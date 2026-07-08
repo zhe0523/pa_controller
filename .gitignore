@@ -1,0 +1,35 @@
+# Build outputs
+/build/
+/bin/
+/obj/
+*.o
+*.a
+*.so
+*.d
+*.elf
+*.map
+*.lst
+
+# Deploy/packaging outputs
+*_deploy
+*.tar
+*.tar.gz
+*.zip
+
+# Runtime logs and generated templates
+*.log
+offset.raw
+gain.raw
+*.raw
+
+# Editor/IDE files
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
