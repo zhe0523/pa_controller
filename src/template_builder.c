@@ -99,6 +99,10 @@ int template_make_offset(fpga_mem_t* mem) {
     return -1;
   }
 
+  /*
+   * 手动 MAKE_OFFSET 保持当前单帧行为，便于现场明确触发。
+   * 自动暗场更新后续应新增多帧平均和质量校验路径，不直接复用这里覆盖模板。
+   */
   int fd = open(TEMPLATE_OFFSET_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd == -1) {
     log_error("open %s failed: %d", TEMPLATE_OFFSET_FILE, errno);

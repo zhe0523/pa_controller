@@ -14,6 +14,13 @@ make
 make PA_PU_BASE_ADDR=0x43c10000 RS422_DEVICE=/dev/ttyS1 RS422_BAUD=115200
 ```
 
+GIC/ROIC 默认配置也可以在构建时覆盖，例如：
+
+```sh
+make GIC_DEFAULT_LINE_TIME_NS=100000 GIC_DEFAULT_START_ROW=0 GIC_DEFAULT_END_ROW=7715 \
+     ROIC_DEFAULT_START_COL=0 ROIC_DEFAULT_END_COL=3071
+```
+
 PA 寄存器默认优先通过 `/dev/uio0` 访问：
 
 ```sh
@@ -44,6 +51,18 @@ build/bin/pa_controller
 
 此模式下日志输出到 `stderr`，协议响应输出到 `stdout`，命令仍然与 RS422 模式完全一致。
 
+如果只想在普通 Ubuntu 上测试文本协议，不访问 `/dev/uio0`、`/dev/mem` 或 FPGA 共享内存：
+
+```sh
+./build/bin/pa_controller --stdio --no-hw
+```
+
+`--no-hw` 只能和 `--stdio` 一起使用。该模式下 `PING`、`STATUS`、`SEND_SINGLE`、
+`START_CONTINUOUS`、`STOP_TRANSFER` 和 `QUIT` 会返回可供上位机联调的协议响应；
+`LOAD_TEMPLATE`、`MAKE_OFFSET`、`MAKE_GAIN`、`CONFIG_TEMPLATE`、`CONFIG_GIC`、`START_GIC`、
+`STOP_GIC`、`CONFIG_ROIC`、`START_ROIC` 和 `START_CORR`
+会返回 `ERR NO_HW`，避免误以为真实硬件动作已经执行。
+
 ## 当前 RS422 调试命令
 
 当前先使用 ASCII 行协议，命令以 `\r\n` 或 `\n` 结束，便于串口助手联调。正式上位机协议确定后，替换 `src/command_handler.c` 即可。
@@ -55,11 +74,95 @@ LOAD_TEMPLATE     -> 从 /usr/local/offset.raw 和 /usr/local/gain.raw 加载模
 MAKE_OFFSET       -> 用当前 FPGA 图像生成 offset 模板
 MAKE_GAIN         -> 用当前 FPGA 图像和 offset 模板生成 gain 模板
 CONFIG_TEMPLATE   -> 将 offset/gain 物理地址配置给 PA
+CONFIG_GIC        -> 将默认 GIC 时序、行范围和 binning 配置给 PA
+START_GIC         -> 启动一次 GIC 操作
+STOP_GIC          -> 停止 GIC 操作，主要用于 xao scan
+CONFIG_ROIC       -> 将默认 ROIC 寄存器、列范围和 binning 配置给 PA
+START_ROIC        -> 启动一次 ROIC 配置操作
 START_CORR        -> 启动 PA 图像校正
-SEND_IMAGE        -> 通知 PA 从 FPGA 图像地址启动光口传图
-WAIT_IRQ          -> 通过 UIO 等待一次 PA/FPGA 中断，超时 5 秒
+SEND_SINGLE       -> 当前 Qt 上位机“手动上图”，通知 PA 从 FPGA 图像地址启动一次写图流程
+START_CONTINUOUS  -> 当前 Qt 上位机“开始上图”，现阶段暂按一次写图流程兼容
+STOP_TRANSFER     -> 当前 Qt 上位机“停止上图”，现阶段仅确认收到停止请求
+SEND_IMAGE        -> 早期调试命令，当前等价于 SEND_SINGLE
 QUIT              -> 退出程序
 ```
+
+`STATUS` 当前返回字段：
+
+```text
+int_vector   PA/FPGA 中断向量寄存器快照
+pa_version   PA 版本寄存器
+com_version  PA/PU 通信模块版本寄存器
+rst_state    复位初始化状态寄存器
+wr_state     图像写出状态机状态
+wr_end       图像写出完成标志
+corr_state   图像校正状态机状态
+corr_end     图像校正完成标志
+gic_state    GIC 状态机状态
+gic_end      GIC 操作完成标志
+gic_dfx      GIC 调试/错误状态
+roic_state   ROIC 状态机状态
+roic_end     ROIC 操作完成标志
+roic_dfx     ROIC 调试/保留状态
+```
+
+GIC/ROIC 推荐的手工 bring-up 顺序：
+
+```text
+STATUS
+CONFIG_GIC
+START_GIC
+STATUS
+CONFIG_ROIC
+START_ROIC
+STATUS
+CONFIG_TEMPLATE
+START_CORR
+STATUS
+SEND_SINGLE
+STATUS
+```
+
+`CONFIG_GIC` 和 `CONFIG_ROIC` 只负责下发配置，不会自动启动硬件动作。`START_GIC`
+和 `START_ROIC` 单独触发，便于串口助手逐步确认状态位和错误位。
+
+注意：`ROIC_DEFAULT_REG_*` 当前是占位值，真实 ROIC 芯片寄存器值需要由 panel
+测试参数或旧工程参数覆盖后再用于真板配置。
+
+说明：当前 PA/FPGA 侧尚未提供正式持续上图和停流寄存器，因此 `SEND_SINGLE`、
+`START_CONTINUOUS` 和早期 `SEND_IMAGE` 都会触发同一个 `IMG_WR_STR` 写图流程；
+`STOP_TRANSFER` 只返回 `OK STOP_TRANSFER`，不额外操作硬件。后续硬件接口明确后，
+只需要在 `src/command_handler.c` 中拆分这三条命令的具体实现。
+
+## 自动暗场模板更新规划
+
+当前 `MAKE_OFFSET` 仍保持手动单帧生成 offset 模板，便于现场明确触发和验证。后续“机器
+空闲时自动更新暗场图”按以下方式落地，不直接让单帧暗场覆盖正式模板：
+
+```text
+机器空闲
+-> 等待空闲状态稳定一段时间
+-> 连续读取 N 帧暗场
+-> 对每个像素做多帧平均
+-> 检查均值、最大值、行噪声和相对旧模板的变化
+-> 通过后写入 FPGA offset_template
+-> 先写 /usr/local/offset.raw.tmp
+-> 校验大小成功后 rename 为 /usr/local/offset.raw
+-> 重新配置 PA 模板地址
+```
+
+初始规划代码在 `src/auto_offset_plan.*`，目前只定义配置、状态和质量门槛，不启动后台
+自动任务，也不改变现有 `MAKE_OFFSET` 行为。等以下硬件条件确认后再启用实际更新：
+
+```text
+1. wr_state / corr_state 的空闲取值
+2. 上图、校正、写图和曝光互斥关系
+3. ARM 是否能可靠知道射线源未曝光
+4. FPGA 图像内存中的帧完成和帧稳定判据
+5. 暗场质量门槛：最大值、均值变化、行噪声阈值
+```
+
+默认建议从 `8` 帧平均开始，空闲稳定时间暂按 `3000 ms`，质量门槛需用真实暗场样例校准。
 
 ## 与项目要求的对应关系
 
@@ -68,6 +171,7 @@ QUIT              -> 退出程序
 ```text
 RS422 上位机通讯入口
 PA/PU 通过 /dev/uio0 访问寄存器
+GIC/ROIC 默认配置、启动和状态查询
 offset/gain 模板生成与加载
 通知 PA/FPGA 启动图像校正
 通知 PA/FPGA 启动光口传图
@@ -94,6 +198,7 @@ src/pa_pu.c/h           PA 寄存器控制，地址来自 fpga/pa_pu_com.v
 src/fpga_mem.c/h        FPGA image/offset/gain 内存映射
 src/image_frame.h       光口图像头格式
 src/template_builder.c  offset/gain 模板生成与加载
+src/auto_offset_plan.*  自动暗场模板更新的配置、状态和质量门槛规划
 src/rs422.c/h           422 串口配置和行收发
 src/command_handler.c   临时调试命令分发
 ```
@@ -117,4 +222,4 @@ src/command_handler.c   临时调试命令分发
    当前 RTL 写 decode 里这两个地址互换，软件暂时用 WR_* 宏兼容。
 ```
 
-当前目标板上的 `f2p_irq_test.ko` 是中断测试驱动，可以验证 hwirq/virq 和 INT_VECTOR；应用层如果要阻塞等待中断，推荐让正式驱动暴露 `read/poll`，或者把同一个中断接入 UIO。`WAIT_IRQ` 命令只在 `/dev/uio0` 具备中断事件时有效。
+当前目标板上的 `f2p_irq_test.ko` 是中断测试驱动，可以验证 hwirq/virq 和 INT_VECTOR；应用层如果要阻塞等待中断，推荐让正式驱动暴露 `read/poll`，或者把同一个中断接入 UIO。RS422 调试协议不再暴露 `WAIT_IRQ`。

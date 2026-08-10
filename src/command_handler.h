@@ -14,6 +14,8 @@
 typedef struct {
   /* FPGA/PA 共享内存，用于模板加载、offset/gain 生成。 */
   fpga_mem_t* fpga_mem;
+  /* false 表示只测试文本协议，不访问 FPGA 内存或 PA 寄存器。 */
+  bool hardware_enabled;
   /* QUIT 命令置位后，main.c 的通信循环会退出。 */
   bool should_quit;
 } command_context_t;

@@ -46,7 +46,7 @@ enum {
   PA_PU_GIC_STR_REG = 0x0200,
   /* 0x0208, pu->pa, 1bit：写 1 停止 GIC 操作，仅 xao scan 模式下使用。 */
   PA_PU_GIC_STOP_REG = 0x0208,
-  /* 0x0210, pu->pa, 8bit：GIC 请求模式，0 串行扫描，1 并行扫描，2 xao 扫描。 */
+  /* 0x0210, pu->pa, 8bit：GIC 请求模式，0 串行扫描 半清，1 并行扫描 并清，2 xao 扫描。 */
   PA_PU_GIC_REQ_CODE_REG = 0x0210,
   /* 0x0218, pu->pa, 1bit：GIC 数据输出使能，高有效，仅串行扫描模式使用。 */
   PA_PU_GIC_DOUT_EN_REG = 0x0218,

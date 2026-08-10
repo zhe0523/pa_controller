@@ -20,7 +20,7 @@
 
 #ifndef DEVICE_HEIGHT
 /* FPGA 内存中一帧的总行数，包含有效图像之外的边界/偏移区域。 */
-#define DEVICE_HEIGHT 7716u
+#define DEVICE_HEIGHT 7680u
 #endif
 
 #ifndef IMAGE_WIDTH
@@ -30,7 +30,7 @@
 
 #ifndef IMAGE_HEIGHT
 /* 上位机和模板算法实际使用的有效图像高度。 */
-#define IMAGE_HEIGHT 7716u
+#define IMAGE_HEIGHT 7680u
 #endif
 
 #ifndef ROW_OFFSET
@@ -75,6 +75,114 @@
 #ifndef TEMPLATE_GAIN_FILE
 /* gain 模板落盘文件，现场生成后重启仍可加载。 */
 #define TEMPLATE_GAIN_FILE "/usr/local/gain.raw"
+#endif
+
+#ifndef GIC_DEFAULT_REQ_CODE
+/* 默认 GIC 请求模式：0 串行扫描，1 并行扫描，2 xao 扫描。 */
+#define GIC_DEFAULT_REQ_CODE 0u
+#endif
+
+#ifndef GIC_DEFAULT_DOUT_EN
+/* 串行扫描模式下的 GIC 数据输出使能。 */
+#define GIC_DEFAULT_DOUT_EN 1u
+#endif
+
+#ifndef GIC_DEFAULT_LINE_TIME_NS
+/* 默认 GIC 行时间，单位 ns；现场应按 panel 时序覆盖。 */
+#define GIC_DEFAULT_LINE_TIME_NS 0u
+#endif
+
+#ifndef GIC_DEFAULT_OE_RISE_NS
+/* 默认 GIC OE 上升沿时间，单位 ns；现场应按 panel 时序覆盖。 */
+#define GIC_DEFAULT_OE_RISE_NS 0u
+#endif
+
+#ifndef GIC_DEFAULT_OE_FALL_NS
+/* 默认 GIC OE 下降沿时间，单位 ns；现场应按 panel 时序覆盖。 */
+#define GIC_DEFAULT_OE_FALL_NS 0u
+#endif
+
+#ifndef GIC_DEFAULT_START_ROW
+#define GIC_DEFAULT_START_ROW 0u
+#endif
+
+#ifndef GIC_DEFAULT_END_ROW
+#define GIC_DEFAULT_END_ROW (IMAGE_HEIGHT - 1u)
+#endif
+
+#ifndef GIC_DEFAULT_BINNING
+#define GIC_DEFAULT_BINNING 1u
+#endif
+
+#ifndef ROIC_DEFAULT_START_COL
+#define ROIC_DEFAULT_START_COL 0u
+#endif
+
+#ifndef ROIC_DEFAULT_END_COL
+#define ROIC_DEFAULT_END_COL (IMAGE_WIDTH - 1u)
+#endif
+
+#ifndef ROIC_DEFAULT_BINNING
+#define ROIC_DEFAULT_BINNING 1u
+#endif
+
+#ifndef ROIC_DEFAULT_REG_00
+/* ROIC 芯片寄存器默认值需由 panel 测试方确认，当前只提供可覆盖占位值。 */
+#define ROIC_DEFAULT_REG_00 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_02
+#define ROIC_DEFAULT_REG_02 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_05
+#define ROIC_DEFAULT_REG_05 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_06
+#define ROIC_DEFAULT_REG_06 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_07
+#define ROIC_DEFAULT_REG_07 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_09
+#define ROIC_DEFAULT_REG_09 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_0A
+#define ROIC_DEFAULT_REG_0A 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_0B
+#define ROIC_DEFAULT_REG_0B 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_0C
+#define ROIC_DEFAULT_REG_0C 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_0D
+#define ROIC_DEFAULT_REG_0D 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_0E
+#define ROIC_DEFAULT_REG_0E 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_0F
+#define ROIC_DEFAULT_REG_0F 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_10
+#define ROIC_DEFAULT_REG_10 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_11
+#define ROIC_DEFAULT_REG_11 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_17
+#define ROIC_DEFAULT_REG_17 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_24
+#define ROIC_DEFAULT_REG_24 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_28
+#define ROIC_DEFAULT_REG_28 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_2D
+#define ROIC_DEFAULT_REG_2D 0u
+#endif
+#ifndef ROIC_DEFAULT_REG_3B
+#define ROIC_DEFAULT_REG_3B 0u
 #endif
 
 /* 有效图像字节数：只包含上位机关心的 IMAGE_WIDTH x IMAGE_HEIGHT。 */

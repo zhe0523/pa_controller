@@ -134,6 +134,12 @@ void pa_pu_read_status(pa_pu_status_t* status) {
   status->img_wr_end = pa_pu_read(PA_PU_IMG_WR_END_REG);
   status->img_corr_state = pa_pu_read(PA_PU_IMG_CORR_STATE_REG);
   status->img_corr_end = pa_pu_read(PA_PU_IMG_CORR_END_REG);
+  status->gic_state = pa_pu_read(PA_PU_GIC_STATE_REG);
+  status->gic_end = pa_pu_read(PA_PU_GIC_END_REG);
+  status->gic_dfx = pa_pu_read(PA_PU_GIC_DFX_REG);
+  status->roic_state = pa_pu_read(PA_PU_ROIC_STATE_REG);
+  status->roic_end = pa_pu_read(PA_PU_ROIC_END_REG);
+  status->roic_dfx = pa_pu_read(PA_PU_ROIC_DFX_REG);
 }
 
 int pa_pu_wait_irq(int timeout_ms, uint32_t* irq_count) {
@@ -203,6 +209,105 @@ void pa_pu_configure_templates(void) {
     .defect_enable = false,
   };
   pa_pu_configure_correction(&config);
+}
+
+void pa_pu_configure_gic_defaults(void) {
+  pa_pu_gic_config_t config = {
+    .req_code = GIC_DEFAULT_REQ_CODE,
+    .dout_enable = GIC_DEFAULT_DOUT_EN != 0,
+    .line_time_ns = GIC_DEFAULT_LINE_TIME_NS,
+    .oe_raising_edge_ns = GIC_DEFAULT_OE_RISE_NS,
+    .oe_falling_edge_ns = GIC_DEFAULT_OE_FALL_NS,
+    .start_row = GIC_DEFAULT_START_ROW,
+    .end_row = GIC_DEFAULT_END_ROW,
+    .binning_mode = GIC_DEFAULT_BINNING,
+  };
+  pa_pu_configure_gic(&config);
+}
+
+void pa_pu_configure_gic(const pa_pu_gic_config_t* config) {
+  if (config == NULL) {
+    return;
+  }
+
+  pa_pu_write(PA_PU_GIC_REQ_CODE_REG, config->req_code);
+  pa_pu_write(PA_PU_GIC_DOUT_EN_REG, config->dout_enable ? 1u : 0u);
+  pa_pu_write(PA_PU_GIC_LINE_TIME_REG, config->line_time_ns);
+  pa_pu_write(PA_PU_GIC_OE_RAISING_EDGE_REG, config->oe_raising_edge_ns);
+  pa_pu_write(PA_PU_GIC_OE_FALLING_EDGE_REG, config->oe_falling_edge_ns);
+  pa_pu_write(PA_PU_GIC_STR_ROW_NUM_REG, config->start_row);
+  pa_pu_write(PA_PU_GIC_END_ROW_NUM_REG, config->end_row);
+  pa_pu_write(PA_PU_GIC_BINNING_MODE_REG, config->binning_mode);
+}
+
+void pa_pu_start_gic(void) {
+  pa_pu_write(PA_PU_GIC_STR_REG, 1);
+}
+
+void pa_pu_stop_gic(void) {
+  pa_pu_write(PA_PU_GIC_STOP_REG, 1);
+}
+
+void pa_pu_configure_roic_defaults(void) {
+  pa_pu_roic_config_t config = {
+    .reg_00 = ROIC_DEFAULT_REG_00,
+    .reg_02 = ROIC_DEFAULT_REG_02,
+    .reg_05 = ROIC_DEFAULT_REG_05,
+    .reg_06 = ROIC_DEFAULT_REG_06,
+    .reg_07 = ROIC_DEFAULT_REG_07,
+    .reg_09 = ROIC_DEFAULT_REG_09,
+    .reg_0a = ROIC_DEFAULT_REG_0A,
+    .reg_0b = ROIC_DEFAULT_REG_0B,
+    .reg_0c = ROIC_DEFAULT_REG_0C,
+    .reg_0d = ROIC_DEFAULT_REG_0D,
+    .reg_0e = ROIC_DEFAULT_REG_0E,
+    .reg_0f = ROIC_DEFAULT_REG_0F,
+    .reg_10 = ROIC_DEFAULT_REG_10,
+    .reg_11 = ROIC_DEFAULT_REG_11,
+    .reg_17 = ROIC_DEFAULT_REG_17,
+    .reg_24 = ROIC_DEFAULT_REG_24,
+    .reg_28 = ROIC_DEFAULT_REG_28,
+    .reg_2d = ROIC_DEFAULT_REG_2D,
+    .reg_3b = ROIC_DEFAULT_REG_3B,
+    .start_col = ROIC_DEFAULT_START_COL,
+    .end_col = ROIC_DEFAULT_END_COL,
+    .binning_mode = ROIC_DEFAULT_BINNING,
+  };
+  pa_pu_configure_roic(&config);
+}
+
+void pa_pu_configure_roic(const pa_pu_roic_config_t* config) {
+  if (config == NULL) {
+    return;
+  }
+
+  pa_pu_write(PA_PU_ROIC_REQ_CODE_REG, PA_PU_ROIC_REQ_CONFIG_ONCE);
+  pa_pu_write(PA_PU_ROIC_REG_00_REG, config->reg_00);
+  pa_pu_write(PA_PU_ROIC_REG_02_REG, config->reg_02);
+  pa_pu_write(PA_PU_ROIC_REG_05_REG, config->reg_05);
+  pa_pu_write(PA_PU_ROIC_REG_06_REG, config->reg_06);
+  pa_pu_write(PA_PU_ROIC_REG_07_REG, config->reg_07);
+  pa_pu_write(PA_PU_ROIC_REG_09_REG, config->reg_09);
+  pa_pu_write(PA_PU_ROIC_REG_0A_REG, config->reg_0a);
+  pa_pu_write(PA_PU_ROIC_REG_0B_REG, config->reg_0b);
+  pa_pu_write(PA_PU_ROIC_REG_0C_REG, config->reg_0c);
+  pa_pu_write(PA_PU_ROIC_REG_0D_REG, config->reg_0d);
+  pa_pu_write(PA_PU_ROIC_REG_0E_REG, config->reg_0e);
+  pa_pu_write(PA_PU_ROIC_REG_0F_REG, config->reg_0f);
+  pa_pu_write(PA_PU_ROIC_REG_10_REG, config->reg_10);
+  pa_pu_write(PA_PU_ROIC_REG_11_REG, config->reg_11);
+  pa_pu_write(PA_PU_ROIC_REG_17_REG, config->reg_17);
+  pa_pu_write(PA_PU_ROIC_REG_24_REG, config->reg_24);
+  pa_pu_write(PA_PU_ROIC_REG_28_REG, config->reg_28);
+  pa_pu_write(PA_PU_ROIC_REG_2D_REG, config->reg_2d);
+  pa_pu_write(PA_PU_ROIC_REG_3B_REG, config->reg_3b);
+  pa_pu_write(PA_PU_ROIC_STR_COL_NUM_REG, config->start_col);
+  pa_pu_write(PA_PU_ROIC_END_COL_NUM_REG, config->end_col);
+  pa_pu_write(PA_PU_ROIC_BINNING_MODE_REG, config->binning_mode);
+}
+
+void pa_pu_start_roic(void) {
+  pa_pu_write(PA_PU_ROIC_STR_REG, 1);
 }
 
 void pa_pu_start_correction(void) {

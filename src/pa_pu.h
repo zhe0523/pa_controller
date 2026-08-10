@@ -49,6 +49,44 @@ typedef struct {
   bool defect_enable;
 } pa_pu_corr_config_t;
 
+/* GIC 采集时序和行方向 ROI 配置。 */
+typedef struct {
+  uint8_t req_code;
+  bool dout_enable;
+  uint32_t line_time_ns;
+  uint32_t oe_raising_edge_ns;
+  uint32_t oe_falling_edge_ns;
+  uint16_t start_row;
+  uint16_t end_row;
+  uint8_t binning_mode;
+} pa_pu_gic_config_t;
+
+/* ROIC 寄存器配置和列方向 ROI 配置。 */
+typedef struct {
+  uint16_t reg_00;
+  uint16_t reg_02;
+  uint16_t reg_05;
+  uint16_t reg_06;
+  uint16_t reg_07;
+  uint16_t reg_09;
+  uint16_t reg_0a;
+  uint16_t reg_0b;
+  uint16_t reg_0c;
+  uint16_t reg_0d;
+  uint16_t reg_0e;
+  uint16_t reg_0f;
+  uint16_t reg_10;
+  uint16_t reg_11;
+  uint16_t reg_17;
+  uint16_t reg_24;
+  uint16_t reg_28;
+  uint16_t reg_2d;
+  uint16_t reg_3b;
+  uint16_t start_col;
+  uint16_t end_col;
+  uint8_t binning_mode;
+} pa_pu_roic_config_t;
+
 /* STATUS 命令返回给上位机的核心 PA 状态快照。 */
 typedef struct {
   /* 中断向量寄存器，bit 定义见 PA_PU_IRQ_*。 */
@@ -67,6 +105,18 @@ typedef struct {
   uint32_t img_corr_state;
   /* 图像校正完成标志。 */
   uint32_t img_corr_end;
+  /* GIC 模块状态，高电平表示 busy。 */
+  uint32_t gic_state;
+  /* GIC 操作完成标志。 */
+  uint32_t gic_end;
+  /* GIC 调试/错误状态。 */
+  uint32_t gic_dfx;
+  /* ROIC 模块状态，高电平表示 busy。 */
+  uint32_t roic_state;
+  /* ROIC 操作完成标志。 */
+  uint32_t roic_end;
+  /* ROIC 调试/保留状态。 */
+  uint32_t roic_dfx;
 } pa_pu_status_t;
 
 /* 打开 PA 寄存器映射：优先 UIO，失败后回退 /dev/mem + base_addr。 */
@@ -98,6 +148,27 @@ void pa_pu_configure_templates(void);
 
 /* 按调用者给定参数配置 PA 校正模块。 */
 void pa_pu_configure_correction(const pa_pu_corr_config_t* config);
+
+/* 使用 app_config.h 中的默认参数配置 GIC。 */
+void pa_pu_configure_gic_defaults(void);
+
+/* 按调用者给定参数配置 GIC。 */
+void pa_pu_configure_gic(const pa_pu_gic_config_t* config);
+
+/* 写 GIC_STR，启动一次 GIC 操作。 */
+void pa_pu_start_gic(void);
+
+/* 写 GIC_STOP，停止 GIC 操作；主要用于 xao scan。 */
+void pa_pu_stop_gic(void);
+
+/* 使用 app_config.h 中的默认参数配置 ROIC。 */
+void pa_pu_configure_roic_defaults(void);
+
+/* 按调用者给定参数配置 ROIC。 */
+void pa_pu_configure_roic(const pa_pu_roic_config_t* config);
+
+/* 写 ROIC_STR，启动一次 ROIC 配置操作。 */
+void pa_pu_start_roic(void);
 
 /* 写 IMG_CORR_STR，启动一次图像校正。 */
 void pa_pu_start_correction(void);
