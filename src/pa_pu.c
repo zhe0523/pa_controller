@@ -222,7 +222,7 @@ static void pa_pu_drain_irq_driver(void) {
       return;
     }
     if (n == -1 && errno == EINTR) {
-      continue;
+      return;
     }
     if (n > 0) {
       log_warn("short read while draining %s: %ld", PA_IRQ_DEVICE, (long)n);
@@ -284,7 +284,7 @@ static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* i
     }
     if (pret < 0) {
       if (errno == EINTR) {
-        continue;
+        return -1;
       }
       log_warn("poll %s failed, fallback to INT_VECTOR polling: %d", PA_IRQ_DEVICE, errno);
       close(g_irq_fd);
@@ -321,7 +321,7 @@ static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* i
         break;
       }
       if (n == -1 && errno == EINTR) {
-        continue;
+        return -1;
       }
       if (n > 0) {
         log_warn("short read from %s: %ld", PA_IRQ_DEVICE, (long)n);
@@ -376,7 +376,9 @@ int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vect
       return 0;
     }
 
-    usleep(PA_PU_IRQ_POLL_INTERVAL_US);
+    if (usleep(PA_PU_IRQ_POLL_INTERVAL_US) != 0 && errno == EINTR) {
+      return -1;
+    }
   }
 }
 

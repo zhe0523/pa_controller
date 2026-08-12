@@ -30,6 +30,20 @@ static void print_usage(const char* program) {
   fprintf(stderr, "  default baud:   %d\n", RS422_BAUD);
 }
 
+static void install_signal_handlers(void) {
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = on_signal;
+  sigemptyset(&action.sa_mask);
+
+  /*
+   * 不设置 SA_RESTART。这样 fgets/read/poll/usleep 被 Ctrl+C 打断后会返回 EINTR，
+   * 主循环和硬件等待函数才能尽快看到退出条件并释放资源。
+   */
+  sigaction(SIGINT, &action, NULL);
+  sigaction(SIGTERM, &action, NULL);
+}
+
 static const char* select_rs422_device(const char* requested) {
   if (requested != NULL && access(requested, R_OK | W_OK) == 0) {
     return requested;
@@ -58,8 +72,7 @@ static const char* select_rs422_device(const char* requested) {
 
 int main(int argc, char* argv[]) {
   /* 支持 Ctrl+C / kill 优雅退出，避免 mmap 和串口 fd 泄漏。 */
-  signal(SIGINT, on_signal);
-  signal(SIGTERM, on_signal);
+  install_signal_handlers();
 
   const char* rs422_device = RS422_DEVICE;
   int rs422_baud = RS422_BAUD;
@@ -152,6 +165,10 @@ int main(int argc, char* argv[]) {
       }
     }
 
+    if (g_stop) {
+      log_info("stop signal received");
+    }
+
     if (!no_hw) {
       pa_pu_close();
       fpga_mem_close(&fpga_mem);
@@ -186,6 +203,10 @@ int main(int argc, char* argv[]) {
       rs422_write_text(&rs422, response);
       log_info("tx: %s", response);
     }
+  }
+
+  if (g_stop) {
+    log_info("stop signal received");
   }
 
   rs422_close(&rs422);

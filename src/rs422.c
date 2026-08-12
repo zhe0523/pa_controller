@@ -88,8 +88,8 @@ int rs422_read_line(rs422_t* port, char* buffer, size_t size) {
     ssize_t n = read(port->fd, &ch, 1);
     if (n < 0) {
       if (errno == EINTR) {
-        /* 被信号打断时重试，让 Ctrl+C 由 main 循环的 g_stop 处理。 */
-        continue;
+        /* 被 Ctrl+C/kill 打断时返回主循环，让 main 检查退出标志并释放资源。 */
+        return 0;
       }
       return -1;
     }
@@ -120,8 +120,8 @@ int rs422_write_text(rs422_t* port, const char* text) {
     ssize_t n = write(port->fd, p, len);
     if (n <= 0) {
       if (errno == EINTR) {
-        /* 写串口时被信号打断，继续写剩余数据。 */
-        continue;
+        /* 被 Ctrl+C/kill 打断时尽快返回，由 main 主循环收尾退出。 */
+        return -1;
       }
       return -1;
     }
