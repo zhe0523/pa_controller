@@ -89,7 +89,7 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  log_info("pa_controller start");
+  log_info("pa_controller start app_version=%s", APP_VERSION);
   log_info("image=%ux%u active=%ux%u offset=(%u,%u)",
            DEVICE_WIDTH, DEVICE_HEIGHT, IMAGE_WIDTH, IMAGE_HEIGHT, COL_OFFSET, ROW_OFFSET);
   log_info("fiber image header=%u bytes", DETECTOR_IMAGE_HEADER_BYTES);
@@ -129,7 +129,7 @@ int main(int argc, char* argv[]) {
   };
 
   char command[256];
-  char response[512];
+  char response[2048];
 
   if (use_stdio) {
     /*

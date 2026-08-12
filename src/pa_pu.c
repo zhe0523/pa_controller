@@ -2,9 +2,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "app_config.h"
@@ -19,10 +21,24 @@ static volatile uint8_t* g_base = NULL;
 /* 映射窗口长度，用于寄存器越界检查和 munmap。 */
 static size_t g_map_size = 0;
 
-/* 记录当前是否通过 UIO 打开；只有 UIO 模式才能用 read/poll 等待中断。 */
+/* 记录当前是否通过 UIO 打开。当前项目暂时不用 UIO fd 中断，只用寄存器 INT_VECTOR。 */
 static bool g_using_uio = false;
 
+/* /dev/pa_irq 驱动 fd。存在时由驱动负责读取 read-clear 的 INT_VECTOR。 */
+static int g_irq_fd = -1;
+
+typedef struct {
+  uint32_t int_vector;
+  uint32_t reserved;
+  uint64_t count;
+  uint64_t timestamp_ns;
+} pa_irq_event_t;
+
 static int pa_pu_open_uio(size_t map_size) {
+  if (PA_PU_UIO_DEVICE[0] == '\0') {
+    return -1;
+  }
+
   g_fd = open(PA_PU_UIO_DEVICE, O_RDWR | O_CLOEXEC);
   if (g_fd == -1) {
     log_warn("open %s failed, fallback to /dev/mem: %d", PA_PU_UIO_DEVICE, errno);
@@ -70,6 +86,20 @@ static int pa_pu_open_devmem(uintptr_t base_addr, size_t map_size) {
   return 0;
 }
 
+static void pa_pu_open_irq_driver(void) {
+  if (g_irq_fd != -1) {
+    return;
+  }
+
+  g_irq_fd = open(PA_IRQ_DEVICE, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+  if (g_irq_fd == -1) {
+    log_warn("open %s failed, fallback to INT_VECTOR polling: %d", PA_IRQ_DEVICE, errno);
+    return;
+  }
+
+  log_info("pa irq driver opened device=%s", PA_IRQ_DEVICE);
+}
+
 int pa_pu_open(uintptr_t base_addr, size_t map_size) {
   if (g_base != NULL) {
     return 0;
@@ -77,14 +107,24 @@ int pa_pu_open(uintptr_t base_addr, size_t map_size) {
 
   /* 优先走 UIO：地址由设备树/驱动维护，用户态只关心 /dev/uioX。 */
   if (pa_pu_open_uio(map_size) == 0) {
+    pa_pu_open_irq_driver();
     return 0;
   }
 
   /* UIO 不存在时才回退 /dev/mem，主要用于早期 bring-up。 */
-  return pa_pu_open_devmem(base_addr, map_size);
+  int ret = pa_pu_open_devmem(base_addr, map_size);
+  if (ret == 0) {
+    pa_pu_open_irq_driver();
+  }
+  return ret;
 }
 
 void pa_pu_close(void) {
+  if (g_irq_fd != -1) {
+    close(g_irq_fd);
+    g_irq_fd = -1;
+  }
+
   if (g_base != NULL) {
     munmap((void*)g_base, g_map_size);
     g_base = NULL;
@@ -100,6 +140,10 @@ void pa_pu_close(void) {
 
 bool pa_pu_is_open(void) {
   return g_base != NULL;
+}
+
+bool pa_pu_irq_driver_is_open(void) {
+  return g_irq_fd != -1;
 }
 
 uint32_t pa_pu_read(uint16_t reg) {
@@ -125,9 +169,15 @@ void pa_pu_read_status(pa_pu_status_t* status) {
 
   memset(status, 0, sizeof(*status));
 
-  /* 这里只读上位机当前最需要的状态，避免 STATUS 响应过长。 */
-  status->int_vector = pa_pu_read(PA_PU_INT_VECTOR_REG);
+  /* 这里只读非 read-clear 状态，避免 STATUS 消费完成中断。 */
   status->pa_version = pa_pu_read(PA_PU_PA_VERSION_REG);
+  status->pa_build_information = pa_pu_read(PA_PU_PA_BUILD_INFORMATION_REG);
+  status->adapted_main_board_version = pa_pu_read(PA_PU_ADAPTED_MAIN_BOARD_VERSION_REG);
+  status->adapted_gic_board_version = pa_pu_read(PA_PU_ADAPTED_GIC_BOARD_VERSION_REG);
+  status->adapted_roic_board_version = pa_pu_read(PA_PU_ADAPTED_ROIC_BOARD_VERSION_REG);
+  status->adapted_reserved_board_0_version = pa_pu_read(PA_PU_ADAPTED_RESERVED_BOARD_0_VERSION_REG);
+  status->adapted_reserved_board_1_version = pa_pu_read(PA_PU_ADAPTED_RESERVED_BOARD_1_VERSION_REG);
+  status->adapted_reserved_board_2_version = pa_pu_read(PA_PU_ADAPTED_RESERVED_BOARD_2_VERSION_REG);
   status->pa_pu_com_version = pa_pu_read(PA_PU_COM_VERSION_REG);
   status->rst_init_state = pa_pu_read(PA_PU_RST_INIT_STATE_REG);
   status->img_wr_state = pa_pu_read(PA_PU_IMG_WR_STATE_REG);
@@ -142,38 +192,192 @@ void pa_pu_read_status(pa_pu_status_t* status) {
   status->roic_dfx = pa_pu_read(PA_PU_ROIC_DFX_REG);
 }
 
-int pa_pu_wait_irq(int timeout_ms, uint32_t* irq_count) {
-  if (!g_using_uio || g_fd < 0) {
-    return -2;
+uint32_t pa_pu_read_int_vector(void) {
+  return pa_pu_read(PA_PU_INT_VECTOR_REG);
+}
+
+static uint64_t monotonic_ms(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+    return 0;
+  }
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void pa_pu_drain_irq_driver(void) {
+  if (g_irq_fd == -1) {
+    return;
   }
 
-  /* UIO 的中断事件通过 fd 可读体现，因此可以直接 poll。 */
-  struct pollfd pfd = {
-    .fd = g_fd,
-    .events = POLLIN,
-  };
-
-  int ret = poll(&pfd, 1, timeout_ms);
-  if (ret <= 0) {
-    return ret;
+  for (;;) {
+    pa_irq_event_t event;
+    ssize_t n = read(g_irq_fd, &event, sizeof(event));
+    if (n == (ssize_t)sizeof(event)) {
+      log_warn("drain stale pa irq int_vector=0x%08x count=%llu",
+               event.int_vector,
+               (unsigned long long)event.count);
+      continue;
+    }
+    if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return;
+    }
+    if (n == -1 && errno == EINTR) {
+      continue;
+    }
+    if (n > 0) {
+      log_warn("short read while draining %s: %ld", PA_IRQ_DEVICE, (long)n);
+    } else if (n == -1) {
+      log_warn("read %s while draining failed, fallback to polling: %d", PA_IRQ_DEVICE, errno);
+      close(g_irq_fd);
+      g_irq_fd = -1;
+    }
+    return;
   }
+}
 
-  uint32_t count = 0;
-  if (read(g_fd, &count, sizeof(count)) != (ssize_t)sizeof(count)) {
-    return -1;
+void pa_pu_prepare_irq_wait(void) {
+  if (g_irq_fd != -1) {
+    pa_pu_drain_irq_driver();
+    return;
   }
 
   /*
-   * 标准 UIO 中断在 read 后需要写 1 重新使能。
-   * 如果驱动不需要，该写入通常会被忽略或返回错误；这里不阻断主流程。
+   * 回退轮询模式下，先读一次 read-clear 的 INT_VECTOR，避免上一轮遗留 bit
+   * 被误判成本轮 start 命令完成。
    */
-  uint32_t enable = 1;
-  (void)write(g_fd, &enable, sizeof(enable));
-
-  if (irq_count != NULL) {
-    *irq_count = count;
+  uint32_t stale = pa_pu_read_int_vector();
+  if (stale != 0) {
+    log_warn("clear stale INT_VECTOR before start: 0x%08x", stale);
   }
-  return 1;
+}
+
+static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* int_vector_out) {
+  const uint64_t start_ms = monotonic_ms();
+  uint32_t last_vector = 0;
+
+  while (g_irq_fd != -1) {
+    const uint64_t now_ms = monotonic_ms();
+    if (now_ms - start_ms >= timeout_ms) {
+      if (int_vector_out != NULL) {
+        *int_vector_out = last_vector;
+      }
+      return 0;
+    }
+
+    uint64_t remain_ms = timeout_ms - (now_ms - start_ms);
+    int poll_timeout = remain_ms > INT32_MAX ? INT32_MAX : (int)remain_ms;
+    if (poll_timeout <= 0) {
+      poll_timeout = 1;
+    }
+
+    struct pollfd pfd = {
+      .fd = g_irq_fd,
+      .events = POLLIN,
+    };
+
+    int pret = poll(&pfd, 1, poll_timeout);
+    if (pret == 0) {
+      if (int_vector_out != NULL) {
+        *int_vector_out = last_vector;
+      }
+      return 0;
+    }
+    if (pret < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      log_warn("poll %s failed, fallback to INT_VECTOR polling: %d", PA_IRQ_DEVICE, errno);
+      close(g_irq_fd);
+      g_irq_fd = -1;
+      return -2;
+    }
+
+    if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+      log_warn("poll %s revents=0x%x, fallback to INT_VECTOR polling", PA_IRQ_DEVICE, pfd.revents);
+      close(g_irq_fd);
+      g_irq_fd = -1;
+      return -2;
+    }
+
+    if ((pfd.revents & POLLIN) == 0) {
+      continue;
+    }
+
+    for (;;) {
+      pa_irq_event_t event;
+      ssize_t n = read(g_irq_fd, &event, sizeof(event));
+      if (n == (ssize_t)sizeof(event)) {
+        last_vector = event.int_vector;
+        if ((last_vector & mask) != 0) {
+          if (int_vector_out != NULL) {
+            *int_vector_out = last_vector;
+          }
+          return 1;
+        }
+        log_warn("pa irq int_vector=0x%08x does not match mask=0x%08x", last_vector, mask);
+        continue;
+      }
+      if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        break;
+      }
+      if (n == -1 && errno == EINTR) {
+        continue;
+      }
+      if (n > 0) {
+        log_warn("short read from %s: %ld", PA_IRQ_DEVICE, (long)n);
+      } else if (n == -1) {
+        log_warn("read %s failed, fallback to INT_VECTOR polling: %d", PA_IRQ_DEVICE, errno);
+      }
+      close(g_irq_fd);
+      g_irq_fd = -1;
+      return -2;
+    }
+  }
+
+  if (int_vector_out != NULL) {
+    *int_vector_out = last_vector;
+  }
+  return -2;
+}
+
+int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vector_out) {
+  if (mask == 0) {
+    return -1;
+  }
+
+  if (g_irq_fd != -1) {
+    int driver_ret = pa_pu_wait_irq_driver(mask, timeout_ms, int_vector_out);
+    if (driver_ret != -2) {
+      return driver_ret;
+    }
+  }
+
+  const uint64_t start_ms = monotonic_ms();
+  uint32_t last_vector = 0;
+
+  for (;;) {
+    /*
+     * INT_VECTOR 是 read-clear：每次读取都会消费当前 pending 中断。
+     * 如果读到了非目标 bit，也保留在 last_vector 中返回给调用方诊断。
+     */
+    last_vector = pa_pu_read_int_vector();
+    if ((last_vector & mask) != 0) {
+      if (int_vector_out != NULL) {
+        *int_vector_out = last_vector;
+      }
+      return 1;
+    }
+
+    const uint64_t now_ms = monotonic_ms();
+    if (now_ms - start_ms >= timeout_ms) {
+      if (int_vector_out != NULL) {
+        *int_vector_out = last_vector;
+      }
+      return 0;
+    }
+
+    usleep(PA_PU_IRQ_POLL_INTERVAL_US);
+  }
 }
 
 void pa_pu_configure_correction(const pa_pu_corr_config_t* config) {

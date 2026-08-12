@@ -7,11 +7,10 @@
 /*
  * FPGA/PA 共享图像内存映射。
  *
- * 当前实现通过 /dev/mem 映射 FPGA_IMAGE_PTR 开始的一段连续物理内存，
- * 并在这个窗口内按固定偏移访问 image / offset / gain 三个区域。
- *
- * 后续目标板建议改成通过名为 pu-pa-ddr 的 UIO 节点映射共享 DDR，
- * 避免应用直接依赖 /dev/mem 权限和裸物理地址。
+ * 当前目标板通过三个 UIO 节点分别映射：
+ *   /dev/uio0: offset/暗场模板
+ *   /dev/uio1: gain/亮场模板
+ *   /dev/uio2: 原始图像采集缓冲区
  */
 typedef struct {
   /* 原始图像缓冲区虚拟地址，对应 FPGA_IMAGE_PTR。 */
@@ -20,8 +19,12 @@ typedef struct {
   uint8_t* offset_template;
   /* gain 模板缓冲区虚拟地址，对应 FPGA_GAIN_PTR。 */
   uint8_t* gain_template;
-  /* mmap 的总长度，用于 munmap。 */
-  size_t map_size;
+  size_t image_map_size;
+  size_t offset_map_size;
+  size_t gain_map_size;
+  int image_fd;
+  int offset_fd;
+  int gain_fd;
 } fpga_mem_t;
 
 /* 打开并映射 FPGA/PA 共享内存。 */

@@ -11,8 +11,28 @@ make
 常用覆盖参数：
 
 ```sh
-make PA_PU_BASE_ADDR=0x43c10000 RS422_DEVICE=/dev/ttyS1 RS422_BAUD=115200
+make APP_VERSION=0.1.0 PA_PU_BASE_ADDR=0x40000000 RS422_DEVICE=/dev/ttyS1 RS422_BAUD=115200
 ```
+
+程序启动时会打印 `app_version`。发布时可用 `APP_VERSION=x.y.z` 指定本软件版本。
+
+当前共享 DDR 默认使用三个 UIO 节点：
+
+```text
+/dev/uio0 -> offset/暗场模板，物理地址 0x3C000000，大小 0x04000000
+/dev/uio1 -> gain/亮场模板，物理地址 0x38000000，大小 0x04000000
+/dev/uio2 -> 原始图像缓冲，物理地址 0x28000000，大小 0x10000000
+```
+
+对应构建参数：
+
+```sh
+make FPGA_OFFSET_UIO_DEVICE=/dev/uio0 FPGA_GAIN_UIO_DEVICE=/dev/uio1 FPGA_IMAGE_UIO_DEVICE=/dev/uio2
+```
+
+`GAIN_TEMPLATE_REPEAT_COUNT` 默认是 `1`。当前 3072×7680 的 16bit 图像一帧约 45MB，
+64MB 的亮场 UIO 窗口只能稳定放一份完整 gain 模板；如果后续重新扩大亮场窗口，可在
+构建时改回多份。
 
 GIC/ROIC 默认配置也可以在构建时覆盖，例如：
 
@@ -21,18 +41,71 @@ make GIC_DEFAULT_LINE_TIME_NS=100000 GIC_DEFAULT_START_ROW=0 GIC_DEFAULT_END_ROW
      ROIC_DEFAULT_START_COL=0 ROIC_DEFAULT_END_COL=3071
 ```
 
-PA 寄存器默认优先通过 `/dev/uio0` 访问：
+start 类命令会写启动寄存器后等待完成 bit。程序启动时会优先打开 `/dev/pa_irq`，
+如果该节点存在，则由驱动阻塞等待中断；如果不存在，则自动回退到轮询 `INT_VECTOR`。
+默认超时 5000ms：
 
 ```sh
-make PA_PU_UIO_DEVICE=/dev/uio0
+make PA_PU_IRQ_TIMEOUT_MS=10000 PA_PU_IRQ_POLL_INTERVAL_US=1000 PA_IRQ_DEVICE=/dev/pa_irq
 ```
 
-`PA_PU_BASE_ADDR` 只作为 `/dev/uio0` 打不开时的 `/dev/mem` 回退地址。
+PA 寄存器默认通过 `/dev/mem + PA_PU_BASE_ADDR` 访问，当前确认的默认基地址为 `0x40000000`。
+`/dev/uio0` 已经用于暗场 DDR，因此暂时不把 PA/PU 寄存器包装为 UIO。
+如果后续设备树给 PA 寄存器单独暴露 UIO，可以再覆盖：
+
+```sh
+make PA_PU_UIO_DEVICE=/dev/uio3
+```
+
+不要把 `PA_PU_UIO_DEVICE` 配成 `/dev/uio0`、`/dev/uio1` 或 `/dev/uio2`，这三个现在都是共享 DDR。
 
 输出文件：
 
 ```text
 build/bin/pa_controller
+```
+
+部署到当前开发板：
+
+```sh
+make deploy-board
+```
+
+默认会上传到：
+
+```text
+root@192.168.3.17:/root/pa_controller
+```
+
+当前默认使用 `sshpass` 自动输入开发板密码，Ubuntu 编译主机需要安装：
+
+```sh
+sudo apt install sshpass
+```
+
+默认登录参数：
+
+```text
+BOARD_USER=root
+BOARD_PASS=root
+```
+
+也可以一键上传并运行：
+
+```sh
+make run-board
+```
+
+默认运行参数是：
+
+```text
+-d /dev/ttyS1 -b 115200
+```
+
+临时覆盖示例：
+
+```sh
+make run-board BOARD_HOST=192.168.3.17 BOARD_USER=root BOARD_DIR=/root BOARD_RUN_ARGS="--stdio"
 ```
 
 运行时也可以指定实际 422 串口：
@@ -57,8 +130,8 @@ build/bin/pa_controller
 ./build/bin/pa_controller --stdio --no-hw
 ```
 
-`--no-hw` 只能和 `--stdio` 一起使用。该模式下 `PING`、`STATUS`、`SEND_SINGLE`、
-`START_CONTINUOUS`、`STOP_TRANSFER` 和 `QUIT` 会返回可供上位机联调的协议响应；
+`--no-hw` 只能和 `--stdio` 一起使用。该模式下 `PING`、`STATUS`、`VERSION`、`SET_TIME`、
+`GET_TIME`、`SEND_SINGLE`、`START_CONTINUOUS`、`STOP_TRANSFER` 和 `QUIT` 可以不访问 PA/FPGA 硬件直接响应；
 `LOAD_TEMPLATE`、`MAKE_OFFSET`、`MAKE_GAIN`、`CONFIG_TEMPLATE`、`CONFIG_GIC`、`START_GIC`、
 `STOP_GIC`、`CONFIG_ROIC`、`START_ROIC` 和 `START_CORR`
 会返回 `ERR NO_HW`，避免误以为真实硬件动作已经执行。
@@ -70,18 +143,23 @@ build/bin/pa_controller
 ```text
 PING              -> 心跳
 STATUS            -> 读取 PA 状态
+VERSION           -> 查询本 app 版本和 PA/FPGA 版本寄存器，GET_VERSION 等价
+SET_TIME          -> 设置 Linux 本机时间，供上位机连接后同步开发板日志时间
+GET_TIME          -> 读取 Linux 本机当前时间，TIME 等价
+READ_REG          -> 直接读取 PA/PU 寄存器，支持寄存器名、偏移或绝对地址
+WRITE_REG         -> 直接写 PA/PU 寄存器，支持寄存器名、偏移或绝对地址
 LOAD_TEMPLATE     -> 从 /usr/local/offset.raw 和 /usr/local/gain.raw 加载模板
 MAKE_OFFSET       -> 用当前 FPGA 图像生成 offset 模板
 MAKE_GAIN         -> 用当前 FPGA 图像和 offset 模板生成 gain 模板
 CONFIG_TEMPLATE   -> 将 offset/gain 物理地址配置给 PA
-CONFIG_GIC        -> 将默认 GIC 时序、行范围和 binning 配置给 PA
-START_GIC         -> 启动一次 GIC 操作
+CONFIG_GIC        -> 将 GIC 时序、行范围和 binning 配置给 PA
+START_GIC         -> 启动一次 GIC 操作，等待 GIC 完成中断
 STOP_GIC          -> 停止 GIC 操作，主要用于 xao scan
 CONFIG_ROIC       -> 将默认 ROIC 寄存器、列范围和 binning 配置给 PA
-START_ROIC        -> 启动一次 ROIC 配置操作
-START_CORR        -> 启动 PA 图像校正
-SEND_SINGLE       -> 当前 Qt 上位机“手动上图”，通知 PA 从 FPGA 图像地址启动一次写图流程
-START_CONTINUOUS  -> 当前 Qt 上位机“开始上图”，现阶段暂按一次写图流程兼容
+START_ROIC        -> 启动一次 ROIC 配置操作，等待 ROIC 完成中断
+START_CORR        -> 启动 PA 图像校正，等待 IMG_CORR 完成中断
+SEND_SINGLE       -> 当前 Qt 上位机“手动上图”，通知 PA 从 FPGA 图像地址启动一次写图流程并等待 IMG_WR 完成中断
+START_CONTINUOUS  -> 当前 Qt 上位机“开始上图”，现阶段暂按一次写图流程兼容并等待 IMG_WR 完成中断
 STOP_TRANSFER     -> 当前 Qt 上位机“停止上图”，现阶段仅确认收到停止请求
 SEND_IMAGE        -> 早期调试命令，当前等价于 SEND_SINGLE
 QUIT              -> 退出程序
@@ -89,21 +167,116 @@ QUIT              -> 退出程序
 
 `STATUS` 当前返回字段：
 
+所有字段值按 32bit 十六进制输出，便于直接和寄存器表、`READ_REG` 结果对照。
+
 ```text
-int_vector   PA/FPGA 中断向量寄存器快照
-pa_version   PA 版本寄存器
-com_version  PA/PU 通信模块版本寄存器
-rst_state    复位初始化状态寄存器
-wr_state     图像写出状态机状态
-wr_end       图像写出完成标志
-corr_state   图像校正状态机状态
-corr_end     图像校正完成标志
-gic_state    GIC 状态机状态
-gic_end      GIC 操作完成标志
-gic_dfx      GIC 调试/错误状态
-roic_state   ROIC 状态机状态
-roic_end     ROIC 操作完成标志
-roic_dfx     ROIC 调试/保留状态
+pa_version                         PA 版本寄存器
+pa_build_information               PA 构建信息寄存器
+adapted_main_board_version         适配主板版本寄存器
+adapted_gic_board_version          适配 GIC 板版本寄存器
+adapted_roic_board_version         适配 ROIC 板版本寄存器
+adapted_reserved_board_0_version   适配预留板卡 0 版本寄存器
+adapted_reserved_board_1_version   适配预留板卡 1 版本寄存器
+adapted_reserved_board_2_version   适配预留板卡 2 版本寄存器
+pa_pu_com_version                  PA/PU 通信模块版本寄存器
+pa_rst_init_state                  复位初始化状态寄存器
+wr_state                           图像写出状态机状态
+wr_end                             图像写出完成标志
+corr_state                         图像校正状态机状态
+corr_end                           图像校正完成标志
+gic_state                          GIC 状态机状态
+gic_end                            GIC 操作完成标志
+gic_dfx                            GIC 调试/错误状态
+roic_state                         ROIC 状态机状态
+roic_end                           ROIC 操作完成标志
+roic_dfx                           ROIC 调试/保留状态
+```
+
+`VERSION` 返回字段：
+
+PA/FPGA 版本寄存器按 `fpga/pa_pu_com_definition.xlsx` 解析：
+`bit23~16.bit15~8.bit7~0` 对应 `first.second.third`。
+`pa_build_information` 按 `bit31~24` 年、`bit23~16` 月、`bit15~8` 日、`bit7~0` 子版本解析。
+
+```text
+app_version                        当前 pa_controller 软件版本
+pa_version                         PA 版本寄存器
+pa_build_information               PA 构建信息寄存器
+adapted_main_board_version         适配主板版本寄存器
+adapted_gic_board_version          适配 GIC 板版本寄存器
+adapted_roic_board_version         适配 ROIC 板版本寄存器
+adapted_reserved_board_0_version   适配预留板卡 0 版本寄存器
+adapted_reserved_board_1_version   适配预留板卡 1 版本寄存器
+adapted_reserved_board_2_version   适配预留板卡 2 版本寄存器
+pa_pu_com_version                  PA/PU 通信模块版本寄存器
+```
+
+返回示例：
+
+```text
+OK VERSION app_version=0.1.0 pa_version=0.0.1 pa_build_information=2026-08-11.1 adapted_main_board_version=0.0.0 adapted_gic_board_version=0.0.0 adapted_roic_board_version=0.0.0 adapted_reserved_board_0_version=0.0.0 adapted_reserved_board_1_version=0.0.0 adapted_reserved_board_2_version=0.0.0 pa_pu_com_version=0.0.0
+```
+
+上位机同步时间推荐使用 epoch 秒或 epoch 毫秒，避免时区字符串歧义：
+
+```text
+SET_TIME epoch=1786435200
+SET_TIME epoch_ms=1786435200123
+GET_TIME
+```
+
+手工串口调试时也可以发送本地时间字符串，程序会按开发板当前本地时区解释：
+
+```text
+SET_TIME 2026-08-11 14:30:00
+SET_TIME 2026-08-11T14:30:00
+```
+
+成功返回示例：
+
+```text
+OK SET_TIME epoch=1786435200 epoch_ms=1786435200123 local=2026-08-11T14:30:00
+OK TIME epoch=1786435200 epoch_ms=1786435200123 local=2026-08-11T14:30:00
+```
+
+注意：当前硬件的 `INT_VECTOR` 是 read-clear，ARM 或驱动每读一次就会清除已经置位的中断。
+因此 `STATUS` 不读取 `INT_VECTOR`，只读取版本、busy/end 和调试状态。`START_GIC`、
+`START_ROIC`、`START_CORR` 和 `SEND_SINGLE`/`START_CONTINUOUS` 内部会优先通过 `/dev/pa_irq`
+等待对应完成 bit；如果 `/dev/pa_irq` 不存在，则回退到直接轮询 `INT_VECTOR`。
+
+寄存器直接读写调试命令：
+
+```text
+READ_REG pa_version
+READ_REG gic_req_code
+READ_REG 0x0210
+READ_REG 0x40000210
+WRITE_REG gic_req_code 0
+WRITE_REG gic_dout_en 1
+WRITE_REG gic_line_time 100000
+WRITE_REG 0x0210 0x0
+WRITE_REG 0x40000200 1
+```
+
+`REG_READ` 等价于 `READ_REG`，`REG_WRITE` 等价于 `WRITE_REG`。寄存器地址既可以写相对
+PA/PU 基地址的 offset，例如 `0x0210`，也可以写绝对地址，例如 `0x40000210`。
+
+注意：`READ_REG int_vector` 或 `READ_REG 0x0000` 会读取并清除 `INT_VECTOR`，可能影响
+正在等待完成中断的调试流程。
+
+start 类命令完成时返回示例：
+
+```text
+OK START_GIC int_vector=0x00000002
+OK START_ROIC int_vector=0x00000004
+OK START_CORR int_vector=0x00000010
+OK SEND_SINGLE addr=0x28000000 int_vector=0x00000008
+```
+
+超时则返回：
+
+```text
+ERR START_GIC TIMEOUT int_vector=0x00000000
 ```
 
 GIC/ROIC 推荐的手工 bring-up 顺序：
@@ -112,19 +285,30 @@ GIC/ROIC 推荐的手工 bring-up 顺序：
 STATUS
 CONFIG_GIC
 START_GIC
-STATUS
 CONFIG_ROIC
 START_ROIC
-STATUS
 CONFIG_TEMPLATE
 START_CORR
-STATUS
 SEND_SINGLE
 STATUS
 ```
 
 `CONFIG_GIC` 和 `CONFIG_ROIC` 只负责下发配置，不会自动启动硬件动作。`START_GIC`
-和 `START_ROIC` 单独触发，便于串口助手逐步确认状态位和错误位。
+和 `START_ROIC` 单独触发并等待完成中断，之后可用 `STATUS` 查看状态位和错误位。
+
+`CONFIG_GIC` 不带参数时使用构建默认值，也可以用 `key=value` 临时覆盖：
+
+```text
+CONFIG_GIC req=0 dout=1 line_time=100000 oe_rise=1000 oe_fall=90000 start_row=0 end_row=7679 binning=1
+```
+
+也支持完整寄存器名：
+
+```text
+CONFIG_GIC gic_req_code=0 gic_dout_en=1 gic_line_time=100000 gic_oe_raising_edge=1000 gic_oe_falling_edge=90000 gic_str_row_num=0 gic_end_row_num=7679 gic_binning_mode=1
+```
+
+写完这些配置寄存器后，再发 `START_GIC`，程序会写 `GIC_STR=1` 让配置生效并启动一次 GIC 操作。
 
 注意：`ROIC_DEFAULT_REG_*` 当前是占位值，真实 ROIC 芯片寄存器值需要由 panel
 测试参数或旧工程参数覆盖后再用于真板配置。
@@ -170,7 +354,8 @@ STATUS
 
 ```text
 RS422 上位机通讯入口
-PA/PU 通过 /dev/uio0 访问寄存器
+PA/PU 通过 /dev/mem 或独立 PA 寄存器 UIO 访问寄存器
+image/offset/gain 通过三个共享 DDR UIO 映射
 GIC/ROIC 默认配置、启动和状态查询
 offset/gain 模板生成与加载
 通知 PA/FPGA 启动图像校正
@@ -195,7 +380,7 @@ Trig PTO 输出给射线源/加速器
 ```text
 src/main.c              主流程：初始化 FPGA/PA、RS422 循环
 src/pa_pu.c/h           PA 寄存器控制，地址来自 fpga/pa_pu_com.v
-src/fpga_mem.c/h        FPGA image/offset/gain 内存映射
+src/fpga_mem.c/h        FPGA image/offset/gain 三个 UIO 内存映射
 src/image_frame.h       光口图像头格式
 src/template_builder.c  offset/gain 模板生成与加载
 src/auto_offset_plan.*  自动暗场模板更新的配置、状态和质量门槛规划
@@ -222,4 +407,8 @@ src/command_handler.c   临时调试命令分发
    当前 RTL 写 decode 里这两个地址互换，软件暂时用 WR_* 宏兼容。
 ```
 
-当前目标板上的 `f2p_irq_test.ko` 是中断测试驱动，可以验证 hwirq/virq 和 INT_VECTOR；应用层如果要阻塞等待中断，推荐让正式驱动暴露 `read/poll`，或者把同一个中断接入 UIO。RS422 调试协议不再暴露 `WAIT_IRQ`。
+当前完成中断优先通过 `/dev/pa_irq` 驱动处理。`gic_str`、`roic_str`、`img_wr_str`
+和 `img_corr_str` 触发后，驱动读取 `INT_VECTOR` 清硬件 sticky，并把 int_vector 事件交给
+`pa_controller`；如果没有加载驱动或没有 `/dev/pa_irq` 节点，应用会回退到原来的
+1ms `INT_VECTOR` 轮询。
+RS422 调试协议不再暴露 `WAIT_IRQ`。

@@ -14,10 +14,10 @@
 #ifndef PA_PU_UIO_DEVICE
 /*
  * PA 寄存器 UIO 设备名。
- * 注意：当前开发板上的 /dev/uio0 名字是 pu-pa-ddr，更像共享 DDR，不是 PA 寄存器。
- * 真板阶段建议把 PA 寄存器单独暴露为 /dev/uio1 或明确命名的 UIO 节点。
+ * 当前 /dev/uio0~2 已用于共享 DDR，因此默认留空，走 /dev/mem + PA_PU_BASE_ADDR。
+ * 如果后续设备树把 PA 寄存器单独暴露为 UIO，再在 make 中覆盖此项。
  */
-#define PA_PU_UIO_DEVICE "/dev/uio0"
+#define PA_PU_UIO_DEVICE ""
 #endif
 
 /*
@@ -89,10 +89,22 @@ typedef struct {
 
 /* STATUS 命令返回给上位机的核心 PA 状态快照。 */
 typedef struct {
-  /* 中断向量寄存器，bit 定义见 PA_PU_IRQ_*。 */
-  uint32_t int_vector;
   /* PA 版本号。 */
   uint32_t pa_version;
+  /* PA 构建信息。 */
+  uint32_t pa_build_information;
+  /* 当前 PA bitstream 适配的主板版本号。 */
+  uint32_t adapted_main_board_version;
+  /* 当前 PA bitstream 适配的 GIC 板版本号。 */
+  uint32_t adapted_gic_board_version;
+  /* 当前 PA bitstream 适配的 ROIC 板版本号。 */
+  uint32_t adapted_roic_board_version;
+  /* 预留板卡 0 版本号。 */
+  uint32_t adapted_reserved_board_0_version;
+  /* 预留板卡 1 版本号。 */
+  uint32_t adapted_reserved_board_1_version;
+  /* 预留板卡 2 版本号。 */
+  uint32_t adapted_reserved_board_2_version;
   /* PA/PU 通信模块版本号。 */
   uint32_t pa_pu_com_version;
   /* 复位初始化状态，文档 bit0~bit3 分别表示主逻辑、panel、DDR、SFP reset done。 */
@@ -128,20 +140,29 @@ void pa_pu_close(void);
 /* 判断 PA 寄存器当前是否已经映射。 */
 bool pa_pu_is_open(void);
 
+/* 判断是否已打开 /dev/pa_irq；未打开时等待中断会自动回退到 INT_VECTOR 轮询。 */
+bool pa_pu_irq_driver_is_open(void);
+
 /* 读一个 32 位 PA 寄存器；reg 使用 pa_pu_regs.h 中的偏移。 */
 uint32_t pa_pu_read(uint16_t reg);
 
 /* 写一个 32 位 PA 寄存器；reg 使用 pa_pu_regs.h 中的偏移。 */
 void pa_pu_write(uint16_t reg, uint32_t value);
 
-/* 读取 STATUS 命令需要的状态寄存器集合。 */
+/* 读取 STATUS 命令需要的非清除类状态寄存器集合。 */
 void pa_pu_read_status(pa_pu_status_t* status);
 
+/* 读取 INT_VECTOR。当前硬件语义为 read-clear，调用者会消费并清除 pending 中断。 */
+uint32_t pa_pu_read_int_vector(void);
+
 /*
- * 等待一次 UIO 中断。
- * 返回值：>0 表示收到中断，0 表示超时，-1 表示 read/poll 错误，-2 表示当前不是 UIO 映射。
+ * 等待 INT_VECTOR 中指定完成 bit：优先使用 /dev/pa_irq，未打开时回退到寄存器轮询。
+ * 返回 1 表示读到目标 bit，0 表示超时，-1 表示参数错误；int_vector_out 返回最后一次读到的快照。
  */
-int pa_pu_wait_irq(int timeout_ms, uint32_t* irq_count);
+int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vector_out);
+
+/* start 类命令写启动寄存器前调用，清掉上一轮遗留的驱动事件或 INT_VECTOR sticky。 */
+void pa_pu_prepare_irq_wait(void);
 
 /* 使用默认模板地址和默认图像尺寸配置 PA 校正模块。 */
 void pa_pu_configure_templates(void);

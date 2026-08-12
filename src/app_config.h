@@ -13,6 +13,11 @@
  * 的所有缓存深度。最终地址和尺寸需要与 FPGA、驱动、上位机协议三方保持一致。
  */
 
+#ifndef APP_VERSION
+/* pa_controller 应用软件版本号。发布时可通过 make APP_VERSION=x.y.z 覆盖。 */
+#define APP_VERSION "0.1.0"
+#endif
+
 #ifndef DEVICE_WIDTH
 /* FPGA 内存中一行的总像素数，包含有效图像之外的边界/偏移区域。 */
 #define DEVICE_WIDTH 3072u
@@ -46,25 +51,73 @@
 #ifndef FPGA_IMAGE_PTR
 /*
  * FPGA 写入原始图像的物理起始地址。
- * 当前值是早期占位配置；开发板上的 /dev/uio0 实际显示为 pu-pa-ddr，
- * 后续应与 FPGA/设备树确认最终共享 DDR 基址和分区。
+ * 对应设备树 pu-pa-ddr2，当前用于收取图片以制作暗场/亮场模板。
  */
-#define FPGA_IMAGE_PTR 0x20000000u
+#define FPGA_IMAGE_PTR 0x28000000u
 #endif
 
 #ifndef FPGA_OFFSET_PTR
-/* offset 模板写入 FPGA/PA 可访问内存的物理起始地址。 */
-#define FPGA_OFFSET_PTR 0x26000000u
+/* offset/暗场模板写入 FPGA/PA 可访问内存的物理起始地址，对应 pu-pa-ddr。 */
+#define FPGA_OFFSET_PTR 0x3C000000u
 #endif
 
 #ifndef FPGA_GAIN_PTR
-/* gain 模板写入 FPGA/PA 可访问内存的物理起始地址。 */
-#define FPGA_GAIN_PTR 0x28000000u
+/* gain/亮场模板写入 FPGA/PA 可访问内存的物理起始地址，对应 pu-pa-ddr1。 */
+#define FPGA_GAIN_PTR 0x38000000u
 #endif
 
 #ifndef FPGA_MEM_MAP_SIZE
-/* ARM 通过 /dev/mem mmap 的总窗口大小，需覆盖 image/offset/gain 三段区域。 */
+/* 兼容旧 /dev/mem 映射的总窗口大小；当前默认使用三个 UIO 节点分别映射。 */
 #define FPGA_MEM_MAP_SIZE 0x10000000u
+#endif
+
+#ifndef FPGA_IMAGE_UIO_DEVICE
+#define FPGA_IMAGE_UIO_DEVICE "/dev/uio2"
+#endif
+
+#ifndef FPGA_OFFSET_UIO_DEVICE
+#define FPGA_OFFSET_UIO_DEVICE "/dev/uio0"
+#endif
+
+#ifndef FPGA_GAIN_UIO_DEVICE
+#define FPGA_GAIN_UIO_DEVICE "/dev/uio1"
+#endif
+
+#ifndef FPGA_IMAGE_UIO_SIZE
+#define FPGA_IMAGE_UIO_SIZE 0x10000000u
+#endif
+
+#ifndef FPGA_OFFSET_UIO_SIZE
+#define FPGA_OFFSET_UIO_SIZE 0x04000000u
+#endif
+
+#ifndef FPGA_GAIN_UIO_SIZE
+#define FPGA_GAIN_UIO_SIZE 0x04000000u
+#endif
+
+#ifndef FPGA_MEM_USE_DEVMEM_FALLBACK
+/* UIO 映射失败时是否回退 /dev/mem；默认关闭，避免误碰裸物理地址。 */
+#define FPGA_MEM_USE_DEVMEM_FALLBACK 0u
+#endif
+
+#ifndef GAIN_TEMPLATE_REPEAT_COUNT
+/* 新亮场 UIO 窗口为 64MB，默认只存放一份有效 gain 模板。 */
+#define GAIN_TEMPLATE_REPEAT_COUNT 1u
+#endif
+
+#ifndef PA_PU_IRQ_TIMEOUT_MS
+/* start 类命令等待 INT_VECTOR 对应完成 bit 的默认超时时间。 */
+#define PA_PU_IRQ_TIMEOUT_MS 5000u
+#endif
+
+#ifndef PA_PU_IRQ_POLL_INTERVAL_US
+/* 轮询 INT_VECTOR 的间隔。读取 INT_VECTOR 会清除已置位中断。 */
+#define PA_PU_IRQ_POLL_INTERVAL_US 1000u
+#endif
+
+#ifndef PA_IRQ_DEVICE
+/* 正式 PA/PU F2P 中断驱动节点；不存在时自动回退到 INT_VECTOR 轮询。 */
+#define PA_IRQ_DEVICE "/dev/pa_irq"
 #endif
 
 #ifndef TEMPLATE_OFFSET_FILE

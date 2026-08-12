@@ -84,10 +84,10 @@ int template_load_files(fpga_mem_t* mem) {
   }
 
   /*
-   * gain 模板保留两份布局，兼容旧工程中 top/bottom 两段 gain.raw 的格式。
-   * 如果文件不存在，后续可通过 MAKE_GAIN 命令现场生成。
+   * gain 模板重复份数由 GAIN_TEMPLATE_REPEAT_COUNT 控制。
+   * 新 UIO 布局中亮场模板窗口为 64MB，默认只保存一份完整模板。
    */
-  if (load_active_template(TEMPLATE_GAIN_FILE, (uint16_t*)mem->gain_template, 2) != 0) {
+  if (load_active_template(TEMPLATE_GAIN_FILE, (uint16_t*)mem->gain_template, GAIN_TEMPLATE_REPEAT_COUNT) != 0) {
     ret = -1;
   }
 
@@ -171,7 +171,7 @@ int template_make_gain(fpga_mem_t* mem) {
    * 当前实现采用 Q12 定点：gain = mean * 4096 / corrected，并做 16 位饱和。
    * 如果 PA 端增益格式不同，只需要替换这一段换算逻辑。
    */
-  for (unsigned repeat = 0; repeat < 2; ++repeat) {
+  for (unsigned repeat = 0; repeat < GAIN_TEMPLATE_REPEAT_COUNT; ++repeat) {
     uint16_t* repeat_gain = gain + (size_t)repeat * DEVICE_WIDTH * DEVICE_HEIGHT;
     for (unsigned row = 0; row < IMAGE_HEIGHT; ++row) {
       const uint16_t* image_row = image + active_row_offset(row);
