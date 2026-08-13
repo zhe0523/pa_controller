@@ -23,9 +23,8 @@ static void on_signal(int signo) {
 }
 
 static void print_usage(const char* program) {
-  fprintf(stderr, "Usage: %s [--stdio] [--no-hw] [-d rs422_device] [-b baud]\n", program);
+  fprintf(stderr, "Usage: %s [--stdio] [-d rs422_device] [-b baud]\n", program);
   fprintf(stderr, "  --stdio: read commands from stdin and write responses to stdout\n");
-  fprintf(stderr, "  --no-hw: with --stdio, test the text protocol without FPGA/PA devices\n");
   fprintf(stderr, "  default device: %s\n", RS422_DEVICE);
   fprintf(stderr, "  default baud:   %d\n", RS422_BAUD);
 }
@@ -77,14 +76,11 @@ int main(int argc, char* argv[]) {
   const char* rs422_device = RS422_DEVICE;
   int rs422_baud = RS422_BAUD;
   bool use_stdio = false;
-  bool no_hw = false;
 
   /* 解析运行参数：--stdio 用于开发板无独立 422 口时模拟上位机命令。 */
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--stdio") == 0) {
       use_stdio = true;
-    } else if (strcmp(argv[i], "--no-hw") == 0) {
-      no_hw = true;
     } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
       rs422_device = argv[++i];
     } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
@@ -97,10 +93,6 @@ int main(int argc, char* argv[]) {
       return 1;
     }
   }
-  if (no_hw && !use_stdio) {
-    fprintf(stderr, "--no-hw can only be used with --stdio\n");
-    return 1;
-  }
 
   log_info("pa_controller start app_version=%s", APP_VERSION);
   log_info("image=%ux%u active=%ux%u offset=(%u,%u)",
@@ -110,38 +102,33 @@ int main(int argc, char* argv[]) {
   fpga_mem_t fpga_mem;
   memset(&fpga_mem, 0, sizeof(fpga_mem));
 
-  if (!no_hw) {
-    /* 映射 FPGA 图像/模板内存。模板生成和光口传图都依赖这块共享内存。 */
-    if (fpga_mem_open(&fpga_mem) != 0) {
-      return 1;
-    }
+  /* 映射 FPGA 图像/模板内存。模板生成和光口传图都依赖这块共享内存。 */
+  if (fpga_mem_open(&fpga_mem) != 0) {
+    return 1;
+  }
 
-    /* 映射 PA 控制寄存器。当前开发板阶段可能只是占位映射，真板需确认 UIO 节点。 */
-    if (pa_pu_open(PA_PU_BASE_ADDR, PA_PU_MAP_SIZE) != 0) {
-      fpga_mem_close(&fpga_mem);
-      return 1;
-    }
+  /* 映射 PA 控制寄存器。当前开发板阶段通过 /dev/mem 访问 AXI-lite 地址空间。 */
+  if (pa_pu_open(PA_PU_BASE_ADDR, PA_PU_MAP_SIZE) != 0) {
+    fpga_mem_close(&fpga_mem);
+    return 1;
+  }
 
-    /*
-     * 启动时尝试加载磁盘上的 offset/gain 模板。
-     * 文件不存在不阻断启动，上位机可通过 MAKE_OFFSET / MAKE_GAIN 现场生成。
-     */
-    if (template_load_files(&fpga_mem) == 0) {
-      pa_pu_configure_templates();
-    } else {
-      log_warn("template files not fully loaded");
-    }
+  /*
+   * 启动时尝试加载磁盘上的 offset/gain 模板。
+   * 文件不存在不阻断启动，上位机可通过 MAKE_OFFSET / MAKE_GAIN 现场生成。
+   */
+  if (template_load_files(&fpga_mem) == 0) {
+    pa_pu_configure_templates();
   } else {
-    log_info("no-hw command mode enabled");
+    log_warn("template files not fully loaded");
   }
 
   command_context_t ctx = {
-    .fpga_mem = no_hw ? NULL : &fpga_mem,
-    .hardware_enabled = !no_hw,
+    .fpga_mem = &fpga_mem,
     .should_quit = false,
   };
 
-  char command[256];
+  char command[1024];
   char response[2048];
 
   if (use_stdio) {
@@ -169,10 +156,8 @@ int main(int argc, char* argv[]) {
       log_info("stop signal received");
     }
 
-    if (!no_hw) {
-      pa_pu_close();
-      fpga_mem_close(&fpga_mem);
-    }
+    pa_pu_close();
+    fpga_mem_close(&fpga_mem);
     log_info("pa_controller stop");
     return 0;
   }

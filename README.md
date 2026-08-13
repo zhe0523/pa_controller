@@ -16,6 +16,18 @@ make APP_VERSION=0.1.0 PA_PU_BASE_ADDR=0x40000000 RS422_DEVICE=/dev/ttyS1 RS422_
 
 程序启动时会打印 `app_version`。发布时可用 `APP_VERSION=x.y.z` 指定本软件版本。
 
+默认参数集中在 `src/app_config.h`，并且都可以通过 Makefile 覆盖。比如修改默认校正配置：
+
+```sh
+make CORR_DEFAULT_ROW_NUM=7680 CORR_DEFAULT_COL_NUM=3072 \
+     CORR_DEFAULT_OFFSET_EN=1 CORR_DEFAULT_OFFSET_ADDR=0x3C000000 \
+     CORR_DEFAULT_OFFSET_ADDER_VALUE=100 \
+     CORR_DEFAULT_GAIN_EN=1 CORR_DEFAULT_GAIN_ADDR=0x38000000 \
+     CORR_DEFAULT_GAIN_CLIPPING_VALUE=55000
+```
+
+可用 `make config` 查看当前构建参数展开后的默认值。
+
 当前共享 DDR 默认使用三个 UIO 节点：
 
 ```text
@@ -124,18 +136,6 @@ make run-board BOARD_HOST=192.168.3.17 BOARD_USER=root BOARD_DIR=/root BOARD_RUN
 
 此模式下日志输出到 `stderr`，协议响应输出到 `stdout`，命令仍然与 RS422 模式完全一致。
 
-如果只想在普通 Ubuntu 上测试文本协议，不访问 `/dev/uio0`、`/dev/mem` 或 FPGA 共享内存：
-
-```sh
-./build/bin/pa_controller --stdio --no-hw
-```
-
-`--no-hw` 只能和 `--stdio` 一起使用。该模式下 `PING`、`STATUS`、`VERSION`、`SET_TIME`、
-`GET_TIME`、`SEND_SINGLE`、`START_CONTINUOUS`、`STOP_TRANSFER` 和 `QUIT` 可以不访问 PA/FPGA 硬件直接响应；
-`LOAD_TEMPLATE`、`MAKE_OFFSET`、`MAKE_GAIN`、`CONFIG_TEMPLATE`、`CONFIG_GIC`、`START_GIC`、
-`STOP_GIC`、`CONFIG_ROIC`、`START_ROIC` 和 `START_CORR`
-会返回 `ERR NO_HW`，避免误以为真实硬件动作已经执行。
-
 ## 当前 RS422 调试命令
 
 当前先使用 ASCII 行协议，命令以 `\r\n` 或 `\n` 结束，便于串口助手联调。正式上位机协议确定后，替换 `src/command_handler.c` 即可。
@@ -152,12 +152,14 @@ LOAD_TEMPLATE     -> 从 /usr/local/offset.raw 和 /usr/local/gain.raw 加载模
 MAKE_OFFSET       -> 用当前 FPGA 图像生成 offset 模板
 MAKE_GAIN         -> 用当前 FPGA 图像和 offset 模板生成 gain 模板
 CONFIG_TEMPLATE   -> 将 offset/gain 物理地址配置给 PA
+CONFIG_CORR       -> 将图像校正尺寸、模板地址和 offset/gain/defect 使能配置给 PA
 CONFIG_GIC        -> 将 GIC 时序、行范围和 binning 配置给 PA
 START_GIC         -> 启动一次 GIC 操作，等待 GIC 完成中断
 STOP_GIC          -> 停止 GIC 操作，主要用于 xao scan
 CONFIG_ROIC       -> 将默认 ROIC 寄存器、列范围和 binning 配置给 PA
 START_ROIC        -> 启动一次 ROIC 配置操作，等待 ROIC 完成中断
 START_CORR        -> 启动 PA 图像校正，等待 IMG_CORR 完成中断
+START_CORR_GIC    -> 启动 PA 图像校正后立即启动 GIC，等待 IMG_CORR 和 GIC 两个完成中断
 SEND_SINGLE       -> 当前 Qt 上位机“手动上图”，通知 PA 从 FPGA 图像地址启动一次写图流程并等待 IMG_WR 完成中断
 START_CONTINUOUS  -> 当前 Qt 上位机“开始上图”，现阶段暂按一次写图流程兼容并等待 IMG_WR 完成中断
 STOP_TRANSFER     -> 当前 Qt 上位机“停止上图”，现阶段仅确认收到停止请求
@@ -288,7 +290,8 @@ START_GIC
 CONFIG_ROIC
 START_ROIC
 CONFIG_TEMPLATE
-START_CORR
+CONFIG_CORR
+START_CORR_GIC
 SEND_SINGLE
 STATUS
 ```
@@ -310,8 +313,53 @@ CONFIG_GIC gic_req_code=0 gic_dout_en=1 gic_line_time=100000 gic_oe_raising_edge
 
 写完这些配置寄存器后，再发 `START_GIC`，程序会写 `GIC_STR=1` 让配置生效并启动一次 GIC 操作。
 
+`CONFIG_CORR` 不带参数时使用默认图像尺寸和模板地址，也可以用 `key=value` 临时覆盖：
+
+```text
+CONFIG_CORR pkg=46080 row=7680 col=3072 offset_en=1 offset_addr=0x3c000000 offset_adder=100 gain_en=1 gain_addr=0x38000000 gain_clip=55000 defect_en=0
+```
+
+也支持完整寄存器名：
+
+```text
+CONFIG_CORR img_pkg_num=46080 img_row_num=7680 img_col_num=3072 img_corr_offset_en=1 img_corr_offset_temp_str_addr=0x3c000000 img_corr_offset_adder_value=100 img_corr_gain_en=1 img_corr_gain_temp_str_addr=0x38000000 img_corr_gain_clipping_value=55000 img_corr_defect_en=0
+```
+
+写完图像校正配置后，再发 `START_CORR`，程序会写 `IMG_CORR_STR=1` 并等待表格协议中的
+IMG_CORR 完成中断 bit。
+
+如果需要图像校正启动后马上启动 GIC，可以发：
+
+```text
+START_CORR_GIC
+```
+
+该命令会先写 `IMG_CORR_STR=1`，紧接着写 `GIC_STR=1`，然后等待表格协议中的
+IMG_CORR 和 GIC 两个完成中断 bit。`START_CORR_THEN_GIC` 是等价别名。
+
 注意：`ROIC_DEFAULT_REG_*` 当前是占位值，真实 ROIC 芯片寄存器值需要由 panel
 测试参数或旧工程参数覆盖后再用于真板配置。
+
+`CONFIG_ROIC` 不带参数时使用构建默认值，也可以用 `key=value` 临时覆盖：
+
+```text
+CONFIG_ROIC start_col=0 end_col=3071 binning=1 reg_00=0x0000 reg_02=0x0000 reg_05=0x0000 reg_06=0x0000 reg_07=0x0000 reg_09=0x0000 reg_0a=0x0000 reg_0b=0x0000 reg_0c=0x0000 reg_0d=0x0000 reg_0e=0x0000 reg_0f=0x0000 reg_10=0x0000 reg_11=0x0000 reg_17=0x0000 reg_24=0x0000 reg_28=0x0000 reg_2d=0x0000 reg_3b=0x0000
+```
+
+也可以只覆盖本次需要改的字段，其它字段继续使用构建默认值：
+
+```text
+CONFIG_ROIC start_col=0 end_col=3071 binning=1
+```
+
+也支持完整寄存器名：
+
+```text
+CONFIG_ROIC roic_str_col_num=0 roic_end_col_num=3071 roic_binning_mode=1 roic_reg_00=0x0000 roic_reg_02=0x0000 roic_reg_05=0x0000 roic_reg_06=0x0000 roic_reg_07=0x0000 roic_reg_09=0x0000 roic_reg_0a=0x0000 roic_reg_0b=0x0000 roic_reg_0c=0x0000 roic_reg_0d=0x0000 roic_reg_0e=0x0000 roic_reg_0f=0x0000 roic_reg_10=0x0000 roic_reg_11=0x0000 roic_reg_17=0x0000 roic_reg_24=0x0000 roic_reg_28=0x0000 roic_reg_2d=0x0000 roic_reg_3b=0x0000
+```
+
+写完 ROIC 配置后，再发 `START_ROIC`，程序会写 `ROIC_STR=1` 并等待表格协议中的
+ROIC 完成中断 bit。
 
 说明：当前 PA/FPGA 侧尚未提供正式持续上图和停流寄存器，因此 `SEND_SINGLE`、
 `START_CONTINUOUS` 和早期 `SEND_IMAGE` 都会触发同一个 `IMG_WR_STR` 写图流程；
@@ -390,21 +438,17 @@ src/command_handler.c   临时调试命令分发
 
 ## 注意
 
-`src/pa_pu_regs.h` 中 `IMG_CORR_DEFECT_EN` 和 `IMG_CORR_DEBUG_IN` 的写地址按当前 `fpga/pa_pu_com.v` 的实际写 decode 做了兼容；如果 PA RTL 修正了这两个地址，需要同步调整。
-
 根据 `fpga/pa_pu_com_definition.xlsx` 和 `fpga/pa_pu_com.v` 对照，目前有几个需要和 FPGA 继续确认的点：
 
 ```text
-1. IMG_CORR 部分存在 0x0801、0x0802、0x0803 等非 4 字节对齐寄存器地址。
-   ARM 用户态 mmap 后做 32 位 MMIO 访问时，非对齐地址在真实硬件上有风险。
-   建议 FPGA 后续把所有寄存器地址改为 4 字节或 8 字节对齐。
+1. IMG_CORR 地址按当前协议表使用 0x0800~0x0850 的 8 字节对齐地址。
+   defect_en 写 0x0850，debug_in 写 0x09C8，不再做旧 RTL 的 defect/debug 地址互换兼容。
 
-2. xlsx 中 int_vector bit0 定义为 pa reset init done interrupt，
-   但当前 RTL 的 int_vector 只拼了 img_corr/img_wr/roic/gic 四类完成信号。
-   需要 FPGA 明确是修文档还是修 RTL。
-
-3. xlsx 中 img_corr_defect_en 地址是 0x0810，img_corr_debug_in 地址是 0x09C8；
-   当前 RTL 写 decode 里这两个地址互换，软件暂时用 WR_* 宏兼容。
+2. 软件协议以 `pa_pu_com_definition.xlsx` 为准：int_vector bit0 是 pa reset init done interrupt，
+   bit1 是 gic interrupt，bit2 是 roic interrupt，bit3 是 image write interrupt，
+   bit4 是 image correct interrupt。若当前 RTL 返回 `{img_corr_end,img_wr_end,roic_end,gic_end}`，
+   则属于 FPGA/表格协议不一致，软件侧仍按表格协议等待，并通过日志打印所有非 0 int_vector
+   方便现场定位。
 ```
 
 当前完成中断优先通过 `/dev/pa_irq` 驱动处理。`gic_str`、`roic_str`、`img_wr_str`

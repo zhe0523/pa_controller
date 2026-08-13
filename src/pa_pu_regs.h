@@ -10,10 +10,7 @@
  * RTL 中使用 upm_pu_awaddr[15:0] / upm_pu_araddr[15:0] 与这些地址比较，
  * 因此这里的值必须和 FPGA 文档保持一致。
  *
- * 重要风险：
- * IMG_CORR 模块存在 0x0801、0x0802 这类非 4 字节对齐地址。ARM 用户态通过
- * mmap 后做 32 位 MMIO 访问时，非对齐地址可能在真实硬件上触发异常或总线行为不确定。
- * 推荐 FPGA 后续把所有寄存器地址改成 4 字节或 8 字节对齐。
+ * 寄存器访问统一通过 pa_pu_read()/pa_pu_write() 做 32 位 MMIO。
  */
 
 enum {
@@ -152,40 +149,40 @@ enum {
   /* img_correct：图像校正参数、模板地址、状态和调试寄存器。 */
   /* 0x0800, pu->pa, 1bit：写 1 启动图像校正，高有效，RTL 自动清零。 */
   PA_PU_IMG_CORR_STR_REG = 0x0800,
-  /* 0x0801, pu->pa, 16bit：校正图像分包数量，xlsx 说明每包 1KB；地址非 4 字节对齐。 */
-  PA_PU_IMG_PKG_NUM_REG = 0x0801,
-  /* 0x0802, pu->pa, 16bit：校正图像行数；地址非 4 字节对齐。 */
-  PA_PU_IMG_ROW_NUM_REG = 0x0802,
-  /* 0x0803, pu->pa, 16bit：校正图像列数，xlsx 要求 4 对齐；地址非 4 字节对齐。 */
-  PA_PU_IMG_COL_NUM_REG = 0x0803,
-  /* 0x0804, pu->pa, 1bit：offset 校正使能，高有效；地址非 4 字节对齐。 */
-  PA_PU_IMG_CORR_OFFSET_EN_REG = 0x0804,
-  /* 0x0805, pu->pa, 32bit：offset 模板在 DDR3 中的起始地址，xlsx 要求 1KB 对齐；地址非 4 字节对齐。 */
-  PA_PU_IMG_CORR_OFFSET_TEMP_STR_ADDR_REG = 0x0805,
-  /* 0x0806, pu->pa, 16bit：offset 校正附加值，具体公式由 FPGA IMG_CORR 模块定义。 */
-  PA_PU_IMG_CORR_OFFSET_ADDER_VALUE_REG = 0x0806,
-  /* 0x0807, pu->pa, 1bit：gain 校正使能，高有效。 */
-  PA_PU_IMG_CORR_GAIN_EN_REG = 0x0807,
-  /* 0x0808, pu->pa, 32bit：gain 模板在 DDR3 中的起始地址，xlsx 要求 1KB 对齐。 */
-  PA_PU_IMG_CORR_GAIN_TEMP_STR_ADDR_REG = 0x0808,
-  /* 0x0809, pu->pa, 16bit：gain 校正限幅值，避免校正结果超过硬件允许范围。 */
-  PA_PU_IMG_CORR_GAIN_CLIPPING_VALUE_REG = 0x0809,
-  /* 0x0810, pu->pa, 1bit：坏点校正使能，高有效；当前 RTL 写 decode 与 debug_in 互换，见 WR_* 宏。 */
-  PA_PU_IMG_CORR_DEFECT_EN_REG = 0x0810,
+  /* 0x0808, pu->pa, 16/32bit：校正图像分包数量，按 1KB 包计数。 */
+  PA_PU_IMG_PKG_NUM_REG = 0x0808,
+  /* 0x0810, pu->pa, 16/32bit：校正图像行数。 */
+  PA_PU_IMG_ROW_NUM_REG = 0x0810,
+  /* 0x0818, pu->pa, 16/32bit：校正图像列数，xlsx 要求 4 对齐。 */
+  PA_PU_IMG_COL_NUM_REG = 0x0818,
+  /* 0x0820, pu->pa, 1bit：offset 校正使能，高有效。 */
+  PA_PU_IMG_CORR_OFFSET_EN_REG = 0x0820,
+  /* 0x0828, pu->pa, 32bit：offset 模板在 DDR3 中的起始地址，xlsx 要求 1KB 对齐。 */
+  PA_PU_IMG_CORR_OFFSET_TEMP_STR_ADDR_REG = 0x0828,
+  /* 0x0830, pu->pa, 16/32bit：offset 校正附加值，具体公式由 FPGA IMG_CORR 模块定义。 */
+  PA_PU_IMG_CORR_OFFSET_ADDER_VALUE_REG = 0x0830,
+  /* 0x0838, pu->pa, 1bit：gain 校正使能，高有效。 */
+  PA_PU_IMG_CORR_GAIN_EN_REG = 0x0838,
+  /* 0x0840, pu->pa, 32bit：gain 模板在 DDR3 中的起始地址，xlsx 要求 1KB 对齐。 */
+  PA_PU_IMG_CORR_GAIN_TEMP_STR_ADDR_REG = 0x0840,
+  /* 0x0848, pu->pa, 16/32bit：gain 校正限幅值，避免校正结果超过硬件允许范围。 */
+  PA_PU_IMG_CORR_GAIN_CLIPPING_VALUE_REG = 0x0848,
+  /* 0x0850, pu->pa, 1bit：坏点校正使能，高有效。 */
+  PA_PU_IMG_CORR_DEFECT_EN_REG = 0x0850,
   /* 0x09a0, pa->pu, 1bit：图像校正模块状态，高电平表示 busy。 */
   PA_PU_IMG_CORR_STATE_REG = 0x09a0,
   /* 0x09a8, pa->pu, 1bit：图像校正完成标志，高有效。 */
   PA_PU_IMG_CORR_END_REG = 0x09a8,
   /* 0x09c0, pa->pu, 8bit：图像校正调试/保留状态。 */
   PA_PU_IMG_CORR_DFX_REG = 0x09c0,
-  /* 0x09c8, pu->pa, 32bit：图像校正调试输入寄存器；当前 RTL 写 decode 与 defect_en 互换。 */
+  /* 0x09c8, pu->pa, 32bit：图像校正调试输入寄存器。 */
   PA_PU_IMG_CORR_DEBUG_IN_REG = 0x09c8,
   /* 0x09d0, pa->pu, 32bit：图像校正调试输出寄存器，仅调试使用。 */
   PA_PU_IMG_CORR_DEBUG_OUT_REG = 0x09d0,
 };
 
 /*
- * int_vector bit 定义，来自 xlsx：
+ * int_vector bit 定义，按 pa_pu_com_definition.xlsx 协议表执行：
  * bit31~5 reserved
  * bit4 image correct interrupt
  * bit3 image write interrupt
@@ -193,11 +190,11 @@ enum {
  * bit1 gic interrupt
  * bit0 pa reset init done interrupt
  *
- * RTL 当前 int_vector 只拼了 {img_corr_end, img_wr_end, roic_end, gic_end}，
- * 没有把 reset init done 放入 bit0；这点需要和 FPGA 确认并修正文档或 RTL。
+ * 当前 RTL 若返回 {img_corr_end, img_wr_end, roic_end, gic_end}，会和表格协议不一致；
+ * 软件侧仍以表格协议为准，现场调试通过日志观察非 0 int_vector。
  */
 enum {
-  /* bit0：PA reset 初始化完成中断。注意当前 RTL 暂未把该 bit 拼进 int_vector。 */
+  /* bit0：PA reset 初始化完成中断。 */
   PA_PU_IRQ_RST_INIT_DONE = 1u << 0,
   /* bit1：GIC 操作完成中断。 */
   PA_PU_IRQ_GIC_END = 1u << 1,
@@ -232,13 +229,6 @@ enum {
   PA_PU_BINNING_4X4 = 4u,
 };
 
-/*
- * 兼容当前 fpga/pa_pu_com.v 中 IMG_CORR 两个写地址 decode 互换的问题：
- *   img_corr_defect_en <= 写 IMG_CORR_DEBUG_IN_ADDR
- *   img_corr_debug_in  <= 写 IMG_CORR_DEFECT_EN_ADDR
- *
- * xlsx 文档中不是这样写的，所以这里保留 WR_* 宏，把“软件写哪个地址”与
- * “文档定义的逻辑寄存器”分开。FPGA 修正 RTL 后，只需要改这两个宏。
- */
-#define PA_PU_WR_IMG_CORR_DEFECT_EN_REG PA_PU_IMG_CORR_DEBUG_IN_REG
-#define PA_PU_WR_IMG_CORR_DEBUG_IN_REG PA_PU_IMG_CORR_DEFECT_EN_REG
+/* IMG_CORR 写地址按当前协议表直接写入；保留 WR_* 名称，避免上层调用点反复改动。 */
+#define PA_PU_WR_IMG_CORR_DEFECT_EN_REG PA_PU_IMG_CORR_DEFECT_EN_REG
+#define PA_PU_WR_IMG_CORR_DEBUG_IN_REG PA_PU_IMG_CORR_DEBUG_IN_REG

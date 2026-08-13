@@ -105,6 +105,60 @@
 #define GAIN_TEMPLATE_REPEAT_COUNT 1u
 #endif
 
+#ifndef CORR_DEFAULT_PKG_NUM
+/*
+ * CONFIG_CORR 不带参数时使用的默认图像校正分包数量。
+ * 写入 IMG_PKG_NUM 寄存器，按 16bit 图像字节数除以 1KB 计算：
+ *   img_pkg_num = 行 * 列 * 2 / 1024
+ */
+#define CORR_DEFAULT_PKG_NUM ((CORR_DEFAULT_ROW_NUM * CORR_DEFAULT_COL_NUM * 2u) / 1024u)
+#endif
+
+#ifndef CORR_DEFAULT_ROW_NUM
+/* CONFIG_CORR 默认校正行数，写入 IMG_ROW_NUM。 */
+#define CORR_DEFAULT_ROW_NUM 7680u
+#endif
+
+#ifndef CORR_DEFAULT_COL_NUM
+/* CONFIG_CORR 默认校正列数，写入 IMG_COL_NUM。 */
+#define CORR_DEFAULT_COL_NUM 3072u
+#endif
+
+#ifndef CORR_DEFAULT_OFFSET_EN
+/* CONFIG_CORR 默认是否启用 offset/暗场校正，写入 IMG_CORR_OFFSET_EN。 */
+#define CORR_DEFAULT_OFFSET_EN 1u
+#endif
+
+#ifndef CORR_DEFAULT_OFFSET_ADDR
+/* CONFIG_CORR 默认 offset/暗场模板物理地址，写入 IMG_CORR_OFFSET_TEMP_STR_ADDR。 */
+#define CORR_DEFAULT_OFFSET_ADDR FPGA_OFFSET_PTR
+#endif
+
+#ifndef CORR_DEFAULT_OFFSET_ADDER_VALUE
+/* CONFIG_CORR 默认 offset 校正附加值，写入 IMG_CORR_OFFSET_ADDER_VALUE。 */
+#define CORR_DEFAULT_OFFSET_ADDER_VALUE 100u
+#endif
+
+#ifndef CORR_DEFAULT_GAIN_EN
+/* CONFIG_CORR 默认是否启用 gain/亮场校正，写入 IMG_CORR_GAIN_EN。 */
+#define CORR_DEFAULT_GAIN_EN 1u
+#endif
+
+#ifndef CORR_DEFAULT_GAIN_ADDR
+/* CONFIG_CORR 默认 gain/亮场模板物理地址，写入 IMG_CORR_GAIN_TEMP_STR_ADDR。 */
+#define CORR_DEFAULT_GAIN_ADDR FPGA_GAIN_PTR
+#endif
+
+#ifndef CORR_DEFAULT_GAIN_CLIPPING_VALUE
+/* CONFIG_CORR 默认 gain 校正限幅值，写入 IMG_CORR_GAIN_CLIPPING_VALUE。 */
+#define CORR_DEFAULT_GAIN_CLIPPING_VALUE 55000u
+#endif
+
+#ifndef CORR_DEFAULT_DEFECT_EN
+/* CONFIG_CORR 默认是否启用坏点校正，写入 IMG_CORR_DEFECT_EN。 */
+#define CORR_DEFAULT_DEFECT_EN 0u
+#endif
+
 #ifndef PA_PU_IRQ_TIMEOUT_MS
 /* start 类命令等待 INT_VECTOR 对应完成 bit 的默认超时时间。 */
 #define PA_PU_IRQ_TIMEOUT_MS 5000u

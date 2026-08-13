@@ -308,13 +308,20 @@ static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* i
       ssize_t n = read(g_irq_fd, &event, sizeof(event));
       if (n == (ssize_t)sizeof(event)) {
         last_vector = event.int_vector;
+        if (last_vector != 0) {
+          log_info("pa irq int_vector=0x%08x count=%llu",
+                   last_vector,
+                   (unsigned long long)event.count);
+        }
         if ((last_vector & mask) != 0) {
           if (int_vector_out != NULL) {
             *int_vector_out = last_vector;
           }
           return 1;
         }
-        log_warn("pa irq int_vector=0x%08x does not match mask=0x%08x", last_vector, mask);
+        if (last_vector != 0) {
+          log_warn("pa irq int_vector=0x%08x does not match mask=0x%08x", last_vector, mask);
+        }
         continue;
       }
       if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -361,6 +368,9 @@ int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vect
      * 如果读到了非目标 bit，也保留在 last_vector 中返回给调用方诊断。
      */
     last_vector = pa_pu_read_int_vector();
+    if (last_vector != 0) {
+      log_info("poll INT_VECTOR=0x%08x", last_vector);
+    }
     if ((last_vector & mask) != 0) {
       if (int_vector_out != NULL) {
         *int_vector_out = last_vector;
@@ -380,6 +390,57 @@ int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vect
       return -1;
     }
   }
+}
+
+int pa_pu_wait_int_vector_all(uint32_t mask, unsigned timeout_ms, uint32_t* int_vector_out) {
+  const uint64_t start_ms = monotonic_ms();
+  uint32_t accumulated_vector = 0;
+
+  if (mask == 0) {
+    return -1;
+  }
+
+  while ((accumulated_vector & mask) != mask) {
+    const uint64_t now_ms = monotonic_ms();
+    if (now_ms - start_ms >= timeout_ms) {
+      if (int_vector_out != NULL) {
+        *int_vector_out = accumulated_vector;
+      }
+      return 0;
+    }
+
+    uint32_t current_vector = 0;
+    unsigned remain_ms = (unsigned)(timeout_ms - (now_ms - start_ms));
+    int ret = pa_pu_wait_int_vector(mask & ~accumulated_vector, remain_ms, &current_vector);
+    if (current_vector != 0) {
+      accumulated_vector |= current_vector;
+      log_info("accumulated INT_VECTOR=0x%08x wait_mask=0x%08x", accumulated_vector, mask);
+    }
+
+    if ((accumulated_vector & mask) == mask) {
+      if (int_vector_out != NULL) {
+        *int_vector_out = accumulated_vector;
+      }
+      return 1;
+    }
+    if (ret < 0) {
+      if (int_vector_out != NULL) {
+        *int_vector_out = accumulated_vector;
+      }
+      return ret;
+    }
+    if (ret == 0 && current_vector == 0) {
+      if (int_vector_out != NULL) {
+        *int_vector_out = accumulated_vector;
+      }
+      return 0;
+    }
+  }
+
+  if (int_vector_out != NULL) {
+    *int_vector_out = accumulated_vector;
+  }
+  return 1;
 }
 
 void pa_pu_configure_correction(const pa_pu_corr_config_t* config) {

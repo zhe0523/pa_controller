@@ -161,6 +161,12 @@ uint32_t pa_pu_read_int_vector(void);
  */
 int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vector_out);
 
+/*
+ * 等待 INT_VECTOR 中指定完成 bit 全部出现。
+ * 返回 1 表示累计读到全部目标 bit，0 表示超时，-1 表示参数错误；int_vector_out 返回累计快照。
+ */
+int pa_pu_wait_int_vector_all(uint32_t mask, unsigned timeout_ms, uint32_t* int_vector_out);
+
 /* start 类命令写启动寄存器前调用，清掉上一轮遗留的驱动事件或 INT_VECTOR sticky。 */
 void pa_pu_prepare_irq_wait(void);
 

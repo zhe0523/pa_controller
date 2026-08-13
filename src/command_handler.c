@@ -424,6 +424,75 @@ static bool parse_gic_config_args(const char* args, pa_pu_gic_config_t* config) 
   return true;
 }
 
+static pa_pu_corr_config_t default_corr_config(void) {
+  pa_pu_corr_config_t config = {
+    .pkg_num = CORR_DEFAULT_PKG_NUM,
+    .row_num = CORR_DEFAULT_ROW_NUM,
+    .col_num = CORR_DEFAULT_COL_NUM,
+    .offset_enable = CORR_DEFAULT_OFFSET_EN != 0,
+    .offset_template_addr = CORR_DEFAULT_OFFSET_ADDR,
+    .offset_adder_value = CORR_DEFAULT_OFFSET_ADDER_VALUE,
+    .gain_enable = CORR_DEFAULT_GAIN_EN != 0,
+    .gain_template_addr = CORR_DEFAULT_GAIN_ADDR,
+    .gain_clipping_value = CORR_DEFAULT_GAIN_CLIPPING_VALUE,
+    .defect_enable = CORR_DEFAULT_DEFECT_EN != 0,
+  };
+  return config;
+}
+
+static bool parse_corr_config_args(const char* args, pa_pu_corr_config_t* config) {
+  char buffer[384];
+  if (args == NULL || config == NULL) {
+    return false;
+  }
+  if (strlen(args) >= sizeof(buffer)) {
+    return false;
+  }
+
+  strcpy(buffer, args);
+  char* token = strtok(buffer, " ");
+  while (token != NULL) {
+    char* equals = strchr(token, '=');
+    uint32_t value = 0;
+    if (equals == NULL) {
+      return false;
+    }
+
+    *equals = '\0';
+    if (!parse_u32_value(equals + 1, &value)) {
+      return false;
+    }
+
+    if (strcmp(token, "pkg") == 0 || strcmp(token, "pkg_num") == 0 || strcmp(token, "img_pkg_num") == 0) {
+      config->pkg_num = (uint16_t)value;
+    } else if (strcmp(token, "row") == 0 || strcmp(token, "row_num") == 0 || strcmp(token, "img_row_num") == 0) {
+      config->row_num = (uint16_t)value;
+    } else if (strcmp(token, "col") == 0 || strcmp(token, "col_num") == 0 || strcmp(token, "img_col_num") == 0) {
+      config->col_num = (uint16_t)value;
+    } else if (strcmp(token, "offset_en") == 0 || strcmp(token, "offset_enable") == 0 || strcmp(token, "img_corr_offset_en") == 0) {
+      config->offset_enable = value != 0;
+    } else if (strcmp(token, "offset_addr") == 0 || strcmp(token, "offset_template_addr") == 0 || strcmp(token, "img_corr_offset_temp_str_addr") == 0) {
+      config->offset_template_addr = value;
+    } else if (strcmp(token, "offset_adder") == 0 || strcmp(token, "offset_adder_value") == 0 || strcmp(token, "img_corr_offset_adder_value") == 0) {
+      config->offset_adder_value = (uint16_t)value;
+    } else if (strcmp(token, "gain_en") == 0 || strcmp(token, "gain_enable") == 0 || strcmp(token, "img_corr_gain_en") == 0) {
+      config->gain_enable = value != 0;
+    } else if (strcmp(token, "gain_addr") == 0 || strcmp(token, "gain_template_addr") == 0 || strcmp(token, "img_corr_gain_temp_str_addr") == 0) {
+      config->gain_template_addr = value;
+    } else if (strcmp(token, "gain_clip") == 0 || strcmp(token, "gain_clipping_value") == 0 || strcmp(token, "img_corr_gain_clipping_value") == 0) {
+      config->gain_clipping_value = (uint16_t)value;
+    } else if (strcmp(token, "defect_en") == 0 || strcmp(token, "defect_enable") == 0 || strcmp(token, "img_corr_defect_en") == 0) {
+      config->defect_enable = value != 0;
+    } else {
+      return false;
+    }
+
+    token = strtok(NULL, " ");
+  }
+
+  return true;
+}
+
 static pa_pu_gic_config_t default_gic_config(void) {
   pa_pu_gic_config_t config = {
     .req_code = GIC_DEFAULT_REQ_CODE,
@@ -436,6 +505,111 @@ static pa_pu_gic_config_t default_gic_config(void) {
     .binning_mode = GIC_DEFAULT_BINNING,
   };
   return config;
+}
+
+static pa_pu_roic_config_t default_roic_config(void) {
+  pa_pu_roic_config_t config = {
+    .reg_00 = ROIC_DEFAULT_REG_00,
+    .reg_02 = ROIC_DEFAULT_REG_02,
+    .reg_05 = ROIC_DEFAULT_REG_05,
+    .reg_06 = ROIC_DEFAULT_REG_06,
+    .reg_07 = ROIC_DEFAULT_REG_07,
+    .reg_09 = ROIC_DEFAULT_REG_09,
+    .reg_0a = ROIC_DEFAULT_REG_0A,
+    .reg_0b = ROIC_DEFAULT_REG_0B,
+    .reg_0c = ROIC_DEFAULT_REG_0C,
+    .reg_0d = ROIC_DEFAULT_REG_0D,
+    .reg_0e = ROIC_DEFAULT_REG_0E,
+    .reg_0f = ROIC_DEFAULT_REG_0F,
+    .reg_10 = ROIC_DEFAULT_REG_10,
+    .reg_11 = ROIC_DEFAULT_REG_11,
+    .reg_17 = ROIC_DEFAULT_REG_17,
+    .reg_24 = ROIC_DEFAULT_REG_24,
+    .reg_28 = ROIC_DEFAULT_REG_28,
+    .reg_2d = ROIC_DEFAULT_REG_2D,
+    .reg_3b = ROIC_DEFAULT_REG_3B,
+    .start_col = ROIC_DEFAULT_START_COL,
+    .end_col = ROIC_DEFAULT_END_COL,
+    .binning_mode = ROIC_DEFAULT_BINNING,
+  };
+  return config;
+}
+
+static bool parse_roic_config_args(const char* args, pa_pu_roic_config_t* config) {
+  char buffer[512];
+  if (args == NULL || config == NULL) {
+    return false;
+  }
+  if (strlen(args) >= sizeof(buffer)) {
+    return false;
+  }
+
+  strcpy(buffer, args);
+  char* token = strtok(buffer, " ");
+  while (token != NULL) {
+    char* equals = strchr(token, '=');
+    uint32_t value = 0;
+    if (equals == NULL) {
+      return false;
+    }
+
+    *equals = '\0';
+    if (!parse_u32_value(equals + 1, &value)) {
+      return false;
+    }
+
+    if (strcmp(token, "reg_00") == 0 || strcmp(token, "roic_reg_00") == 0) {
+      config->reg_00 = (uint16_t)value;
+    } else if (strcmp(token, "reg_02") == 0 || strcmp(token, "roic_reg_02") == 0) {
+      config->reg_02 = (uint16_t)value;
+    } else if (strcmp(token, "reg_05") == 0 || strcmp(token, "roic_reg_05") == 0) {
+      config->reg_05 = (uint16_t)value;
+    } else if (strcmp(token, "reg_06") == 0 || strcmp(token, "roic_reg_06") == 0) {
+      config->reg_06 = (uint16_t)value;
+    } else if (strcmp(token, "reg_07") == 0 || strcmp(token, "roic_reg_07") == 0) {
+      config->reg_07 = (uint16_t)value;
+    } else if (strcmp(token, "reg_09") == 0 || strcmp(token, "roic_reg_09") == 0) {
+      config->reg_09 = (uint16_t)value;
+    } else if (strcmp(token, "reg_0a") == 0 || strcmp(token, "roic_reg_0a") == 0) {
+      config->reg_0a = (uint16_t)value;
+    } else if (strcmp(token, "reg_0b") == 0 || strcmp(token, "roic_reg_0b") == 0) {
+      config->reg_0b = (uint16_t)value;
+    } else if (strcmp(token, "reg_0c") == 0 || strcmp(token, "roic_reg_0c") == 0) {
+      config->reg_0c = (uint16_t)value;
+    } else if (strcmp(token, "reg_0d") == 0 || strcmp(token, "roic_reg_0d") == 0) {
+      config->reg_0d = (uint16_t)value;
+    } else if (strcmp(token, "reg_0e") == 0 || strcmp(token, "roic_reg_0e") == 0) {
+      config->reg_0e = (uint16_t)value;
+    } else if (strcmp(token, "reg_0f") == 0 || strcmp(token, "roic_reg_0f") == 0) {
+      config->reg_0f = (uint16_t)value;
+    } else if (strcmp(token, "reg_10") == 0 || strcmp(token, "roic_reg_10") == 0) {
+      config->reg_10 = (uint16_t)value;
+    } else if (strcmp(token, "reg_11") == 0 || strcmp(token, "roic_reg_11") == 0) {
+      config->reg_11 = (uint16_t)value;
+    } else if (strcmp(token, "reg_17") == 0 || strcmp(token, "roic_reg_17") == 0) {
+      config->reg_17 = (uint16_t)value;
+    } else if (strcmp(token, "reg_24") == 0 || strcmp(token, "roic_reg_24") == 0) {
+      config->reg_24 = (uint16_t)value;
+    } else if (strcmp(token, "reg_28") == 0 || strcmp(token, "roic_reg_28") == 0) {
+      config->reg_28 = (uint16_t)value;
+    } else if (strcmp(token, "reg_2d") == 0 || strcmp(token, "roic_reg_2d") == 0) {
+      config->reg_2d = (uint16_t)value;
+    } else if (strcmp(token, "reg_3b") == 0 || strcmp(token, "roic_reg_3b") == 0) {
+      config->reg_3b = (uint16_t)value;
+    } else if (strcmp(token, "start_col") == 0 || strcmp(token, "roic_str_col_num") == 0) {
+      config->start_col = (uint16_t)value;
+    } else if (strcmp(token, "end_col") == 0 || strcmp(token, "roic_end_col_num") == 0) {
+      config->end_col = (uint16_t)value;
+    } else if (strcmp(token, "binning") == 0 || strcmp(token, "roic_binning_mode") == 0) {
+      config->binning_mode = (uint8_t)value;
+    } else {
+      return false;
+    }
+
+    token = strtok(NULL, " ");
+  }
+
+  return true;
 }
 
 static void write_status_response(char* response, size_t response_size) {
@@ -467,11 +641,6 @@ static void write_status_response(char* response, size_t response_size) {
            status.roic_dfx);
 }
 
-static void write_no_hw_status_response(char* response, size_t response_size) {
-  snprintf(response, response_size,
-           "OK STATUS pa_version=0x00000000 pa_build_information=0x00000000 adapted_main_board_version=0x00000000 adapted_gic_board_version=0x00000000 adapted_roic_board_version=0x00000000 adapted_reserved_board_0_version=0x00000000 adapted_reserved_board_1_version=0x00000000 adapted_reserved_board_2_version=0x00000000 pa_pu_com_version=0x00000000 pa_rst_init_state=0x00000000 wr_state=0x00000000 wr_end=0x00000000 corr_state=0x00000000 corr_end=0x00000000 gic_state=0x00000000 gic_end=0x00000000 gic_dfx=0x00000000 roic_state=0x00000000 roic_end=0x00000000 roic_dfx=0x00000000\r\n");
-}
-
 static void format_fpga_version(uint32_t value, char* text, size_t text_size) {
   snprintf(text, text_size,
            "%u.%u.%u",
@@ -493,7 +662,7 @@ static void format_fpga_build_information(uint32_t value, char* text, size_t tex
   snprintf(text, text_size, "%04u-%02u-%02u.%u", year, month, day, sub);
 }
 
-static void write_version_response(bool hardware_enabled, char* response, size_t response_size) {
+static void write_version_response(char* response, size_t response_size) {
   pa_pu_status_t status;
   char pa_version[16];
   char pa_build_information[24];
@@ -506,9 +675,7 @@ static void write_version_response(bool hardware_enabled, char* response, size_t
   char pa_pu_com_version[16];
   memset(&status, 0, sizeof(status));
 
-  if (hardware_enabled) {
-    pa_pu_read_status(&status);
-  }
+  pa_pu_read_status(&status);
 
   format_fpga_version(status.pa_version, pa_version, sizeof(pa_version));
   format_fpga_build_information(status.pa_build_information, pa_build_information, sizeof(pa_build_information));
@@ -534,14 +701,6 @@ static void write_version_response(bool hardware_enabled, char* response, size_t
            pa_pu_com_version);
 }
 
-static bool reject_no_hw(const command_context_t* ctx, char* response, size_t response_size) {
-  if (ctx != NULL && !ctx->hardware_enabled) {
-    snprintf(response, response_size, "ERR NO_HW\r\n");
-    return true;
-  }
-  return false;
-}
-
 static void write_start_result(char* response,
                                size_t response_size,
                                const char* command,
@@ -552,6 +711,21 @@ static void write_start_result(char* response,
     snprintf(response, response_size, "OK %s int_vector=0x%08x\r\n", command, int_vector);
   } else if (ret == 0) {
     snprintf(response, response_size, "ERR %s TIMEOUT int_vector=0x%08x\r\n", command, int_vector);
+  } else {
+    snprintf(response, response_size, "ERR %s IRQ_WAIT\r\n", command);
+  }
+}
+
+static void write_start_combo_result(char* response,
+                                     size_t response_size,
+                                     const char* command,
+                                     uint32_t irq_mask) {
+  uint32_t int_vector = 0;
+  int ret = pa_pu_wait_int_vector_all(irq_mask, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
+  if (ret > 0) {
+    snprintf(response, response_size, "OK %s int_vector=0x%08x\r\n", command, int_vector);
+  } else if (ret == 0) {
+    snprintf(response, response_size, "ERR %s TIMEOUT int_vector=0x%08x wait_mask=0x%08x\r\n", command, int_vector, irq_mask);
   } else {
     snprintf(response, response_size, "ERR %s IRQ_WAIT\r\n", command);
   }
@@ -576,17 +750,13 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
 
   if (cmd_is(command, "STATUS")) {
     /* 读取 PA/FPGA 当前非清除类状态，用于上位机刷新状态栏或调试。 */
-    if (ctx->hardware_enabled) {
-      write_status_response(response, response_size);
-    } else {
-      write_no_hw_status_response(response, response_size);
-    }
+    write_status_response(response, response_size);
     return 0;
   }
 
   if (cmd_is(command, "VERSION") || cmd_is(command, "GET_VERSION")) {
     /* 返回 ARM 应用版本和 PA/FPGA 版本寄存器，不读取 read-clear 的 INT_VECTOR。 */
-    write_version_response(ctx->hardware_enabled, response, response_size);
+    write_version_response(response, response_size);
     return 0;
   }
 
@@ -622,9 +792,6 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (is_read_reg_command(command)) {
-    if (reject_no_hw(ctx, response, response_size)) {
-      return 0;
-    }
 
     const char* args = cmd_args(command);
     char reg_text[96];
@@ -640,9 +807,6 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (is_write_reg_command(command)) {
-    if (reject_no_hw(ctx, response, response_size)) {
-      return 0;
-    }
 
     const char* args = cmd_args(command);
     char reg_text[96];
@@ -663,9 +827,6 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "LOAD_TEMPLATE")) {
-    if (reject_no_hw(ctx, response, response_size)) {
-      return 0;
-    }
     /* 从文件系统加载 offset/gain 模板，适合设备重启后恢复已有校正模板。 */
     if (template_load_files(ctx->fpga_mem) == 0) {
       pa_pu_configure_templates();
@@ -677,9 +838,6 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "MAKE_OFFSET")) {
-    if (reject_no_hw(ctx, response, response_size)) {
-      return 0;
-    }
     /* 用当前暗场图像生成 offset 模板；上位机应先确保当前帧是有效暗场。 */
     if (template_make_offset(ctx->fpga_mem) == 0) {
       pa_pu_configure_templates();
@@ -691,9 +849,6 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "MAKE_GAIN")) {
-    if (reject_no_hw(ctx, response, response_size)) {
-      return 0;
-    }
     /* 用当前亮场图像和已有 offset 模板生成 gain 模板；需先执行或加载 offset。 */
     if (template_make_gain(ctx->fpga_mem) == 0) {
       pa_pu_configure_templates();
@@ -705,19 +860,39 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "CONFIG_TEMPLATE")) {
-    if (reject_no_hw(ctx, response, response_size)) {
-      return 0;
-    }
     /* 只重新下发模板地址/尺寸配置，不重新生成或加载模板内容。 */
     pa_pu_configure_templates();
     snprintf(response, response_size, "OK CONFIG_TEMPLATE\r\n");
     return 0;
   }
 
-  if (cmd_has_name(command, "CONFIG_GIC")) {
-    if (reject_no_hw(ctx, response, response_size)) {
+  if (cmd_has_name(command, "CONFIG_CORR") || cmd_has_name(command, "CONFIG_IMG_CORR")) {
+    /*
+     * 下发图像校正尺寸、offset/gain/defect 使能和模板地址。
+     * 不带参数时使用默认图像尺寸和模板地址；带 key=value 时覆盖对应字段。
+     */
+    pa_pu_corr_config_t config = default_corr_config();
+    if (!parse_corr_config_args(cmd_args(command), &config)) {
+      snprintf(response, response_size, "ERR CONFIG_CORR ARG\r\n");
       return 0;
     }
+    pa_pu_configure_correction(&config);
+    snprintf(response, response_size,
+             "OK CONFIG_CORR pkg=%u row=%u col=%u offset_en=%u offset_addr=0x%08x offset_adder=%u gain_en=%u gain_addr=0x%08x gain_clip=%u defect_en=%u\r\n",
+             config.pkg_num,
+             config.row_num,
+             config.col_num,
+             config.offset_enable ? 1u : 0u,
+             config.offset_template_addr,
+             config.offset_adder_value,
+             config.gain_enable ? 1u : 0u,
+             config.gain_template_addr,
+             config.gain_clipping_value,
+             config.defect_enable ? 1u : 0u);
+    return 0;
+  }
+
+  if (cmd_has_name(command, "CONFIG_GIC")) {
     /*
      * 下发 GIC 时序、行范围和 binning 配置。
      * 不带参数时使用 app_config.h 的默认值；带 key=value 时覆盖对应字段。
@@ -742,9 +917,6 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "START_GIC")) {
-    if (reject_no_hw(ctx, response, response_size)) {
-      return 0;
-    }
     /* 启动一次 GIC 操作，并等待 INT_VECTOR 中的 GIC 完成 bit。 */
     pa_pu_prepare_irq_wait();
     pa_pu_start_gic();
@@ -753,32 +925,32 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "STOP_GIC")) {
-    if (reject_no_hw(ctx, response, response_size)) {
-      return 0;
-    }
     /* 主要用于 xao scan 模式；其它模式下是否有效由 FPGA 决定。 */
     pa_pu_stop_gic();
     snprintf(response, response_size, "OK STOP_GIC\r\n");
     return 0;
   }
 
-  if (cmd_is(command, "CONFIG_ROIC")) {
-    if (reject_no_hw(ctx, response, response_size)) {
+  if (cmd_has_name(command, "CONFIG_ROIC")) {
+    /*
+     * 下发 ROIC 芯片寄存器和列范围配置，但不立即启动。
+     * 不带参数时使用 app_config.h 的默认值；带 key=value 时覆盖对应字段。
+     */
+    pa_pu_roic_config_t config = default_roic_config();
+    if (!parse_roic_config_args(cmd_args(command), &config)) {
+      snprintf(response, response_size, "ERR CONFIG_ROIC ARG\r\n");
       return 0;
     }
-    /*
-     * 下发 ROIC 芯片寄存器默认值和列范围配置，但不立即启动。
-     * ROIC_DEFAULT_REG_* 现在是占位值，真板联调前应按 panel 参数覆盖。
-     */
-    pa_pu_configure_roic_defaults();
-    snprintf(response, response_size, "OK CONFIG_ROIC\r\n");
+    pa_pu_configure_roic(&config);
+    snprintf(response, response_size,
+             "OK CONFIG_ROIC start_col=%u end_col=%u binning=%u\r\n",
+             config.start_col,
+             config.end_col,
+             config.binning_mode);
     return 0;
   }
 
   if (cmd_is(command, "START_ROIC")) {
-    if (reject_no_hw(ctx, response, response_size)) {
-      return 0;
-    }
     /* 启动一次 ROIC 配置操作，并等待 INT_VECTOR 中的 ROIC 完成 bit。 */
     pa_pu_prepare_irq_wait();
     pa_pu_start_roic();
@@ -787,13 +959,25 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "START_CORR")) {
-    if (reject_no_hw(ctx, response, response_size)) {
-      return 0;
-    }
     /* 启动 FPGA 图像校正，并等待 INT_VECTOR 中的 IMG_CORR 完成 bit。 */
     pa_pu_prepare_irq_wait();
     pa_pu_start_correction();
     write_start_result(response, response_size, "START_CORR", PA_PU_IRQ_IMG_CORR_END);
+    return 0;
+  }
+
+  if (cmd_is(command, "START_CORR_GIC") || cmd_is(command, "START_CORR_THEN_GIC")) {
+    /*
+     * 启动图像校正后立即启动 GIC，不等待 IMG_CORR 完成后再启动 GIC。
+     * 随后等待 IMG_CORR 和 GIC 两个完成中断 bit 都出现。
+     */
+    pa_pu_prepare_irq_wait();
+    pa_pu_start_correction();
+    pa_pu_start_gic();
+    write_start_combo_result(response,
+                             response_size,
+                             "START_CORR_GIC",
+                             PA_PU_IRQ_IMG_CORR_END | PA_PU_IRQ_GIC_END);
     return 0;
   }
 
@@ -806,20 +990,16 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
      * 的客户入口命令。当前 FPGA 侧尚未区分单帧和持续上图，因此两者暂时都触发
      * 同一次写图流程，后续硬件支持持续模式后只需要在这里拆分实现。
      */
-    if (ctx->hardware_enabled) {
-      pa_pu_prepare_irq_wait();
-      pa_pu_start_image_write(FPGA_IMAGE_PTR);
-      uint32_t int_vector = 0;
-      int ret = pa_pu_wait_int_vector(PA_PU_IRQ_IMG_WR_END, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
-      if (ret > 0) {
-        snprintf(response, response_size, "OK %s addr=0x%08x int_vector=0x%08x\r\n", command, FPGA_IMAGE_PTR, int_vector);
-      } else if (ret == 0) {
-        snprintf(response, response_size, "ERR %s TIMEOUT addr=0x%08x int_vector=0x%08x\r\n", command, FPGA_IMAGE_PTR, int_vector);
-      } else {
-        snprintf(response, response_size, "ERR %s IRQ_WAIT addr=0x%08x\r\n", command, FPGA_IMAGE_PTR);
-      }
+    pa_pu_prepare_irq_wait();
+    pa_pu_start_image_write(FPGA_IMAGE_PTR);
+    uint32_t int_vector = 0;
+    int ret = pa_pu_wait_int_vector(PA_PU_IRQ_IMG_WR_END, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
+    if (ret > 0) {
+      snprintf(response, response_size, "OK %s addr=0x%08x int_vector=0x%08x\r\n", command, FPGA_IMAGE_PTR, int_vector);
+    } else if (ret == 0) {
+      snprintf(response, response_size, "ERR %s TIMEOUT addr=0x%08x int_vector=0x%08x\r\n", command, FPGA_IMAGE_PTR, int_vector);
     } else {
-      snprintf(response, response_size, "OK %s addr=0x%08x\r\n", command, FPGA_IMAGE_PTR);
+      snprintf(response, response_size, "ERR %s IRQ_WAIT addr=0x%08x\r\n", command, FPGA_IMAGE_PTR);
     }
     return 0;
   }
