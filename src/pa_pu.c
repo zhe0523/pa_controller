@@ -34,6 +34,104 @@ typedef struct {
   uint64_t timestamp_ns;
 } pa_irq_event_t;
 
+typedef struct {
+  const char* name;
+  uint16_t reg;
+} pa_pu_reg_desc_t;
+
+static const pa_pu_reg_desc_t k_pa_pu_reg_descs[] = {
+  {"int_vector", PA_PU_INT_VECTOR_REG},
+  {"pa_version", PA_PU_PA_VERSION_REG},
+  {"pa_build_information", PA_PU_PA_BUILD_INFORMATION_REG},
+  {"adapted_main_board_version", PA_PU_ADAPTED_MAIN_BOARD_VERSION_REG},
+  {"adapted_gic_board_version", PA_PU_ADAPTED_GIC_BOARD_VERSION_REG},
+  {"adapted_roic_board_version", PA_PU_ADAPTED_ROIC_BOARD_VERSION_REG},
+  {"adapted_reserved_board_0_version", PA_PU_ADAPTED_RESERVED_BOARD_0_VERSION_REG},
+  {"adapted_reserved_board_1_version", PA_PU_ADAPTED_RESERVED_BOARD_1_VERSION_REG},
+  {"adapted_reserved_board_2_version", PA_PU_ADAPTED_RESERVED_BOARD_2_VERSION_REG},
+  {"pa_pu_com_version", PA_PU_COM_VERSION_REG},
+  {"rst_init_state", PA_PU_RST_INIT_STATE_REG},
+  {"gic_str", PA_PU_GIC_STR_REG},
+  {"gic_stop", PA_PU_GIC_STOP_REG},
+  {"gic_req_code", PA_PU_GIC_REQ_CODE_REG},
+  {"gic_dout_en", PA_PU_GIC_DOUT_EN_REG},
+  {"gic_line_time", PA_PU_GIC_LINE_TIME_REG},
+  {"gic_oe_raising_edge", PA_PU_GIC_OE_RAISING_EDGE_REG},
+  {"gic_oe_falling_edge", PA_PU_GIC_OE_FALLING_EDGE_REG},
+  {"gic_str_row_num", PA_PU_GIC_STR_ROW_NUM_REG},
+  {"gic_end_row_num", PA_PU_GIC_END_ROW_NUM_REG},
+  {"gic_binning_mode", PA_PU_GIC_BINNING_MODE_REG},
+  {"gic_state", PA_PU_GIC_STATE_REG},
+  {"gic_end", PA_PU_GIC_END_REG},
+  {"gic_dfx", PA_PU_GIC_DFX_REG},
+  {"gic_debug_in", PA_PU_GIC_DEBUG_IN_REG},
+  {"gic_debug_out", PA_PU_GIC_DEBUG_OUT_REG},
+  {"roic_str", PA_PU_ROIC_STR_REG},
+  {"roic_req_code", PA_PU_ROIC_REQ_CODE_REG},
+  {"roic_reg_00", PA_PU_ROIC_REG_00_REG},
+  {"roic_reg_02", PA_PU_ROIC_REG_02_REG},
+  {"roic_reg_05", PA_PU_ROIC_REG_05_REG},
+  {"roic_reg_06", PA_PU_ROIC_REG_06_REG},
+  {"roic_reg_07", PA_PU_ROIC_REG_07_REG},
+  {"roic_reg_09", PA_PU_ROIC_REG_09_REG},
+  {"roic_reg_0a", PA_PU_ROIC_REG_0A_REG},
+  {"roic_reg_0b", PA_PU_ROIC_REG_0B_REG},
+  {"roic_reg_0c", PA_PU_ROIC_REG_0C_REG},
+  {"roic_reg_0d", PA_PU_ROIC_REG_0D_REG},
+  {"roic_reg_0e", PA_PU_ROIC_REG_0E_REG},
+  {"roic_reg_0f", PA_PU_ROIC_REG_0F_REG},
+  {"roic_reg_10", PA_PU_ROIC_REG_10_REG},
+  {"roic_reg_11", PA_PU_ROIC_REG_11_REG},
+  {"roic_reg_17", PA_PU_ROIC_REG_17_REG},
+  {"roic_reg_24", PA_PU_ROIC_REG_24_REG},
+  {"roic_reg_28", PA_PU_ROIC_REG_28_REG},
+  {"roic_reg_2d", PA_PU_ROIC_REG_2D_REG},
+  {"roic_reg_3b", PA_PU_ROIC_REG_3B_REG},
+  {"roic_str_col_num", PA_PU_ROIC_STR_COL_NUM_REG},
+  {"roic_end_col_num", PA_PU_ROIC_END_COL_NUM_REG},
+  {"roic_binning_mode", PA_PU_ROIC_BINNING_MODE_REG},
+  {"roic_state", PA_PU_ROIC_STATE_REG},
+  {"roic_end", PA_PU_ROIC_END_REG},
+  {"roic_dfx", PA_PU_ROIC_DFX_REG},
+  {"roic_debug_in", PA_PU_ROIC_DEBUG_IN_REG},
+  {"roic_debug_out", PA_PU_ROIC_DEBUG_OUT_REG},
+  {"img_wr_str", PA_PU_IMG_WR_STR_REG},
+  {"img_wr_str_addr", PA_PU_IMG_WR_STR_ADDR_REG},
+  {"img_wr_state", PA_PU_IMG_WR_STATE_REG},
+  {"img_wr_end", PA_PU_IMG_WR_END_REG},
+  {"img_wr_dfx", PA_PU_IMG_WR_DFX_REG},
+  {"img_wr_debug_in", PA_PU_IMG_WR_DEBUG_IN_REG},
+  {"img_wr_debug_out", PA_PU_IMG_WR_DEBUG_OUT_REG},
+  {"img_corr_str", PA_PU_IMG_CORR_STR_REG},
+  {"img_pkg_num", PA_PU_IMG_PKG_NUM_REG},
+  {"img_row_num", PA_PU_IMG_ROW_NUM_REG},
+  {"img_col_num", PA_PU_IMG_COL_NUM_REG},
+  {"img_corr_offset_en", PA_PU_IMG_CORR_OFFSET_EN_REG},
+  {"img_corr_offset_temp_str_addr", PA_PU_IMG_CORR_OFFSET_TEMP_STR_ADDR_REG},
+  {"img_corr_offset_adder_value", PA_PU_IMG_CORR_OFFSET_ADDER_VALUE_REG},
+  {"img_corr_gain_en", PA_PU_IMG_CORR_GAIN_EN_REG},
+  {"img_corr_gain_temp_str_addr", PA_PU_IMG_CORR_GAIN_TEMP_STR_ADDR_REG},
+  {"img_corr_gain_clipping_value", PA_PU_IMG_CORR_GAIN_CLIPPING_VALUE_REG},
+  {"img_corr_defect_en", PA_PU_IMG_CORR_DEFECT_EN_REG},
+  {"img_corr_state", PA_PU_IMG_CORR_STATE_REG},
+  {"img_corr_end", PA_PU_IMG_CORR_END_REG},
+  {"img_corr_dfx", PA_PU_IMG_CORR_DFX_REG},
+  {"img_corr_debug_in", PA_PU_IMG_CORR_DEBUG_IN_REG},
+  {"img_corr_debug_out", PA_PU_IMG_CORR_DEBUG_OUT_REG},
+};
+
+static size_t pa_pu_reg_desc_count(void) {
+  return sizeof(k_pa_pu_reg_descs) / sizeof(k_pa_pu_reg_descs[0]);
+}
+
+static bool pa_pu_reg_is_read_clear(uint16_t reg) {
+  /*
+   * INT_VECTOR 是硬件 read-clear 寄存器，读一次会清除 pending 中断。
+   * 调试快照不能碰它，否则可能把现场中断消费掉。
+   */
+  return reg == PA_PU_INT_VECTOR_REG;
+}
+
 static int pa_pu_open_uio(size_t map_size) {
   if (PA_PU_UIO_DEVICE[0] == '\0') {
     return -1;
@@ -192,6 +290,71 @@ void pa_pu_read_status(pa_pu_status_t* status) {
   status->roic_dfx = pa_pu_read(PA_PU_ROIC_DFX_REG);
 }
 
+void pa_pu_dump_all_registers(const char* reason) {
+  const char* text = reason != NULL ? reason : "manual";
+  size_t count = 0;
+  size_t skipped = 0;
+
+  log_error("pa_pu register dump begin reason=%s total=%lu", text, (unsigned long)pa_pu_reg_desc_count());
+  for (size_t i = 0; i < pa_pu_reg_desc_count(); ++i) {
+    const pa_pu_reg_desc_t* desc = &k_pa_pu_reg_descs[i];
+    if (pa_pu_reg_is_read_clear(desc->reg)) {
+      ++skipped;
+      log_error("pa_pu reg %-34s offset=0x%04x skipped=read_clear",
+                desc->name,
+                desc->reg);
+      continue;
+    }
+
+    uint32_t value = pa_pu_read(desc->reg);
+    ++count;
+    log_error("pa_pu reg %-34s offset=0x%04x value=0x%08x",
+              desc->name,
+              desc->reg,
+              value);
+  }
+  log_error("pa_pu register dump end reason=%s count=%lu skipped=%lu",
+            text,
+            (unsigned long)count,
+            (unsigned long)skipped);
+}
+
+size_t pa_pu_dump_safe_registers(const char* reason, size_t* skipped_out) {
+  const char* text = reason != NULL ? reason : "manual";
+  size_t count = 0;
+  size_t skipped = 0;
+
+  log_info("pa_pu safe register dump begin reason=%s total=%lu",
+           text,
+           (unsigned long)pa_pu_reg_desc_count());
+  for (size_t i = 0; i < pa_pu_reg_desc_count(); ++i) {
+    const pa_pu_reg_desc_t* desc = &k_pa_pu_reg_descs[i];
+    if (pa_pu_reg_is_read_clear(desc->reg)) {
+      ++skipped;
+      log_info("pa_pu reg %-34s offset=0x%04x skipped=read_clear",
+               desc->name,
+               desc->reg);
+      continue;
+    }
+
+    uint32_t value = pa_pu_read(desc->reg);
+    ++count;
+    log_info("pa_pu reg %-34s offset=0x%04x value=0x%08x",
+             desc->name,
+             desc->reg,
+             value);
+  }
+  log_info("pa_pu safe register dump end reason=%s count=%lu skipped=%lu",
+           text,
+           (unsigned long)count,
+           (unsigned long)skipped);
+
+  if (skipped_out != NULL) {
+    *skipped_out = skipped;
+  }
+  return count;
+}
+
 uint32_t pa_pu_read_int_vector(void) {
   return pa_pu_read(PA_PU_INT_VECTOR_REG);
 }
@@ -308,11 +471,6 @@ static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* i
       ssize_t n = read(g_irq_fd, &event, sizeof(event));
       if (n == (ssize_t)sizeof(event)) {
         last_vector = event.int_vector;
-        if (last_vector != 0) {
-          log_info("pa irq int_vector=0x%08x count=%llu",
-                   last_vector,
-                   (unsigned long long)event.count);
-        }
         if ((last_vector & mask) != 0) {
           if (int_vector_out != NULL) {
             *int_vector_out = last_vector;
@@ -368,7 +526,9 @@ int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vect
      * 如果读到了非目标 bit，也保留在 last_vector 中返回给调用方诊断。
      */
     last_vector = pa_pu_read_int_vector();
-    if (last_vector != 0) {
+    if (last_vector != 0 && (last_vector & mask) == 0) {
+      log_warn("poll INT_VECTOR=0x%08x does not match mask=0x%08x", last_vector, mask);
+    } else if (last_vector != 0 && mask != PA_PU_IRQ_GIC_END) {
       log_info("poll INT_VECTOR=0x%08x", last_vector);
     }
     if ((last_vector & mask) != 0) {
@@ -462,18 +622,18 @@ void pa_pu_configure_correction(const pa_pu_corr_config_t* config) {
 }
 
 void pa_pu_configure_templates(void) {
-  /* 当前默认配置：启用 offset/gain，关闭坏点校正，图像尺寸来自 app_config.h。 */
+  /* 使用 app_config.h/Makefile 中的统一默认图像校正配置。 */
   pa_pu_corr_config_t config = {
-    .pkg_num = 8,
-    .row_num = IMAGE_HEIGHT,
-    .col_num = IMAGE_WIDTH,
-    .offset_enable = true,
-    .offset_template_addr = FPGA_OFFSET_PTR,
-    .offset_adder_value = 0,
-    .gain_enable = true,
-    .gain_template_addr = FPGA_GAIN_PTR,
-    .gain_clipping_value = 0xffff,
-    .defect_enable = false,
+    .pkg_num = CORR_DEFAULT_PKG_NUM,
+    .row_num = CORR_DEFAULT_ROW_NUM,
+    .col_num = CORR_DEFAULT_COL_NUM,
+    .offset_enable = CORR_DEFAULT_OFFSET_EN != 0,
+    .offset_template_addr = CORR_DEFAULT_OFFSET_ADDR,
+    .offset_adder_value = CORR_DEFAULT_OFFSET_ADDER_VALUE,
+    .gain_enable = CORR_DEFAULT_GAIN_EN != 0,
+    .gain_template_addr = CORR_DEFAULT_GAIN_ADDR,
+    .gain_clipping_value = CORR_DEFAULT_GAIN_CLIPPING_VALUE,
+    .defect_enable = CORR_DEFAULT_DEFECT_EN != 0,
   };
   pa_pu_configure_correction(&config);
 }
@@ -582,8 +742,23 @@ void pa_pu_start_correction(void) {
   pa_pu_write(PA_PU_IMG_CORR_STR_REG, 1);
 }
 
+void pa_pu_configure_image_write(uint32_t image_addr) {
+  /* 这里只写首地址，真正开始写图由 IMG_WR_STR 触发。 */
+  pa_pu_write(PA_PU_IMG_WR_STR_ADDR_REG, image_addr);
+}
+
+void pa_pu_start_capture_triplet(void) {
+  /*
+   * 软件侧尽量连续写三个启动寄存器，实现“同时启动”的业务语义。
+   * FPGA 侧最终时序仍以各模块 STR 采样和内部同步逻辑为准。
+   */
+  pa_pu_write(PA_PU_IMG_CORR_STR_REG, 1);
+  pa_pu_write(PA_PU_IMG_WR_STR_REG, 1);
+  pa_pu_write(PA_PU_GIC_STR_REG, 1);
+}
+
 void pa_pu_start_image_write(uint32_t image_addr) {
   /* 先配置原始图像地址，再触发写图。光口传输本身由 PA/FPGA 完成。 */
-  pa_pu_write(PA_PU_IMG_WR_STR_ADDR_REG, image_addr);
+  pa_pu_configure_image_write(image_addr);
   pa_pu_write(PA_PU_IMG_WR_STR_REG, 1);
 }

@@ -14,26 +14,36 @@ make
 make APP_VERSION=0.1.0 PA_PU_BASE_ADDR=0x40000000 RS422_DEVICE=/dev/ttyS1 RS422_BAUD=115200
 ```
 
-程序启动时会打印 `app_version`。发布时可用 `APP_VERSION=x.y.z` 指定本软件版本。
+程序启动时会打印 `app_version` 和 `build_time`。发布时可用 `APP_VERSION=x.y.z`
+指定本软件版本；`BUILD_TIME` 默认由 Makefile 在编译时生成。
 
 默认参数集中在 `src/app_config.h`，并且都可以通过 Makefile 覆盖。比如修改默认校正配置：
 
 ```sh
 make CORR_DEFAULT_ROW_NUM=7680 CORR_DEFAULT_COL_NUM=3072 \
-     CORR_DEFAULT_OFFSET_EN=1 CORR_DEFAULT_OFFSET_ADDR=0x3C000000 \
-     CORR_DEFAULT_OFFSET_ADDER_VALUE=100 \
-     CORR_DEFAULT_GAIN_EN=1 CORR_DEFAULT_GAIN_ADDR=0x38000000 \
+     CORR_DEFAULT_OFFSET_EN=1 CORR_DEFAULT_OFFSET_ADDER_VALUE=100 \
+     CORR_DEFAULT_GAIN_EN=1 \
      CORR_DEFAULT_GAIN_CLIPPING_VALUE=55000
 ```
+
+offset/gain/image 的物理地址和 UIO size 不再通过 Makefile 配置，程序启动时从
+`/sys/class/uio/uioN/maps/map0/{addr,size}` 读取设备树中的实际布局。
 
 可用 `make config` 查看当前构建参数展开后的默认值。
 
 当前共享 DDR 默认使用三个 UIO 节点：
 
 ```text
-/dev/uio0 -> offset/暗场模板，物理地址 0x3C000000，大小 0x04000000
-/dev/uio1 -> gain/亮场模板，物理地址 0x38000000，大小 0x04000000
-/dev/uio2 -> 原始图像缓冲，物理地址 0x28000000，大小 0x10000000
+/dev/uio0 -> offset/暗场模板
+/dev/uio1 -> gain/亮场模板
+/dev/uio2 -> 实际输出图环形图像池
+```
+
+物理地址和窗口大小由设备树决定，程序启动时从 UIO sysfs 读取，例如：
+
+```text
+/sys/class/uio/uio0/maps/map0/addr
+/sys/class/uio/uio0/maps/map0/size
 ```
 
 对应构建参数：
@@ -66,10 +76,11 @@ PA 寄存器默认通过 `/dev/mem + PA_PU_BASE_ADDR` 访问，当前确认的�
 如果后续设备树给 PA 寄存器单独暴露 UIO，可以再覆盖：
 
 ```sh
-make PA_PU_UIO_DEVICE=/dev/uio3
+make PA_PU_UIO_DEVICE=/dev/uio4
 ```
 
-不要把 `PA_PU_UIO_DEVICE` 配成 `/dev/uio0`、`/dev/uio1` 或 `/dev/uio2`，这三个现在都是共享 DDR。
+不要把 `PA_PU_UIO_DEVICE` 配成 `/dev/uio0`、`/dev/uio1` 或 `/dev/uio2`，
+这些现在都是共享 DDR。
 
 输出文件：
 
@@ -146,6 +157,7 @@ STATUS            -> 读取 PA 状态
 VERSION           -> 查询本 app 版本和 PA/FPGA 版本寄存器，GET_VERSION 等价
 SET_TIME          -> 设置 Linux 本机时间，供上位机连接后同步开发板日志时间
 GET_TIME          -> 读取 Linux 本机当前时间，TIME 等价
+DUMP_REGS         -> 打印 PA/PU 寄存器快照到日志，跳过 read-clear 中断寄存器
 READ_REG          -> 直接读取 PA/PU 寄存器，支持寄存器名、偏移或绝对地址
 WRITE_REG         -> 直接写 PA/PU 寄存器，支持寄存器名、偏移或绝对地址
 LOAD_TEMPLATE     -> 从 /usr/local/offset.raw 和 /usr/local/gain.raw 加载模板
@@ -153,6 +165,12 @@ MAKE_OFFSET       -> 用当前 FPGA 图像生成 offset 模板
 MAKE_GAIN         -> 用当前 FPGA 图像和 offset 模板生成 gain 模板
 CONFIG_TEMPLATE   -> 将 offset/gain 物理地址配置给 PA
 CONFIG_CORR       -> 将图像校正尺寸、模板地址和 offset/gain/defect 使能配置给 PA
+CONFIG_STATIC_IDLE -> 配置静态 Idle 工作模式的时间窗口、GIC 时序和暗场校正开关
+START_STATIC_IDLE_CAPTURE -> 触发一次静态 Idle 采图，等待 offset 模板帧和实际输出帧完成
+LOOP_STATIC_IDLE_CAPTURE -> 循环触发 Static Idle 采图，用于稳定性测试
+GET_WORK_STATE    -> 查询当前工作模式状态、最近一次错误和本次 DDR 写图地址
+STOP_WORK         -> 停止后台 Static Idle 工作线程
+START_WORK        -> 重新启动后台 Static Idle 工作线程
 CONFIG_GIC        -> 将 GIC 时序、行范围和 binning 配置给 PA
 START_GIC         -> 启动一次 GIC 操作，等待 GIC 完成中断
 STOP_GIC          -> 停止 GIC 操作，主要用于 xao scan
@@ -202,6 +220,7 @@ PA/FPGA 版本寄存器按 `fpga/pa_pu_com_definition.xlsx` 解析：
 
 ```text
 app_version                        当前 pa_controller 软件版本
+app_build_time                     当前 pa_controller 编译时间
 pa_version                         PA 版本寄存器
 pa_build_information               PA 构建信息寄存器
 adapted_main_board_version         适配主板版本寄存器
@@ -216,7 +235,7 @@ pa_pu_com_version                  PA/PU 通信模块版本寄存器
 返回示例：
 
 ```text
-OK VERSION app_version=0.1.0 pa_version=0.0.1 pa_build_information=2026-08-11.1 adapted_main_board_version=0.0.0 adapted_gic_board_version=0.0.0 adapted_roic_board_version=0.0.0 adapted_reserved_board_0_version=0.0.0 adapted_reserved_board_1_version=0.0.0 adapted_reserved_board_2_version=0.0.0 pa_pu_com_version=0.0.0
+OK VERSION app_version=0.1.0 app_build_time="2026-08-17 10:30:00 +0800" pa_version=0.0.1 pa_build_information=2026-08-11.1 adapted_main_board_version=0.0.0 adapted_gic_board_version=0.0.0 adapted_roic_board_version=0.0.0 adapted_reserved_board_0_version=0.0.0 adapted_reserved_board_1_version=0.0.0 adapted_reserved_board_2_version=0.0.0 pa_pu_com_version=0.0.0
 ```
 
 上位机同步时间推荐使用 epoch 秒或 epoch 毫秒，避免时区字符串歧义：
@@ -265,6 +284,8 @@ PA/PU 基地址的 offset，例如 `0x0210`，也可以写绝对地址，例如 
 
 注意：`READ_REG int_vector` 或 `READ_REG 0x0000` 会读取并清除 `INT_VECTOR`，可能影响
 正在等待完成中断的调试流程。
+如果只是想看完整寄存器现场，优先使用 `DUMP_REGS`；该命令会把寄存器快照打印到日志，
+并跳过 `INT_VECTOR` 这类 read-clear 中断寄存器。
 
 start 类命令完成时返回示例：
 
@@ -272,7 +293,7 @@ start 类命令完成时返回示例：
 OK START_GIC int_vector=0x00000002
 OK START_ROIC int_vector=0x00000004
 OK START_CORR int_vector=0x00000010
-OK SEND_SINGLE addr=0x28000000 int_vector=0x00000008
+OK SEND_SINGLE addr=0x21000000 int_vector=0x00000008
 ```
 
 超时则返回：
@@ -313,20 +334,62 @@ CONFIG_GIC gic_req_code=0 gic_dout_en=1 gic_line_time=100000 gic_oe_raising_edge
 
 写完这些配置寄存器后，再发 `START_GIC`，程序会写 `GIC_STR=1` 让配置生效并启动一次 GIC 操作。
 
-`CONFIG_CORR` 不带参数时使用默认图像尺寸和模板地址，也可以用 `key=value` 临时覆盖：
+`CONFIG_CORR` 不带参数时使用默认图像尺寸，模板地址默认来自 `/dev/uio0` 和 `/dev/uio1`
+的 sysfs 物理地址；也可以用 `key=value` 临时覆盖：
 
 ```text
-CONFIG_CORR pkg=46080 row=7680 col=3072 offset_en=1 offset_addr=0x3c000000 offset_adder=100 gain_en=1 gain_addr=0x38000000 gain_clip=55000 defect_en=0
+CONFIG_CORR pkg=46080 row=7680 col=3072 offset_en=1 offset_addr=0x16000000 offset_adder=100 gain_en=1 gain_addr=0x1a000000 gain_clip=55000 defect_en=0
 ```
 
 也支持完整寄存器名：
 
 ```text
-CONFIG_CORR img_pkg_num=46080 img_row_num=7680 img_col_num=3072 img_corr_offset_en=1 img_corr_offset_temp_str_addr=0x3c000000 img_corr_offset_adder_value=100 img_corr_gain_en=1 img_corr_gain_temp_str_addr=0x38000000 img_corr_gain_clipping_value=55000 img_corr_defect_en=0
+CONFIG_CORR img_pkg_num=46080 img_row_num=7680 img_col_num=3072 img_corr_offset_en=1 img_corr_offset_temp_str_addr=0x16000000 img_corr_offset_adder_value=100 img_corr_gain_en=1 img_corr_gain_temp_str_addr=0x1a000000 img_corr_gain_clipping_value=55000 img_corr_defect_en=0
 ```
 
 写完图像校正配置后，再发 `START_CORR`，程序会写 `IMG_CORR_STR=1` 并等待表格协议中的
 IMG_CORR 完成中断 bit。
+
+Static Idle 是正式业务流程入口。启动后后台工作线程会按 `idle_clean_interval_ms`
+周期执行 GIC 自清空，`gic_req_code=0`、`gic_dout_en=0`。可以用下面命令配置：
+
+```text
+CONFIG_STATIC_IDLE idle_clean_interval_ms=50 exposure_ms=50 dark_window_ms=50 offset_en=1 gain_en=1 defect_en=0 line_time=25600 start_row=0 end_row=7679 binning=0
+```
+
+触发一次静态采图：
+
+```text
+START_STATIC_IDLE_CAPTURE
+```
+
+循环稳定性测试：
+
+```text
+LOOP_STATIC_IDLE_CAPTURE count=100 interval_ms=5000
+```
+
+`count=0` 表示一直循环；不带参数时默认 `count=0 interval_ms=5000 stop_on_error=1`。
+该命令同步运行，长时间测试时可用 Ctrl+C 结束程序。
+
+该命令会等待当前自清空结束后执行：
+
+```text
+曝光窗口
+-> 第一帧 light：关闭 offset/gain/defect，写到 offset 模板区，等待 IMG_CORR+IMG_WR+GIC
+-> 暗场窗口
+-> 第二帧输出图：按配置打开 offset/gain/defect，写到 uio2 图像池，等待 IMG_CORR+IMG_WR+GIC
+```
+
+当前测试版中，第一帧未校正 light 固定写到 `/dev/uio0` 的物理地址，作为 offset 模板。
+第二帧实际输出图由 ARM 从 `/dev/uio2` 图像池按 `frame_stride` 环形分配，并写入
+`img_wr_str_addr`。如果 uio2 尾部剩余空间不足一帧，下一张输出图会回到池起始地址；
+单张图不会跨越 uio2 尾部。
+状态可用：
+
+```text
+GET_WORK_STATE
+```
 
 如果需要图像校正启动后马上启动 GIC，可以发：
 

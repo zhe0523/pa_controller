@@ -13,6 +13,7 @@
 #include "pa_pu.h"
 #include "rs422.h"
 #include "template_builder.h"
+#include "work_mode.h"
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -94,7 +95,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  log_info("pa_controller start app_version=%s", APP_VERSION);
+  log_info("pa_controller start app_version=%s build_time=%s", APP_VERSION, APP_BUILD_TIME);
   log_info("image=%ux%u active=%ux%u offset=(%u,%u)",
            DEVICE_WIDTH, DEVICE_HEIGHT, IMAGE_WIDTH, IMAGE_HEIGHT, COL_OFFSET, ROW_OFFSET);
   log_info("fiber image header=%u bytes", DETECTOR_IMAGE_HEADER_BYTES);
@@ -118,13 +119,43 @@ int main(int argc, char* argv[]) {
    * 文件不存在不阻断启动，上位机可通过 MAKE_OFFSET / MAKE_GAIN 现场生成。
    */
   if (template_load_files(&fpga_mem) == 0) {
-    pa_pu_configure_templates();
+    pa_pu_corr_config_t config = {
+      .pkg_num = CORR_DEFAULT_PKG_NUM,
+      .row_num = CORR_DEFAULT_ROW_NUM,
+      .col_num = CORR_DEFAULT_COL_NUM,
+      .offset_enable = CORR_DEFAULT_OFFSET_EN != 0,
+      .offset_template_addr = fpga_mem.offset_phys_base,
+      .offset_adder_value = CORR_DEFAULT_OFFSET_ADDER_VALUE,
+      .gain_enable = CORR_DEFAULT_GAIN_EN != 0,
+      .gain_template_addr = fpga_mem.gain_phys_base,
+      .gain_clipping_value = CORR_DEFAULT_GAIN_CLIPPING_VALUE,
+      .defect_enable = CORR_DEFAULT_DEFECT_EN != 0,
+    };
+    pa_pu_configure_correction(&config);
   } else {
     log_warn("template files not fully loaded");
   }
 
+  /*
+   * Static Idle 工作线程由 ARM 统一编排 FPGA 时序：
+   * 空闲自清空、上位机触发亮/暗场采图、DDR 写图地址选择都在这里完成。
+   */
+  work_mode_context_t work_mode;
+  if (work_mode_init(&work_mode, &fpga_mem) != 0) {
+    pa_pu_close();
+    fpga_mem_close(&fpga_mem);
+    return 1;
+  }
+  if (work_mode_start(&work_mode) != 0) {
+    log_error("work mode thread start failed");
+    pa_pu_close();
+    fpga_mem_close(&fpga_mem);
+    return 1;
+  }
+
   command_context_t ctx = {
     .fpga_mem = &fpga_mem,
+    .work_mode = &work_mode,
     .should_quit = false,
   };
 
@@ -156,6 +187,7 @@ int main(int argc, char* argv[]) {
       log_info("stop signal received");
     }
 
+    work_mode_stop(&work_mode);
     pa_pu_close();
     fpga_mem_close(&fpga_mem);
     log_info("pa_controller stop");
@@ -167,6 +199,7 @@ int main(int argc, char* argv[]) {
   rs422_device = select_rs422_device(rs422_device);
   if (rs422_open(&rs422, rs422_device, rs422_baud) != 0) {
     log_error("no rs422 device opened, use -d /dev/ttySx to specify the 422 uart");
+    work_mode_stop(&work_mode);
     pa_pu_close();
     fpga_mem_close(&fpga_mem);
     return 1;
@@ -195,6 +228,7 @@ int main(int argc, char* argv[]) {
   }
 
   rs422_close(&rs422);
+  work_mode_stop(&work_mode);
   pa_pu_close();
   fpga_mem_close(&fpga_mem);
   log_info("pa_controller stop");

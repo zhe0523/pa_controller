@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "fpga_mem.h"
+#include "work_mode.h"
 
 /*
  * 命令处理上下文。
@@ -14,6 +15,8 @@
 typedef struct {
   /* FPGA/PA 共享内存，用于模板加载、offset/gain 生成。 */
   fpga_mem_t* fpga_mem;
+  /* 正式工作模式状态机。 */
+  work_mode_context_t* work_mode;
   /* QUIT 命令置位后，main.c 的通信循环会退出。 */
   bool should_quit;
 } command_context_t;

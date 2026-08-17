@@ -18,6 +18,11 @@
 #define APP_VERSION "0.1.0"
 #endif
 
+#ifndef APP_BUILD_TIME
+/* pa_controller 编译时间；Makefile 会注入更易读的本地时间字符串。 */
+#define APP_BUILD_TIME __DATE__ " " __TIME__
+#endif
+
 #ifndef DEVICE_WIDTH
 /* FPGA 内存中一行的总像素数，包含有效图像之外的边界/偏移区域。 */
 #define DEVICE_WIDTH 3072u
@@ -50,25 +55,25 @@
 
 #ifndef FPGA_IMAGE_PTR
 /*
- * FPGA 写入原始图像的物理起始地址。
- * 对应设备树 pu-pa-ddr2，当前用于收取图片以制作暗场/亮场模板。
+ * 旧 /dev/mem fallback 使用的物理地址。
+ * 正常 UIO 模式下，物理地址和 size 都从 /sys/class/uio/uioN/maps/map0 读取。
  */
-#define FPGA_IMAGE_PTR 0x28000000u
+#define FPGA_IMAGE_PTR 0x21000000u
 #endif
 
 #ifndef FPGA_OFFSET_PTR
-/* offset/暗场模板写入 FPGA/PA 可访问内存的物理起始地址，对应 pu-pa-ddr。 */
-#define FPGA_OFFSET_PTR 0x3C000000u
+/* 旧 /dev/mem fallback 使用的 offset/暗场模板物理起始地址。 */
+#define FPGA_OFFSET_PTR 0x16000000u
 #endif
 
 #ifndef FPGA_GAIN_PTR
-/* gain/亮场模板写入 FPGA/PA 可访问内存的物理起始地址，对应 pu-pa-ddr1。 */
-#define FPGA_GAIN_PTR 0x38000000u
+/* 旧 /dev/mem fallback 使用的 gain/亮场模板物理起始地址。 */
+#define FPGA_GAIN_PTR 0x1A000000u
 #endif
 
 #ifndef FPGA_MEM_MAP_SIZE
 /* 兼容旧 /dev/mem 映射的总窗口大小；当前默认使用三个 UIO 节点分别映射。 */
-#define FPGA_MEM_MAP_SIZE 0x10000000u
+#define FPGA_MEM_MAP_SIZE 0x1F000000u
 #endif
 
 #ifndef FPGA_IMAGE_UIO_DEVICE
@@ -83,16 +88,9 @@
 #define FPGA_GAIN_UIO_DEVICE "/dev/uio1"
 #endif
 
-#ifndef FPGA_IMAGE_UIO_SIZE
-#define FPGA_IMAGE_UIO_SIZE 0x10000000u
-#endif
-
-#ifndef FPGA_OFFSET_UIO_SIZE
-#define FPGA_OFFSET_UIO_SIZE 0x04000000u
-#endif
-
-#ifndef FPGA_GAIN_UIO_SIZE
-#define FPGA_GAIN_UIO_SIZE 0x04000000u
+#ifndef DDR_IMAGE_FRAME_ALIGN
+/* 图像池中每张图的首地址/步进对齐，IMG_WR_STR_ADDR 协议要求至少 1KB 对齐。 */
+#define DDR_IMAGE_FRAME_ALIGN 4096u
 #endif
 
 #ifndef FPGA_MEM_USE_DEVMEM_FALLBACK
@@ -174,6 +172,21 @@
 #define PA_IRQ_DEVICE "/dev/pa_irq"
 #endif
 
+#ifndef STATIC_IDLE_CLEAN_INTERVAL_MS
+/* Static Idle 空闲自清空间隔，单位 ms。 */
+#define STATIC_IDLE_CLEAN_INTERVAL_MS 50u
+#endif
+
+#ifndef STATIC_IDLE_EXPOSURE_MS
+/* Static Idle 收到采图请求后的曝光窗口时间，单位 ms。 */
+#define STATIC_IDLE_EXPOSURE_MS 50u
+#endif
+
+#ifndef STATIC_IDLE_DARK_WINDOW_MS
+/* Static Idle 亮场采图完成后的暗场窗口时间，单位 ms。 */
+#define STATIC_IDLE_DARK_WINDOW_MS 50u
+#endif
+
 #ifndef TEMPLATE_OFFSET_FILE
 /* offset 模板落盘文件，现场生成后重启仍可加载。 */
 #define TEMPLATE_OFFSET_FILE "/usr/local/offset.raw"
@@ -196,7 +209,7 @@
 
 #ifndef GIC_DEFAULT_LINE_TIME_NS
 /* 默认 GIC 行时间，单位 ns；现场应按 panel 时序覆盖。 */
-#define GIC_DEFAULT_LINE_TIME_NS 0u
+#define GIC_DEFAULT_LINE_TIME_NS 25600u
 #endif
 
 #ifndef GIC_DEFAULT_OE_RISE_NS
@@ -218,7 +231,7 @@
 #endif
 
 #ifndef GIC_DEFAULT_BINNING
-#define GIC_DEFAULT_BINNING 1u
+#define GIC_DEFAULT_BINNING 0u
 #endif
 
 #ifndef ROIC_DEFAULT_START_COL

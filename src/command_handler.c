@@ -9,6 +9,7 @@
 #include <strings.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "app_config.h"
 #include "log.h"
@@ -194,6 +195,81 @@ static bool parse_set_time_args(const char* args, time_t* seconds, long* nanosec
   }
 
   return false;
+}
+
+static bool sleep_ms_for_loop(uint32_t interval_ms) {
+  uint32_t remain_ms = interval_ms;
+  while (remain_ms > 0) {
+    uint32_t chunk_ms = remain_ms > 1000u ? 1000u : remain_ms;
+    if (usleep(chunk_ms * 1000u) != 0 && errno == EINTR) {
+      return false;
+    }
+    remain_ms -= chunk_ms;
+  }
+  return true;
+}
+
+typedef struct {
+  uint32_t count;
+  uint32_t interval_ms;
+  bool stop_on_error;
+} static_idle_loop_config_t;
+
+static bool parse_static_idle_loop_args(const char* args, static_idle_loop_config_t* config) {
+  char buffer[256];
+  if (config == NULL) {
+    return false;
+  }
+
+  config->count = 0;
+  config->interval_ms = 5000u;
+  config->stop_on_error = true;
+
+  if (args == NULL) {
+    return true;
+  }
+  while (*args == ' ') {
+    ++args;
+  }
+  if (*args == '\0') {
+    return true;
+  }
+  if (strlen(args) >= sizeof(buffer)) {
+    return false;
+  }
+
+  strcpy(buffer, args);
+  char* token = strtok(buffer, " ");
+  while (token != NULL) {
+    char* equals = strchr(token, '=');
+    uint32_t value = 0;
+    if (equals == NULL) {
+      return false;
+    }
+
+    *equals = '\0';
+    if (!parse_u32_value(equals + 1, &value)) {
+      return false;
+    }
+
+    if (strcmp(token, "count") == 0 || strcmp(token, "times") == 0) {
+      config->count = value;
+    } else if (strcmp(token, "interval_ms") == 0 || strcmp(token, "period_ms") == 0) {
+      config->interval_ms = value;
+    } else if (strcmp(token, "interval_s") == 0 || strcmp(token, "period_s") == 0) {
+      if (value > UINT32_MAX / 1000u) {
+        return false;
+      }
+      config->interval_ms = value * 1000u;
+    } else if (strcmp(token, "stop_on_error") == 0) {
+      config->stop_on_error = value != 0;
+    } else {
+      return false;
+    }
+
+    token = strtok(NULL, " ");
+  }
+  return true;
 }
 
 static void write_time_response(char* response, size_t response_size, const char* command_name) {
@@ -424,16 +500,16 @@ static bool parse_gic_config_args(const char* args, pa_pu_gic_config_t* config) 
   return true;
 }
 
-static pa_pu_corr_config_t default_corr_config(void) {
+static pa_pu_corr_config_t default_corr_config(const fpga_mem_t* fpga_mem) {
   pa_pu_corr_config_t config = {
     .pkg_num = CORR_DEFAULT_PKG_NUM,
     .row_num = CORR_DEFAULT_ROW_NUM,
     .col_num = CORR_DEFAULT_COL_NUM,
     .offset_enable = CORR_DEFAULT_OFFSET_EN != 0,
-    .offset_template_addr = CORR_DEFAULT_OFFSET_ADDR,
+    .offset_template_addr = fpga_mem != NULL ? fpga_mem->offset_phys_base : CORR_DEFAULT_OFFSET_ADDR,
     .offset_adder_value = CORR_DEFAULT_OFFSET_ADDER_VALUE,
     .gain_enable = CORR_DEFAULT_GAIN_EN != 0,
-    .gain_template_addr = CORR_DEFAULT_GAIN_ADDR,
+    .gain_template_addr = fpga_mem != NULL ? fpga_mem->gain_phys_base : CORR_DEFAULT_GAIN_ADDR,
     .gain_clipping_value = CORR_DEFAULT_GAIN_CLIPPING_VALUE,
     .defect_enable = CORR_DEFAULT_DEFECT_EN != 0,
   };
@@ -612,6 +688,129 @@ static bool parse_roic_config_args(const char* args, pa_pu_roic_config_t* config
   return true;
 }
 
+static bool parse_static_idle_config_args(const char* args, static_idle_config_t* config) {
+  /*
+   * Static Idle 是正式工作流程配置，不暴露亮/暗场 DDR 地址参数。
+   * 当前测试版由 ARM 从 uio2 环形图像池分配实际输出图地址。
+   * 第一帧 offset 模板地址固定，不从这里分配。
+   */
+  char buffer[768];
+  if (args == NULL || config == NULL) {
+    return false;
+  }
+  if (strlen(args) >= sizeof(buffer)) {
+    return false;
+  }
+
+  strcpy(buffer, args);
+  char* token = strtok(buffer, " ");
+  while (token != NULL) {
+    char* equals = strchr(token, '=');
+    uint32_t value = 0;
+    if (equals == NULL) {
+      return false;
+    }
+
+    *equals = '\0';
+    if (!parse_u32_value(equals + 1, &value)) {
+      return false;
+    }
+
+    if (strcmp(token, "idle_clean_interval_ms") == 0 || strcmp(token, "clean_ms") == 0) {
+      config->idle_clean_interval_ms = value;
+    } else if (strcmp(token, "exposure_ms") == 0 || strcmp(token, "exposure_window_ms") == 0) {
+      config->exposure_window_ms = value;
+    } else if (strcmp(token, "dark_window_ms") == 0 || strcmp(token, "dark_ms") == 0) {
+      config->dark_window_ms = value;
+    } else if (strcmp(token, "offset_en") == 0 || strcmp(token, "img_corr_offset_en") == 0) {
+      config->dark_corr.offset_enable = value != 0;
+    } else if (strcmp(token, "gain_en") == 0 || strcmp(token, "img_corr_gain_en") == 0) {
+      config->dark_corr.gain_enable = value != 0;
+    } else if (strcmp(token, "defect_en") == 0 || strcmp(token, "img_corr_defect_en") == 0) {
+      config->dark_corr.defect_enable = value != 0;
+    } else if (strcmp(token, "line_time") == 0 || strcmp(token, "gic_line_time") == 0) {
+      config->clean_gic.line_time_ns = value;
+      config->bright_gic.line_time_ns = value;
+      config->dark_gic.line_time_ns = value;
+    } else if (strcmp(token, "oe_rise") == 0 || strcmp(token, "gic_oe_raising_edge") == 0) {
+      config->clean_gic.oe_raising_edge_ns = value;
+      config->bright_gic.oe_raising_edge_ns = value;
+      config->dark_gic.oe_raising_edge_ns = value;
+    } else if (strcmp(token, "oe_fall") == 0 || strcmp(token, "gic_oe_falling_edge") == 0) {
+      config->clean_gic.oe_falling_edge_ns = value;
+      config->bright_gic.oe_falling_edge_ns = value;
+      config->dark_gic.oe_falling_edge_ns = value;
+    } else if (strcmp(token, "start_row") == 0 || strcmp(token, "gic_str_row_num") == 0) {
+      config->clean_gic.start_row = (uint16_t)value;
+      config->bright_gic.start_row = (uint16_t)value;
+      config->dark_gic.start_row = (uint16_t)value;
+    } else if (strcmp(token, "end_row") == 0 || strcmp(token, "gic_end_row_num") == 0) {
+      config->clean_gic.end_row = (uint16_t)value;
+      config->bright_gic.end_row = (uint16_t)value;
+      config->dark_gic.end_row = (uint16_t)value;
+    } else if (strcmp(token, "binning") == 0 || strcmp(token, "gic_binning_mode") == 0) {
+      config->clean_gic.binning_mode = (uint8_t)value;
+      config->bright_gic.binning_mode = (uint8_t)value;
+      config->dark_gic.binning_mode = (uint8_t)value;
+    } else if (strcmp(token, "offset_addr") == 0 || strcmp(token, "img_corr_offset_temp_str_addr") == 0) {
+      config->bright_corr.offset_template_addr = value;
+      config->dark_corr.offset_template_addr = value;
+    } else if (strcmp(token, "offset_adder") == 0 || strcmp(token, "img_corr_offset_adder_value") == 0) {
+      config->bright_corr.offset_adder_value = (uint16_t)value;
+      config->dark_corr.offset_adder_value = (uint16_t)value;
+    } else if (strcmp(token, "gain_addr") == 0 || strcmp(token, "img_corr_gain_temp_str_addr") == 0) {
+      config->bright_corr.gain_template_addr = value;
+      config->dark_corr.gain_template_addr = value;
+    } else if (strcmp(token, "gain_clip") == 0 || strcmp(token, "img_corr_gain_clipping_value") == 0) {
+      config->bright_corr.gain_clipping_value = (uint16_t)value;
+      config->dark_corr.gain_clipping_value = (uint16_t)value;
+    } else {
+      return false;
+    }
+
+    token = strtok(NULL, " ");
+  }
+
+  /* 固化本模式的硬件语义：自清空不出图，亮场/暗场都出图，亮场校正全关。 */
+  config->clean_gic.req_code = PA_PU_GIC_REQ_SERIAL_SCAN;
+  config->clean_gic.dout_enable = false;
+  config->bright_gic.req_code = PA_PU_GIC_REQ_SERIAL_SCAN;
+  config->bright_gic.dout_enable = true;
+  config->dark_gic.req_code = PA_PU_GIC_REQ_SERIAL_SCAN;
+  config->dark_gic.dout_enable = true;
+
+  config->bright_corr.offset_enable = false;
+  config->bright_corr.gain_enable = false;
+  config->bright_corr.defect_enable = false;
+  return true;
+}
+
+static void write_work_state_response(const work_mode_status_t* status, char* response, size_t response_size) {
+  /* 给上位机和串口调试保留足够现场信息，尤其是失败阶段、等待 mask 和本次 DDR 地址。 */
+  snprintf(response,
+           response_size,
+           "OK WORK_STATE mode=Idle state=%s pending_capture=%u stop=%u last_error=%d last_phase=%s last_int_vector=0x%08x last_wait_mask=0x%08x wr_state=0x%08x wr_end=0x%08x corr_state=0x%08x corr_end=0x%08x gic_state=0x%08x gic_end=0x%08x gic_dfx=0x%08x bright_addr=0x%08x dark_addr=0x%08x capture_id=%u ddr_next_offset=0x%08x frame_stride=0x%lx\r\n",
+           work_mode_state_name(status->state),
+           status->pending_capture ? 1u : 0u,
+           status->stop_requested ? 1u : 0u,
+           status->last_error,
+           work_mode_phase_name(status->last_phase),
+           status->last_int_vector,
+           status->last_wait_mask,
+           status->last_wr_state,
+           status->last_wr_end,
+           status->last_corr_state,
+           status->last_corr_end,
+           status->last_gic_state,
+           status->last_gic_end,
+           status->last_gic_dfx,
+           status->last_bright_addr,
+           status->last_dark_addr,
+           status->capture_id,
+           status->ddr_next_offset,
+           (unsigned long)status->ddr_frame_stride);
+}
+
 static void write_status_response(char* response, size_t response_size) {
   pa_pu_status_t status;
   pa_pu_read_status(&status);
@@ -688,8 +887,9 @@ static void write_version_response(char* response, size_t response_size) {
   format_fpga_version(status.pa_pu_com_version, pa_pu_com_version, sizeof(pa_pu_com_version));
 
   snprintf(response, response_size,
-           "OK VERSION app_version=%s pa_version=%s pa_build_information=%s adapted_main_board_version=%s adapted_gic_board_version=%s adapted_roic_board_version=%s adapted_reserved_board_0_version=%s adapted_reserved_board_1_version=%s adapted_reserved_board_2_version=%s pa_pu_com_version=%s\r\n",
+           "OK VERSION app_version=%s app_build_time=\"%s\" pa_version=%s pa_build_information=%s adapted_main_board_version=%s adapted_gic_board_version=%s adapted_roic_board_version=%s adapted_reserved_board_0_version=%s adapted_reserved_board_1_version=%s adapted_reserved_board_2_version=%s pa_pu_com_version=%s\r\n",
            APP_VERSION,
+           APP_BUILD_TIME,
            pa_version,
            pa_build_information,
            adapted_main_board_version,
@@ -791,8 +991,181 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     return 0;
   }
 
-  if (is_read_reg_command(command)) {
+  if (cmd_is(command, "GET_WORK_STATE") || cmd_is(command, "WORK_STATE")) {
+    /* 查询 ARM 工作线程状态，不访问 read-clear 类 FPGA 中断寄存器。 */
+    work_mode_status_t status;
+    work_mode_get_status(ctx->work_mode, &status);
+    write_work_state_response(&status, response, response_size);
+    return 0;
+  }
 
+  if (cmd_is(command, "DUMP_REGS") || cmd_is(command, "DUMP_REGISTERS") || cmd_is(command, "DUMP_PA_REGS")) {
+    /*
+     * 调试快照输出到日志，命令响应只返回统计信息。
+     * safe dump 会跳过 INT_VECTOR 等 read-clear 寄存器，避免读取时清掉中断现场。
+     */
+    size_t skipped = 0;
+    size_t count = pa_pu_dump_safe_registers("command", &skipped);
+    snprintf(response,
+             response_size,
+             "OK DUMP_REGS count=%lu skipped_read_clear=%lu\r\n",
+             (unsigned long)count,
+             (unsigned long)skipped);
+    return 0;
+  }
+
+  if (cmd_has_name(command, "CONFIG_STATIC_IDLE")) {
+    /*
+     * 更新 Static Idle 的时间窗口、GIC 时序和暗场校正开关。
+     * 工作线程处于采图窗口或采图阶段时会返回 BUSY，防止半途改寄存器。
+     */
+    static_idle_config_t config;
+    work_mode_get_static_idle_config(ctx->work_mode, &config);
+    if (!parse_static_idle_config_args(cmd_args(command), &config)) {
+      snprintf(response, response_size, "ERR CONFIG_STATIC_IDLE ARG\r\n");
+      return 0;
+    }
+
+    int ret = work_mode_update_static_idle_config(ctx->work_mode, &config);
+    if (ret == -2) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR CONFIG_STATIC_IDLE BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
+    if (ret != 0) {
+      snprintf(response, response_size, "ERR CONFIG_STATIC_IDLE\r\n");
+      return 0;
+    }
+
+    snprintf(response,
+             response_size,
+             "OK CONFIG_STATIC_IDLE idle_clean_interval_ms=%u exposure_ms=%u dark_window_ms=%u offset_en=%u gain_en=%u defect_en=%u line_time=%u start_row=%u end_row=%u binning=%u\r\n",
+             config.idle_clean_interval_ms,
+             config.exposure_window_ms,
+             config.dark_window_ms,
+             config.dark_corr.offset_enable ? 1u : 0u,
+             config.dark_corr.gain_enable ? 1u : 0u,
+             config.dark_corr.defect_enable ? 1u : 0u,
+             config.dark_gic.line_time_ns,
+             config.dark_gic.start_row,
+             config.dark_gic.end_row,
+             config.dark_gic.binning_mode);
+    return 0;
+  }
+
+  if (cmd_is(command, "START_STATIC_IDLE_CAPTURE")) {
+    /*
+     * 发起一次静态 Idle 正式采图：
+     * 等待当前空闲清空结束后，按曝光窗口 -> 亮场 -> 暗场窗口 -> 暗场执行。
+     */
+    work_mode_status_t status;
+    int ret = work_mode_start_static_idle_capture(ctx->work_mode, &status);
+    if (ret == -2) {
+      snprintf(response, response_size, "ERR START_STATIC_IDLE_CAPTURE BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
+    if (ret != 0) {
+      snprintf(response,
+               response_size,
+               "ERR START_STATIC_IDLE_CAPTURE phase=%s int_vector=0x%08x wait_mask=0x%08x wr_state=0x%08x wr_end=0x%08x corr_state=0x%08x corr_end=0x%08x gic_state=0x%08x gic_end=0x%08x gic_dfx=0x%08x bright_addr=0x%08x dark_addr=0x%08x\r\n",
+               work_mode_phase_name(status.last_phase),
+               status.last_int_vector,
+               status.last_wait_mask,
+               status.last_wr_state,
+               status.last_wr_end,
+               status.last_corr_state,
+               status.last_corr_end,
+               status.last_gic_state,
+               status.last_gic_end,
+               status.last_gic_dfx,
+               status.last_bright_addr,
+               status.last_dark_addr);
+      return 0;
+    }
+    snprintf(response,
+             response_size,
+             "OK START_STATIC_IDLE_CAPTURE bright_addr=0x%08x dark_addr=0x%08x int_vector=0x%08x capture_id=%u\r\n",
+             status.last_bright_addr,
+             status.last_dark_addr,
+             status.last_int_vector,
+             status.capture_id);
+    return 0;
+  }
+
+  if (cmd_has_name(command, "LOOP_STATIC_IDLE_CAPTURE") || cmd_has_name(command, "START_STATIC_IDLE_LOOP")) {
+    /*
+     * 稳定性测试命令：周期性执行正式 Static Idle 采图流程。
+     * count=0 表示一直循环；该命令同步运行，长循环时需要 Ctrl+C 或外部终止程序。
+     */
+    static_idle_loop_config_t loop_config;
+    if (!parse_static_idle_loop_args(cmd_args(command), &loop_config)) {
+      snprintf(response, response_size, "ERR LOOP_STATIC_IDLE_CAPTURE ARG\r\n");
+      return 0;
+    }
+
+    uint32_t ok_count = 0;
+    uint32_t fail_count = 0;
+    uint32_t last_iteration = 0;
+    work_mode_status_t status;
+    memset(&status, 0, sizeof(status));
+
+    for (uint32_t iteration = 1; loop_config.count == 0 || iteration <= loop_config.count; ++iteration) {
+      last_iteration = iteration;
+      log_info("static idle loop capture begin iteration=%u count=%u interval_ms=%u",
+               iteration,
+               loop_config.count,
+               loop_config.interval_ms);
+
+      int ret = work_mode_start_static_idle_capture(ctx->work_mode, &status);
+      if (ret == 0) {
+        ++ok_count;
+        log_info("static idle loop capture ok iteration=%u capture_id=%u offset_addr=0x%08x output_addr=0x%08x int_vector=0x%08x",
+                 iteration,
+                 status.capture_id,
+                 status.last_bright_addr,
+                 status.last_dark_addr,
+                 status.last_int_vector);
+      } else {
+        ++fail_count;
+        log_error("static idle loop capture failed iteration=%u ret=%d phase=%s int_vector=0x%08x wait_mask=0x%08x",
+                  iteration,
+                  ret,
+                  work_mode_phase_name(status.last_phase),
+                  status.last_int_vector,
+                  status.last_wait_mask);
+        if (loop_config.stop_on_error) {
+          break;
+        }
+      }
+
+      if (loop_config.count != 0 && iteration >= loop_config.count) {
+        break;
+      }
+      if (!sleep_ms_for_loop(loop_config.interval_ms)) {
+        snprintf(response,
+                 response_size,
+                 "ERR LOOP_STATIC_IDLE_CAPTURE INTERRUPTED ok=%u fail=%u last_iteration=%u\r\n",
+                 ok_count,
+                 fail_count,
+                 last_iteration);
+        return 0;
+      }
+    }
+
+    snprintf(response,
+             response_size,
+             "OK LOOP_STATIC_IDLE_CAPTURE ok=%u fail=%u last_iteration=%u last_capture_id=%u last_output_addr=0x%08x\r\n",
+             ok_count,
+             fail_count,
+             last_iteration,
+             status.capture_id,
+             status.last_dark_addr);
+    return 0;
+  }
+
+  if (is_read_reg_command(command)) {
+    // 读寄存器命令
     const char* args = cmd_args(command);
     char reg_text[96];
     uint16_t reg = 0;
@@ -807,7 +1180,13 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (is_write_reg_command(command)) {
-
+    if (!work_mode_allows_write_reg(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR WRITE_REG BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
+    // 写寄存器命令
     const char* args = cmd_args(command);
     char reg_text[96];
     char value_text[96];
@@ -827,9 +1206,16 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "LOAD_TEMPLATE")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR LOAD_TEMPLATE BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
     /* 从文件系统加载 offset/gain 模板，适合设备重启后恢复已有校正模板。 */
     if (template_load_files(ctx->fpga_mem) == 0) {
-      pa_pu_configure_templates();
+      pa_pu_corr_config_t config = default_corr_config(ctx->fpga_mem);
+      pa_pu_configure_correction(&config);
       snprintf(response, response_size, "OK LOAD_TEMPLATE\r\n");
     } else {
       snprintf(response, response_size, "ERR LOAD_TEMPLATE\r\n");
@@ -838,9 +1224,16 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "MAKE_OFFSET")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR MAKE_OFFSET BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
     /* 用当前暗场图像生成 offset 模板；上位机应先确保当前帧是有效暗场。 */
     if (template_make_offset(ctx->fpga_mem) == 0) {
-      pa_pu_configure_templates();
+      pa_pu_corr_config_t config = default_corr_config(ctx->fpga_mem);
+      pa_pu_configure_correction(&config);
       snprintf(response, response_size, "OK MAKE_OFFSET\r\n");
     } else {
       snprintf(response, response_size, "ERR MAKE_OFFSET\r\n");
@@ -849,9 +1242,16 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "MAKE_GAIN")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR MAKE_GAIN BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
     /* 用当前亮场图像和已有 offset 模板生成 gain 模板；需先执行或加载 offset。 */
     if (template_make_gain(ctx->fpga_mem) == 0) {
-      pa_pu_configure_templates();
+      pa_pu_corr_config_t config = default_corr_config(ctx->fpga_mem);
+      pa_pu_configure_correction(&config);
       snprintf(response, response_size, "OK MAKE_GAIN\r\n");
     } else {
       snprintf(response, response_size, "ERR MAKE_GAIN\r\n");
@@ -860,18 +1260,31 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "CONFIG_TEMPLATE")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR CONFIG_TEMPLATE BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
     /* 只重新下发模板地址/尺寸配置，不重新生成或加载模板内容。 */
-    pa_pu_configure_templates();
+    pa_pu_corr_config_t config = default_corr_config(ctx->fpga_mem);
+    pa_pu_configure_correction(&config);
     snprintf(response, response_size, "OK CONFIG_TEMPLATE\r\n");
     return 0;
   }
 
   if (cmd_has_name(command, "CONFIG_CORR") || cmd_has_name(command, "CONFIG_IMG_CORR")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR CONFIG_CORR BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
     /*
      * 下发图像校正尺寸、offset/gain/defect 使能和模板地址。
      * 不带参数时使用默认图像尺寸和模板地址；带 key=value 时覆盖对应字段。
      */
-    pa_pu_corr_config_t config = default_corr_config();
+    pa_pu_corr_config_t config = default_corr_config(ctx->fpga_mem);
     if (!parse_corr_config_args(cmd_args(command), &config)) {
       snprintf(response, response_size, "ERR CONFIG_CORR ARG\r\n");
       return 0;
@@ -893,6 +1306,12 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_has_name(command, "CONFIG_GIC")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR CONFIG_GIC BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
     /*
      * 下发 GIC 时序、行范围和 binning 配置。
      * 不带参数时使用 app_config.h 的默认值；带 key=value 时覆盖对应字段。
@@ -917,6 +1336,12 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "START_GIC")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR START_GIC BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
     /* 启动一次 GIC 操作，并等待 INT_VECTOR 中的 GIC 完成 bit。 */
     pa_pu_prepare_irq_wait();
     pa_pu_start_gic();
@@ -925,6 +1350,12 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "STOP_GIC")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR STOP_GIC BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
     /* 主要用于 xao scan 模式；其它模式下是否有效由 FPGA 决定。 */
     pa_pu_stop_gic();
     snprintf(response, response_size, "OK STOP_GIC\r\n");
@@ -932,6 +1363,12 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_has_name(command, "CONFIG_ROIC")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR CONFIG_ROIC BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
     /*
      * 下发 ROIC 芯片寄存器和列范围配置，但不立即启动。
      * 不带参数时使用 app_config.h 的默认值；带 key=value 时覆盖对应字段。
@@ -951,6 +1388,12 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "START_ROIC")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR START_ROIC BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
     /* 启动一次 ROIC 配置操作，并等待 INT_VECTOR 中的 ROIC 完成 bit。 */
     pa_pu_prepare_irq_wait();
     pa_pu_start_roic();
@@ -959,6 +1402,12 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "START_CORR")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR START_CORR BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
     /* 启动 FPGA 图像校正，并等待 INT_VECTOR 中的 IMG_CORR 完成 bit。 */
     pa_pu_prepare_irq_wait();
     pa_pu_start_correction();
@@ -967,6 +1416,12 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "START_CORR_GIC") || cmd_is(command, "START_CORR_THEN_GIC")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR START_CORR_GIC BUSY state=%s\r\n", work_mode_state_name(status.state));
+      return 0;
+    }
     /*
      * 启动图像校正后立即启动 GIC，不等待 IMG_CORR 完成后再启动 GIC。
      * 随后等待 IMG_CORR 和 GIC 两个完成中断 bit 都出现。
@@ -982,6 +1437,12 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "SEND_IMAGE") || cmd_is(command, "SEND_SINGLE") || cmd_is(command, "START_CONTINUOUS")) {
+    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
+      work_mode_status_t status;
+      work_mode_get_status(ctx->work_mode, &status);
+      snprintf(response, response_size, "ERR %s BUSY state=%s\r\n", command, work_mode_state_name(status.state));
+      return 0;
+    }
     /*
      * 图像数据不经过 ARM 发送。这里仅通知 PA 端从 FPGA 图像物理地址启动写图流程，
      * 光口传输由 PA/FPGA 逻辑完成。
@@ -991,15 +1452,16 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
      * 同一次写图流程，后续硬件支持持续模式后只需要在这里拆分实现。
      */
     pa_pu_prepare_irq_wait();
-    pa_pu_start_image_write(FPGA_IMAGE_PTR);
+    uint32_t image_addr = ctx->fpga_mem != NULL ? ctx->fpga_mem->image_phys_base : FPGA_IMAGE_PTR;
+    pa_pu_start_image_write(image_addr);
     uint32_t int_vector = 0;
     int ret = pa_pu_wait_int_vector(PA_PU_IRQ_IMG_WR_END, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
     if (ret > 0) {
-      snprintf(response, response_size, "OK %s addr=0x%08x int_vector=0x%08x\r\n", command, FPGA_IMAGE_PTR, int_vector);
+      snprintf(response, response_size, "OK %s addr=0x%08x int_vector=0x%08x\r\n", command, image_addr, int_vector);
     } else if (ret == 0) {
-      snprintf(response, response_size, "ERR %s TIMEOUT addr=0x%08x int_vector=0x%08x\r\n", command, FPGA_IMAGE_PTR, int_vector);
+      snprintf(response, response_size, "ERR %s TIMEOUT addr=0x%08x int_vector=0x%08x\r\n", command, image_addr, int_vector);
     } else {
-      snprintf(response, response_size, "ERR %s IRQ_WAIT addr=0x%08x\r\n", command, FPGA_IMAGE_PTR);
+      snprintf(response, response_size, "ERR %s IRQ_WAIT addr=0x%08x\r\n", command, image_addr);
     }
     return 0;
   }
@@ -1010,6 +1472,23 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
      * ARM 确认收到停止请求，但不额外操作硬件。
      */
     snprintf(response, response_size, "OK STOP_TRANSFER\r\n");
+    return 0;
+  }
+
+  if (cmd_is(command, "STOP_WORK")) {
+    /* 调试用：停止后台 Static Idle 线程，便于人工独占寄存器测试。 */
+    work_mode_stop(ctx->work_mode);
+    snprintf(response, response_size, "OK STOP_WORK\r\n");
+    return 0;
+  }
+
+  if (cmd_is(command, "START_WORK")) {
+    /* 调试用：重新启动后台 Static Idle 线程。 */
+    if (work_mode_start(ctx->work_mode) != 0) {
+      snprintf(response, response_size, "ERR START_WORK\r\n");
+      return 0;
+    }
+    snprintf(response, response_size, "OK START_WORK\r\n");
     return 0;
   }
 

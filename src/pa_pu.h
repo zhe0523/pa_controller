@@ -152,6 +152,15 @@ void pa_pu_write(uint16_t reg, uint32_t value);
 /* 读取 STATUS 命令需要的非清除类状态寄存器集合。 */
 void pa_pu_read_status(pa_pu_status_t* status);
 
+/* 调试用：打印 PA/PU 寄存器值；会跳过 INT_VECTOR 等 read-clear 寄存器。 */
+void pa_pu_dump_all_registers(const char* reason);
+
+/*
+ * 调试命令用：打印寄存器快照，但跳过 read-clear 寄存器。
+ * 返回实际读取并打印的寄存器数量；skipped_out 返回被跳过的数量。
+ */
+size_t pa_pu_dump_safe_registers(const char* reason, size_t* skipped_out);
+
 /* 读取 INT_VECTOR。当前硬件语义为 read-clear，调用者会消费并清除 pending 中断。 */
 uint32_t pa_pu_read_int_vector(void);
 
@@ -199,6 +208,12 @@ void pa_pu_start_roic(void);
 
 /* 写 IMG_CORR_STR，启动一次图像校正。 */
 void pa_pu_start_correction(void);
+
+/* 只配置 IMG_WR_STR_ADDR，不触发 IMG_WR_STR；image_addr 必须是 FPGA 可访问的 DDR 物理地址。 */
+void pa_pu_configure_image_write(uint32_t image_addr);
+
+/* 连续写 IMG_CORR_STR、IMG_WR_STR、GIC_STR；调用前必须已经配置 GIC、IMG_WR_ADDR 和 IMG_CORR。 */
+void pa_pu_start_capture_triplet(void);
 
 /* 配置原始图像地址并写 IMG_WR_STR，启动一次图像写出/光口传图。 */
 void pa_pu_start_image_write(uint32_t image_addr);
