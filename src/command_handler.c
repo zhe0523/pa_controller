@@ -789,7 +789,7 @@ static void write_work_state_response(const work_mode_status_t* status, char* re
   /* 给上位机和串口调试保留足够现场信息，尤其是失败阶段、等待 mask 和本次 DDR 地址。 */
   snprintf(response,
            response_size,
-           "OK WORK_STATE mode=Idle state=%s pending_capture=%u stop=%u last_error=%d last_phase=%s last_int_vector=0x%08x last_wait_mask=0x%08x wr_state=0x%08x wr_end=0x%08x corr_state=0x%08x corr_end=0x%08x gic_state=0x%08x gic_end=0x%08x gic_dfx=0x%08x bright_addr=0x%08x dark_addr=0x%08x capture_id=%u ddr_next_offset=0x%08x frame_stride=0x%lx\r\n",
+           "OK WORK_STATE mode=Idle state=%s pending_capture=%u stop=%u last_error=%d last_phase=%s last_int_vector=0x%08x last_wait_mask=0x%08x wr_state=0x%08x wr_end=0x%08x corr_state=0x%08x corr_end=0x%08x gic_state=0x%08x gic_end=0x%08x gic_dfx=0x%08x bright_addr=0x%08x dark_addr=0x%08x capture_id=%u ddr_next_offset=0x%08x frame_stride=0x%lx frame_count=%lu\r\n",
            work_mode_state_name(status->state),
            status->pending_capture ? 1u : 0u,
            status->stop_requested ? 1u : 0u,
@@ -808,7 +808,8 @@ static void write_work_state_response(const work_mode_status_t* status, char* re
            status->last_dark_addr,
            status->capture_id,
            status->ddr_next_offset,
-           (unsigned long)status->ddr_frame_stride);
+           (unsigned long)status->ddr_frame_stride,
+           (unsigned long)status->ddr_frame_count);
 }
 
 static void write_status_response(char* response, size_t response_size) {
@@ -1155,7 +1156,8 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
 
     snprintf(response,
              response_size,
-             "OK LOOP_STATIC_IDLE_CAPTURE ok=%u fail=%u last_iteration=%u last_capture_id=%u last_output_addr=0x%08x\r\n",
+             "%s LOOP_STATIC_IDLE_CAPTURE ok=%u fail=%u last_iteration=%u last_capture_id=%u last_output_addr=0x%08x\r\n",
+             fail_count == 0 ? "OK" : "ERR",
              ok_count,
              fail_count,
              last_iteration,

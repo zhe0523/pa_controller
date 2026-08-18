@@ -2,83 +2,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include "app_config.h"
 #include "log.h"
-
-static bool uio_device_index(const char* device, unsigned* index_out) {
-  /* 从 /dev/uioN 解析出 N，用于定位 /sys/class/uio/uioN/maps/map0。 */
-  const char* prefix = "/dev/uio";
-  char* end = NULL;
-  unsigned long value = 0;
-
-  if (device == NULL || strncmp(device, prefix, strlen(prefix)) != 0 || index_out == NULL) {
-    return false;
-  }
-
-  errno = 0;
-  value = strtoul(device + strlen(prefix), &end, 10);
-  if (errno != 0 || end == device + strlen(prefix) || *end != '\0' || value > UINT_MAX) {
-    return false;
-  }
-
-  *index_out = (unsigned)value;
-  return true;
-}
-
-static bool read_uio_map_value(const char* device, const char* name, unsigned long* value_out) {
-  unsigned index = 0;
-  char path[96];
-  FILE* fp = NULL;
-  unsigned long value = 0;
-
-  if (value_out == NULL || !uio_device_index(device, &index)) {
-    return false;
-  }
-
-  snprintf(path, sizeof(path), "/sys/class/uio/uio%u/maps/map0/%s", index, name);
-  fp = fopen(path, "r");
-  if (fp == NULL) {
-    log_error("open %s failed: %d", path, errno);
-    return false;
-  }
-
-  if (fscanf(fp, "%lx", &value) != 1) {
-    log_error("read %s failed", path);
-    fclose(fp);
-    return false;
-  }
-
-  fclose(fp);
-  *value_out = value;
-  return true;
-}
-
-static bool read_uio_region_info(const char* device, uint32_t* phys_out, size_t* size_out) {
-  unsigned long phys = 0;
-  unsigned long size = 0;
-
-  if (!read_uio_map_value(device, "addr", &phys) ||
-      !read_uio_map_value(device, "size", &size) ||
-      phys > UINT32_MAX ||
-      size == 0) {
-    return false;
-  }
-
-  if (phys_out != NULL) {
-    *phys_out = (uint32_t)phys;
-  }
-  if (size_out != NULL) {
-    *size_out = (size_t)size;
-  }
-  return true;
-}
 
 static int map_uio_region(const char* device, size_t size, uint8_t** ptr_out) {
   /* 所有共享 DDR 都按 UIO map0 映射，返回 fd 供 fpga_mem_close 释放。 */
@@ -124,17 +53,17 @@ static int fpga_mem_open_uio(fpga_mem_t* mem) {
   /*
    * 当前板上只有 uio0/uio1/uio2：
    * uio0/uio1 用于 offset/gain 模板区，uio2 用于 Static Idle 实际输出图环形池。
-   * 物理地址和 size 以设备树暴露到 UIO sysfs 的 map0 为准。
+   * 物理地址和 size 由 Makefile/app_config.h 显式配置，必须和设备树保持一致。
    */
-  if (!read_uio_region_info(FPGA_OFFSET_UIO_DEVICE, &mem->offset_phys_base, &mem->offset_map_size) ||
-      !read_uio_region_info(FPGA_GAIN_UIO_DEVICE, &mem->gain_phys_base, &mem->gain_map_size) ||
-      !read_uio_region_info(FPGA_IMAGE_UIO_DEVICE, &mem->image_phys_base, &mem->image_map_size)) {
-    return -1;
-  }
-
+  mem->offset_phys_base = FPGA_OFFSET_PTR;
+  mem->gain_phys_base = FPGA_GAIN_PTR;
+  mem->image_phys_base = FPGA_IMAGE_PTR;
+  mem->offset_map_size = FPGA_OFFSET_UIO_SIZE;
+  mem->gain_map_size = FPGA_GAIN_UIO_SIZE;
+  mem->image_map_size = FPGA_IMAGE_UIO_SIZE;
   mem->image_pool = NULL;
-  mem->image_pool_phys_base = mem->image_phys_base;
-  mem->image_pool_map_size = mem->image_map_size;
+  mem->image_pool_phys_base = DDR_IMAGE_POOL_BASE;
+  mem->image_pool_map_size = DDR_IMAGE_POOL_UIO_SIZE;
 
   mem->offset_fd = map_uio_region(FPGA_OFFSET_UIO_DEVICE, mem->offset_map_size, &mem->offset_template);
   if (mem->offset_fd == -1) {
@@ -178,8 +107,8 @@ static int fpga_mem_open_uio(fpga_mem_t* mem) {
 static int fpga_mem_open_devmem(fpga_mem_t* mem) {
   (void)mem;
   /*
-   * 当前设备树把 offset/gain/image 放在三段独立 UIO 区域，并且 image 不再覆盖 offset/gain。
-   * 单个 /dev/mem 窗口很容易算错偏移，因此正式路径只支持 UIO sysfs 描述的布局。
+   * 当前三块 DDR 是离散 UIO 区域，不能再按一个 /dev/mem 连续窗口推导偏移。
+   * 正式路径使用 UIO 节点，物理地址仍由 Makefile/app_config.h 显式给出。
    */
   log_error("split DDR layout requires UIO mapping; /dev/mem fallback is not supported");
   return -1;

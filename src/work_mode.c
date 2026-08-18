@@ -146,14 +146,22 @@ static void record_error_locked(work_mode_context_t* wm,
 static bool alloc_frame_locked(work_mode_context_t* wm, const char* phase, uint32_t* addr_out) {
   /*
    * uio2 作为实际输出图像池，按整帧步进做环形分配。
+   * STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU=1 时，第 0 帧保留给 bright 临时帧，
+   * 实际输出图从第 1 帧开始回环，避免 bright scratch 和 output 复用同一地址。
    * 边界行为：如果尾部剩余空间不足一帧，下一帧从池起始地址重新开始；
    * 单帧永远不跨越 uio2 尾部。
    */
+  const size_t first_output_offset =
+      STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU ? wm->status.ddr_frame_stride : 0u;
   size_t offset = wm->status.ddr_next_offset;
+  size_t pool_limit = wm->status.ddr_frame_stride * wm->status.ddr_frame_count;
   bool wrapped = false;
 
-  if (offset + wm->status.ddr_frame_stride > wm->fpga_mem->image_pool_map_size) {
-    offset = 0;
+  if (offset < first_output_offset) {
+    offset = first_output_offset;
+  }
+  if (offset + wm->status.ddr_frame_stride > pool_limit) {
+    offset = first_output_offset;
     wrapped = true;
   }
 
@@ -163,13 +171,15 @@ static bool alloc_frame_locked(work_mode_context_t* wm, const char* phase, uint3
     *addr_out = addr;
   }
 
-  log_info("ddr image pool alloc capture_id=%u phase=%s addr=0x%08x offset=0x%lx stride=0x%lx size=0x%lx wrapped=%u",
+  log_info("ddr image pool alloc capture_id=%u phase=%s addr=0x%08x offset=0x%lx stride=0x%lx size=0x%lx frames=%lu first_output_offset=0x%lx wrapped=%u",
            wm->status.capture_id,
            phase,
            addr,
            (unsigned long)offset,
            (unsigned long)wm->status.ddr_frame_stride,
-           (unsigned long)wm->fpga_mem->image_pool_map_size,
+           (unsigned long)pool_limit,
+           (unsigned long)wm->status.ddr_frame_count,
+           (unsigned long)first_output_offset,
            wrapped ? 1u : 0u);
   return true;
 }
@@ -198,6 +208,37 @@ static int run_idle_clean(work_mode_context_t* wm, const static_idle_config_t* c
   return ret > 0 ? 0 : -1;
 }
 
+static int wait_capture_modules_idle(const char* phase_name, unsigned timeout_ms) {
+  /*
+   * 连续采图时，上一帧完成中断到各子模块 state 回到空闲之间可能存在短暂延迟。
+   * 启动下一帧前先确认 GIC/IMG_WR/IMG_CORR 都空闲，避免 start 脉冲打在模块忙碌窗口里。
+   */
+  const uint64_t start_ms = monotonic_ms_local();
+  pa_pu_status_t status;
+
+  for (;;) {
+    pa_pu_read_status(&status);
+    if (status.img_wr_state == 0 && status.img_corr_state == 0 && status.gic_state == 0) {
+      return 0;
+    }
+
+    uint64_t now_ms = monotonic_ms_local();
+    if (now_ms - start_ms >= timeout_ms) {
+      log_error("static capture wait idle timeout phase=%s wr_state=0x%08x corr_state=0x%08x gic_state=0x%08x wr_end=0x%08x corr_end=0x%08x gic_end=0x%08x",
+                phase_name,
+                status.img_wr_state,
+                status.img_corr_state,
+                status.gic_state,
+                status.img_wr_end,
+                status.img_corr_end,
+                status.gic_end);
+      return -1;
+    }
+
+    usleep(1000u);
+  }
+}
+
 static int run_capture_phase(work_mode_context_t* wm,
                              const char* phase_name,
                              work_state_t state,
@@ -211,6 +252,14 @@ static int run_capture_phase(work_mode_context_t* wm,
   set_state_locked(wm, state, phase);
   pthread_mutex_unlock(&wm->mutex);
 
+  if (wait_capture_modules_idle(phase_name, 1000u) != 0) {
+    pthread_mutex_lock(&wm->mutex);
+    record_error_locked(wm, EBUSY, phase, 0, 0);
+    pthread_mutex_unlock(&wm->mutex);
+    pa_pu_dump_all_registers("wait_idle_failed");
+    return -1;
+  }
+
   /*
    * 每帧采图的硬件配置顺序：
    * 1. 配置 GIC 时序/行范围；
@@ -218,11 +267,31 @@ static int run_capture_phase(work_mode_context_t* wm,
    * 3. 配置校正模块；
    * 4. 清理上一轮中断后连续写三个 STR 寄存器。
    */
+  log_info("static capture phase start phase=%s addr=0x%08x offset_en=%u gain_en=%u defect_en=%u",
+           phase_name,
+           image_addr,
+           corr->offset_enable ? 1u : 0u,
+           corr->gain_enable ? 1u : 0u,
+           corr->defect_enable ? 1u : 0u);
+  log_info("static capture phase step phase=%s step=config_gic begin", phase_name);
   pa_pu_configure_gic(gic);
+  log_info("static capture phase step phase=%s step=config_gic done", phase_name);
+  log_info("static capture phase step phase=%s step=config_image_write begin addr=0x%08x", phase_name, image_addr);
   pa_pu_configure_image_write(image_addr);
+  log_info("static capture phase step phase=%s step=config_image_write done", phase_name);
+  log_info("static capture phase step phase=%s step=config_correction begin offset_addr=0x%08x gain_addr=0x%08x",
+           phase_name,
+           corr->offset_template_addr,
+           corr->gain_template_addr);
   pa_pu_configure_correction(corr);
+  log_info("static capture phase step phase=%s step=config_correction done", phase_name);
+  log_info("static capture phase step phase=%s step=prepare_irq begin", phase_name);
   pa_pu_prepare_irq_wait();
+  log_info("static capture phase step phase=%s step=prepare_irq done", phase_name);
+  log_info("static capture phase step phase=%s step=start_triplet begin", phase_name);
   pa_pu_start_capture_triplet();
+  log_info("static capture phase step phase=%s step=start_triplet done", phase_name);
+  log_info("static capture phase wait phase=%s wait_mask=0x%08x", phase_name, STATIC_CAPTURE_WAIT_MASK);
 
   int ret = pa_pu_wait_int_vector_all(STATIC_CAPTURE_WAIT_MASK, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
   pthread_mutex_lock(&wm->mutex);
@@ -251,7 +320,37 @@ static int run_capture_phase(work_mode_context_t* wm,
   }
   pthread_mutex_unlock(&wm->mutex);
 
+  if (ret > 0) {
+    log_info("static capture phase done phase=%s addr=0x%08x int_vector=0x%08x", phase_name, image_addr, int_vector);
+  }
   return ret > 0 ? 0 : -1;
+}
+
+static int copy_bright_to_offset_template(work_mode_context_t* wm, uint32_t bright_addr) {
+  /*
+   * 调试模式：避免 FPGA 直接写 uio0/offset，先让 FPGA 写 uio2 基地址。
+   * bright 完成后由 ARM 复制到 uio0，用来判断卡死是否和 FPGA 写 offset 区有关。
+   */
+  if (wm->fpga_mem->image_pool == NULL ||
+      wm->fpga_mem->offset_template == NULL ||
+      bright_addr != wm->fpga_mem->image_pool_phys_base ||
+      wm->fpga_mem->image_pool_map_size < ACTIVE_IMAGE_BYTES ||
+      wm->fpga_mem->offset_map_size < ACTIVE_IMAGE_BYTES) {
+    log_error("static bright copy invalid bright_addr=0x%08x image_pool=0x%08x image_size=0x%lx offset=0x%08x offset_size=0x%lx",
+              bright_addr,
+              wm->fpga_mem->image_pool_phys_base,
+              (unsigned long)wm->fpga_mem->image_pool_map_size,
+              wm->fpga_mem->offset_phys_base,
+              (unsigned long)wm->fpga_mem->offset_map_size);
+    return -1;
+  }
+
+  memcpy(wm->fpga_mem->offset_template, wm->fpga_mem->image_pool, ACTIVE_IMAGE_BYTES);
+  log_info("static bright copied to offset template src=0x%08x dst=0x%08x bytes=0x%lx",
+           bright_addr,
+           wm->fpga_mem->offset_phys_base,
+           (unsigned long)ACTIVE_IMAGE_BYTES);
+  return 0;
 }
 
 static int run_static_capture(work_mode_context_t* wm, const static_idle_config_t* config) {
@@ -261,10 +360,15 @@ static int run_static_capture(work_mode_context_t* wm, const static_idle_config_
   pthread_mutex_lock(&wm->mutex);
   wm->status.capture_id++;
   /*
-   * 第一帧未矫正 light 作为 offset 模板，直接写入 uio0/offset 区。
+   * 第一帧未矫正 light 作为 offset 模板。
+   * 默认 FPGA 直接写 uio0/offset；调试模式可改为先写 uio2，再由 ARM 复制到 uio0。
    * 第二帧才是实际输出图，从 uio2 环形图像池分配地址。
    */
+#if STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU
+  bright_addr = wm->fpga_mem->image_pool_phys_base;
+#else
   bright_addr = wm->fpga_mem->offset_phys_base;
+#endif
   bool output_ok = alloc_frame_locked(wm, "output", &dark_addr);
   if (!output_ok) {
     record_error_locked(wm, ENOSPC, WORK_PHASE_EXPOSURE_WINDOW, 0, 0);
@@ -272,7 +376,11 @@ static int run_static_capture(work_mode_context_t* wm, const static_idle_config_
     pa_pu_dump_all_registers("ddr_alloc_failed");
     return -1;
   }
-  log_info("static offset light fixed addr=0x%08x output_addr=0x%08x", bright_addr, dark_addr);
+  log_info("static offset light fixed addr=0x%08x offset_addr=0x%08x output_addr=0x%08x via_cpu=%u",
+           bright_addr,
+           wm->fpga_mem->offset_phys_base,
+           dark_addr,
+           STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU ? 1u : 0u);
   wm->status.last_bright_addr = bright_addr;
   wm->status.last_dark_addr = dark_addr;
   set_state_locked(wm, WORK_STATE_EXPOSURE_WINDOW, WORK_PHASE_EXPOSURE_WINDOW);
@@ -289,6 +397,19 @@ static int run_static_capture(work_mode_context_t* wm, const static_idle_config_
                         &config->bright_gic, &config->bright_corr, bright_addr) != 0) {
     return -1;
   }
+#if STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU
+  if (copy_bright_to_offset_template(wm, bright_addr) != 0) {
+    pthread_mutex_lock(&wm->mutex);
+    record_error_locked(wm, EIO, WORK_PHASE_BRIGHT_CAPTURE, STATIC_CAPTURE_WAIT_MASK, wm->status.last_int_vector);
+    pthread_mutex_unlock(&wm->mutex);
+    pa_pu_dump_all_registers("copy_offset_failed");
+    return -1;
+  }
+#endif
+  log_info("static bright phase done, enter dark window capture_id=%u dark_window_ms=%u output_addr=0x%08x",
+           wm->status.capture_id,
+           config->dark_window_ms,
+           dark_addr);
 
   pthread_mutex_lock(&wm->mutex);
   set_state_locked(wm, WORK_STATE_DARK_WINDOW, WORK_PHASE_DARK_WINDOW);
@@ -428,29 +549,43 @@ int work_mode_init(work_mode_context_t* wm, fpga_mem_t* fpga_mem) {
   work_mode_default_static_idle_config(&wm->config);
   wm->status.mode = WORK_MODE_IDLE;
   wm->status.state = WORK_STATE_STOPPED;
-  /* 模板物理地址来自设备树/UIO sysfs，避免 Makefile 和设备树重复维护地址。 */
+  /* 模板物理地址来自 fpga_mem 映射结果，当前由 Makefile/app_config.h 显式配置。 */
   wm->config.bright_corr.offset_template_addr = fpga_mem->offset_phys_base;
   wm->config.dark_corr.offset_template_addr = fpga_mem->offset_phys_base;
   wm->config.bright_corr.gain_template_addr = fpga_mem->gain_phys_base;
   wm->config.dark_corr.gain_template_addr = fpga_mem->gain_phys_base;
   /* frame_stride 是 uio2 环形图像池的单帧步进，需要能容纳完整有效图像。 */
   wm->status.ddr_frame_stride = align_up_size(ACTIVE_IMAGE_BYTES, DDR_IMAGE_FRAME_ALIGN);
+  size_t max_frame_count = wm->status.ddr_frame_stride == 0 ? 0 : fpga_mem->image_pool_map_size / wm->status.ddr_frame_stride;
+  wm->status.ddr_frame_count = DDR_IMAGE_POOL_FRAME_COUNT == 0 ? max_frame_count : (size_t)DDR_IMAGE_POOL_FRAME_COUNT;
+  if (STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU) {
+    wm->status.ddr_next_offset = (uint32_t)wm->status.ddr_frame_stride;
+  }
 
   if (wm->status.ddr_frame_stride == 0 ||
       wm->status.ddr_frame_stride > UINT32_MAX ||
       wm->status.ddr_frame_stride > fpga_mem->image_pool_map_size ||
+      wm->status.ddr_frame_count == 0 ||
+      wm->status.ddr_frame_count > max_frame_count ||
+      (STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU && wm->status.ddr_frame_count < 2u) ||
       fpga_mem->image_pool_phys_base == 0) {
-    log_error("static idle image pool invalid pool_base=0x%08x pool_size=0x%lx frame_stride=0x%lx",
+    log_error("static idle image pool invalid pool_base=0x%08x pool_size=0x%lx frame_stride=0x%lx frame_count=%lu max_frame_count=%lu via_cpu=%u",
               fpga_mem->image_pool_phys_base,
               (unsigned long)fpga_mem->image_pool_map_size,
-              (unsigned long)wm->status.ddr_frame_stride);
+              (unsigned long)wm->status.ddr_frame_stride,
+              (unsigned long)wm->status.ddr_frame_count,
+              (unsigned long)max_frame_count,
+              STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU ? 1u : 0u);
     return -1;
   }
 
-  log_info("work mode init image_pool_base=0x%08x image_pool_size=0x%lx frame_stride=0x%lx ring=1",
+  log_info("work mode init image_pool_base=0x%08x image_pool_size=0x%lx frame_stride=0x%lx frame_count=%lu max_frame_count=%lu via_cpu=%u ring=1",
            fpga_mem->image_pool_phys_base,
            (unsigned long)fpga_mem->image_pool_map_size,
-           (unsigned long)wm->status.ddr_frame_stride);
+           (unsigned long)wm->status.ddr_frame_stride,
+           (unsigned long)wm->status.ddr_frame_count,
+           (unsigned long)max_frame_count,
+           STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU ? 1u : 0u);
   return 0;
 }
 

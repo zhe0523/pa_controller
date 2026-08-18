@@ -26,8 +26,8 @@ make CORR_DEFAULT_ROW_NUM=7680 CORR_DEFAULT_COL_NUM=3072 \
      CORR_DEFAULT_GAIN_CLIPPING_VALUE=55000
 ```
 
-offset/gain/image 的物理地址和 UIO size 不再通过 Makefile 配置，程序启动时从
-`/sys/class/uio/uioN/maps/map0/{addr,size}` 读取设备树中的实际布局。
+offset/gain/image 的物理地址和 UIO size 通过 Makefile 配置，必须和设备树中的
+UIO 布局保持一致。
 
 可用 `make config` 查看当前构建参数展开后的默认值。
 
@@ -39,17 +39,20 @@ offset/gain/image 的物理地址和 UIO size 不再通过 Makefile 配置，程
 /dev/uio2 -> 实际输出图环形图像池
 ```
 
-物理地址和窗口大小由设备树决定，程序启动时从 UIO sysfs 读取，例如：
+当前默认物理地址和窗口大小：
 
 ```text
-/sys/class/uio/uio0/maps/map0/addr
-/sys/class/uio/uio0/maps/map0/size
+FPGA_OFFSET_PTR=0x16000000 FPGA_OFFSET_UIO_SIZE=0x04000000
+FPGA_GAIN_PTR=0x1A000000 FPGA_GAIN_UIO_SIZE=0x04000000
+FPGA_IMAGE_PTR=0x21000000 FPGA_IMAGE_UIO_SIZE=0x1F000000
 ```
 
 对应构建参数：
 
 ```sh
-make FPGA_OFFSET_UIO_DEVICE=/dev/uio0 FPGA_GAIN_UIO_DEVICE=/dev/uio1 FPGA_IMAGE_UIO_DEVICE=/dev/uio2
+make FPGA_OFFSET_UIO_DEVICE=/dev/uio0 FPGA_OFFSET_PTR=0x16000000 FPGA_OFFSET_UIO_SIZE=0x04000000 \
+     FPGA_GAIN_UIO_DEVICE=/dev/uio1 FPGA_GAIN_PTR=0x1A000000 FPGA_GAIN_UIO_SIZE=0x04000000 \
+     FPGA_IMAGE_UIO_DEVICE=/dev/uio2 FPGA_IMAGE_PTR=0x21000000 FPGA_IMAGE_UIO_SIZE=0x1F000000
 ```
 
 `GAIN_TEMPLATE_REPEAT_COUNT` 默认是 `1`。当前 3072×7680 的 16bit 图像一帧约 45MB，
@@ -334,8 +337,8 @@ CONFIG_GIC gic_req_code=0 gic_dout_en=1 gic_line_time=100000 gic_oe_raising_edge
 
 写完这些配置寄存器后，再发 `START_GIC`，程序会写 `GIC_STR=1` 让配置生效并启动一次 GIC 操作。
 
-`CONFIG_CORR` 不带参数时使用默认图像尺寸，模板地址默认来自 `/dev/uio0` 和 `/dev/uio1`
-的 sysfs 物理地址；也可以用 `key=value` 临时覆盖：
+`CONFIG_CORR` 不带参数时使用默认图像尺寸，模板地址默认来自 `FPGA_OFFSET_PTR` 和
+`FPGA_GAIN_PTR`；也可以用 `key=value` 临时覆盖：
 
 ```text
 CONFIG_CORR pkg=46080 row=7680 col=3072 offset_en=1 offset_addr=0x16000000 offset_adder=100 gain_en=1 gain_addr=0x1a000000 gain_clip=55000 defect_en=0

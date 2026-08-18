@@ -12,7 +12,7 @@
  *   /dev/uio1: 亮场图/gain 模板区
  *   /dev/uio2: 实际输出图环形图像池
  *
- * 物理地址和映射大小来自 UIO sysfs，而不是 Makefile 中写死的地址。
+ * 物理地址和映射大小来自 app_config.h/Makefile，必须和设备树 UIO 布局保持一致。
  */
 typedef struct {
   /* 实际输出图缓冲区虚拟地址，对应 FPGA_IMAGE_UIO_DEVICE。 */

@@ -54,25 +54,22 @@
 #endif
 
 #ifndef FPGA_IMAGE_PTR
-/*
- * 旧 /dev/mem fallback 使用的物理地址。
- * 正常 UIO 模式下，物理地址和 size 都从 /sys/class/uio/uioN/maps/map0 读取。
- */
+/* /dev/uio2 实际输出图 DDR 池物理起始地址，写 IMG_WR_STR_ADDR 时使用。 */
 #define FPGA_IMAGE_PTR 0x21000000u
 #endif
 
 #ifndef FPGA_OFFSET_PTR
-/* 旧 /dev/mem fallback 使用的 offset/暗场模板物理起始地址。 */
+/* /dev/uio0 offset/暗场模板物理起始地址。 */
 #define FPGA_OFFSET_PTR 0x16000000u
 #endif
 
 #ifndef FPGA_GAIN_PTR
-/* 旧 /dev/mem fallback 使用的 gain/亮场模板物理起始地址。 */
+/* /dev/uio1 gain/亮场模板物理起始地址。 */
 #define FPGA_GAIN_PTR 0x1A000000u
 #endif
 
 #ifndef FPGA_MEM_MAP_SIZE
-/* 兼容旧 /dev/mem 映射的总窗口大小；当前默认使用三个 UIO 节点分别映射。 */
+/* /dev/mem fallback 映射窗口大小；正常使用三个 UIO 节点分别映射。 */
 #define FPGA_MEM_MAP_SIZE 0x1F000000u
 #endif
 
@@ -88,9 +85,47 @@
 #define FPGA_GAIN_UIO_DEVICE "/dev/uio1"
 #endif
 
+#ifndef FPGA_IMAGE_UIO_SIZE
+/* /dev/uio2 实际输出图 DDR 池映射大小。 */
+#define FPGA_IMAGE_UIO_SIZE 0x1F000000u
+#endif
+
+#ifndef FPGA_OFFSET_UIO_SIZE
+/* /dev/uio0 offset/暗场模板映射大小。 */
+#define FPGA_OFFSET_UIO_SIZE 0x04000000u
+#endif
+
+#ifndef FPGA_GAIN_UIO_SIZE
+/* /dev/uio1 gain/亮场模板映射大小。 */
+#define FPGA_GAIN_UIO_SIZE 0x04000000u
+#endif
+
+#ifndef DDR_IMAGE_POOL_BASE
+/* Static Idle 实际输出图环形池物理起始地址；当前复用 FPGA_IMAGE_PTR。 */
+#define DDR_IMAGE_POOL_BASE FPGA_IMAGE_PTR
+#endif
+
+#ifndef DDR_IMAGE_POOL_UIO_SIZE
+/* Static Idle 实际输出图环形池大小；当前复用 FPGA_IMAGE_UIO_SIZE。 */
+#define DDR_IMAGE_POOL_UIO_SIZE FPGA_IMAGE_UIO_SIZE
+#endif
+
 #ifndef DDR_IMAGE_FRAME_ALIGN
 /* 图像池中每张图的首地址/步进对齐，IMG_WR_STR_ADDR 协议要求至少 1KB 对齐。 */
 #define DDR_IMAGE_FRAME_ALIGN 4096u
+#endif
+
+#ifndef DDR_IMAGE_POOL_FRAME_COUNT
+/* Static Idle 输出图环形池最大帧数；0 表示按 DDR_IMAGE_POOL_UIO_SIZE 自动使用全部可用帧。 */
+#define DDR_IMAGE_POOL_FRAME_COUNT 0u
+#endif
+
+#ifndef STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU
+/*
+ * Static Idle 第一帧 light 模板写入策略。
+ * 0：FPGA 直接写 uio0/offset；1：FPGA 先写 uio2，再由 ARM 复制到 uio0。
+ */
+#define STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU 0u
 #endif
 
 #ifndef FPGA_MEM_USE_DEVMEM_FALLBACK

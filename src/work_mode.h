@@ -96,6 +96,8 @@ typedef struct {
   uint32_t ddr_next_offset;
   /* uio2 DDR 池单帧需要的对齐步进。 */
   size_t ddr_frame_stride;
+  /* 当前环形池实际启用的帧数；0 不合法。 */
+  size_t ddr_frame_count;
 } work_mode_status_t;
 
 /*
