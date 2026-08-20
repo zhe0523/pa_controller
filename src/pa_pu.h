@@ -143,6 +143,9 @@ bool pa_pu_is_open(void);
 /* 判断是否已打开 /dev/pa_irq；未打开时等待中断会自动回退到 INT_VECTOR 轮询。 */
 bool pa_pu_irq_driver_is_open(void);
 
+/* 调试用：打开后等待中断路径会同步打印 trace，用于定位硬卡死位置。 */
+void pa_pu_set_trace(bool enabled);
+
 /* 读一个 32 位 PA 寄存器；reg 使用 pa_pu_regs.h 中的偏移。 */
 uint32_t pa_pu_read(uint16_t reg);
 

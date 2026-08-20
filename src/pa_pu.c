@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -27,12 +28,27 @@ static bool g_using_uio = false;
 /* /dev/pa_irq 驱动 fd。存在时由驱动负责读取 read-clear 的 INT_VECTOR。 */
 static int g_irq_fd = -1;
 
+/* 调试 trace：只在命令显式打开时同步打印，避免正常运行刷屏。 */
+static bool g_trace = false;
+
 typedef struct {
   uint32_t int_vector;
   uint32_t reserved;
   uint64_t count;
   uint64_t timestamp_ns;
 } pa_irq_event_t;
+
+void pa_pu_set_trace(bool enabled) {
+  g_trace = enabled;
+}
+
+static void pa_pu_trace(const char* tag, uint32_t mask, uint32_t value) {
+  if (!g_trace) {
+    return;
+  }
+  fprintf(stderr, "[TRACE] pa_pu %s mask=0x%08x value=0x%08x irq_fd=%d\n", tag, mask, value, g_irq_fd);
+  fflush(stderr);
+}
 
 typedef struct {
   const char* name;
@@ -418,6 +434,7 @@ static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* i
   const uint64_t start_ms = monotonic_ms();
   uint32_t last_vector = 0;
 
+  pa_pu_trace("wait_irq_driver_enter", mask, timeout_ms);
   while (g_irq_fd != -1) {
     const uint64_t now_ms = monotonic_ms();
     if (now_ms - start_ms >= timeout_ms) {
@@ -439,6 +456,7 @@ static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* i
     };
 
     int pret = poll(&pfd, 1, poll_timeout);
+    pa_pu_trace("wait_irq_driver_poll_return", mask, (uint32_t)pret);
     if (pret == 0) {
       if (int_vector_out != NULL) {
         *int_vector_out = last_vector;
@@ -471,6 +489,7 @@ static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* i
       ssize_t n = read(g_irq_fd, &event, sizeof(event));
       if (n == (ssize_t)sizeof(event)) {
         last_vector = event.int_vector;
+        pa_pu_trace("wait_irq_driver_event", mask, last_vector);
         if ((last_vector & mask) != 0) {
           if (int_vector_out != NULL) {
             *int_vector_out = last_vector;
@@ -510,8 +529,10 @@ int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vect
     return -1;
   }
 
+  pa_pu_trace("wait_int_vector_enter", mask, timeout_ms);
   if (g_irq_fd != -1) {
     int driver_ret = pa_pu_wait_irq_driver(mask, timeout_ms, int_vector_out);
+    pa_pu_trace("wait_int_vector_driver_ret", mask, (uint32_t)driver_ret);
     if (driver_ret != -2) {
       return driver_ret;
     }
@@ -526,6 +547,9 @@ int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vect
      * 如果读到了非目标 bit，也保留在 last_vector 中返回给调用方诊断。
      */
     last_vector = pa_pu_read_int_vector();
+    if (last_vector != 0) {
+      pa_pu_trace("wait_int_vector_poll_value", mask, last_vector);
+    }
     if (last_vector != 0 && (last_vector & mask) == 0) {
       log_warn("poll INT_VECTOR=0x%08x does not match mask=0x%08x", last_vector, mask);
     } else if (last_vector != 0 && mask != PA_PU_IRQ_GIC_END) {
@@ -560,6 +584,7 @@ int pa_pu_wait_int_vector_all(uint32_t mask, unsigned timeout_ms, uint32_t* int_
     return -1;
   }
 
+  pa_pu_trace("wait_all_enter", mask, timeout_ms);
   while ((accumulated_vector & mask) != mask) {
     const uint64_t now_ms = monotonic_ms();
     if (now_ms - start_ms >= timeout_ms) {
@@ -571,16 +596,24 @@ int pa_pu_wait_int_vector_all(uint32_t mask, unsigned timeout_ms, uint32_t* int_
 
     uint32_t current_vector = 0;
     unsigned remain_ms = (unsigned)(timeout_ms - (now_ms - start_ms));
+    pa_pu_trace("wait_all_before_wait_one", mask & ~accumulated_vector, accumulated_vector);
     int ret = pa_pu_wait_int_vector(mask & ~accumulated_vector, remain_ms, &current_vector);
+    pa_pu_trace("wait_all_after_wait_one", mask & ~accumulated_vector, current_vector);
     if (current_vector != 0) {
       accumulated_vector |= current_vector;
-      log_info("accumulated INT_VECTOR=0x%08x wait_mask=0x%08x", accumulated_vector, mask);
+      if ((current_vector & mask) == 0 || (accumulated_vector & mask) != mask) {
+        log_warn("accumulated INT_VECTOR=0x%08x wait_mask=0x%08x current=0x%08x",
+                 accumulated_vector,
+                 mask,
+                 current_vector);
+      }
     }
 
     if ((accumulated_vector & mask) == mask) {
       if (int_vector_out != NULL) {
         *int_vector_out = accumulated_vector;
       }
+      pa_pu_trace("wait_all_done", mask, accumulated_vector);
       return 1;
     }
     if (ret < 0) {
@@ -612,6 +645,24 @@ void pa_pu_configure_correction(const pa_pu_corr_config_t* config) {
   pa_pu_write(PA_PU_IMG_PKG_NUM_REG, config->pkg_num);
   pa_pu_write(PA_PU_IMG_ROW_NUM_REG, config->row_num);
   pa_pu_write(PA_PU_IMG_COL_NUM_REG, config->col_num);
+  /*
+   * 现场曾观察到 IMG_ROW_NUM 读回等于 IMG_PKG_NUM。
+   * 这里做一次尺寸寄存器读回校验，正常不打印；异常时优先排查地址表/FPGA 地址解码/配置覆盖。
+   */
+  uint32_t pkg_readback = pa_pu_read(PA_PU_IMG_PKG_NUM_REG);
+  uint32_t row_readback = pa_pu_read(PA_PU_IMG_ROW_NUM_REG);
+  uint32_t col_readback = pa_pu_read(PA_PU_IMG_COL_NUM_REG);
+  if (pkg_readback != config->pkg_num ||
+      row_readback != config->row_num ||
+      col_readback != config->col_num) {
+    log_warn("img corr size readback mismatch pkg=%u/0x%08x row=%u/0x%08x col=%u/0x%08x",
+             config->pkg_num,
+             pkg_readback,
+             config->row_num,
+             row_readback,
+             config->col_num,
+             col_readback);
+  }
   pa_pu_write(PA_PU_IMG_CORR_OFFSET_EN_REG, config->offset_enable ? 1u : 0u);
   pa_pu_write(PA_PU_IMG_CORR_OFFSET_TEMP_STR_ADDR_REG, config->offset_template_addr);
   pa_pu_write(PA_PU_IMG_CORR_OFFSET_ADDER_VALUE_REG, config->offset_adder_value);

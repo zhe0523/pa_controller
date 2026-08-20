@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "app_config.h"
+#include "calibration_builder.h"
 #include "log.h"
 #include "pa_pu.h"
 #include "template_builder.h"
@@ -215,6 +216,33 @@ typedef struct {
   bool stop_on_error;
 } static_idle_loop_config_t;
 
+static pa_pu_gic_config_t default_gic_config(void);
+static pa_pu_corr_config_t default_corr_config(const fpga_mem_t* fpga_mem);
+static bool parse_float_value(const char* text, float* value);
+
+typedef struct {
+  /* 固定地址裸压测配置：绕过 Static Idle 业务流程，只验证一次三模块联合采图。 */
+  uint32_t image_addr;
+  bool has_image_addr;
+  uint32_t count;
+  uint32_t interval_ms;
+  uint32_t timeout_ms;
+  uint32_t wait_mask;
+  bool stop_on_error;
+  bool trace;
+  /* 是否启动 IMG_WR 向 DDR 写图。false 时不写 IMG_WR_STR_ADDR/IMG_WR_STR，也不等待 IMG_WR_END。 */
+  bool write_ddr;
+  pa_pu_gic_config_t gic;
+  pa_pu_corr_config_t corr;
+} capture_addr_loop_config_t;
+
+typedef struct {
+  uint32_t levels[CAL_GAIN_MAX_LEVELS];
+  uint32_t level_count;
+  uint32_t frames;
+  float threshold;
+} cal_gain_begin_args_t;
+
 static bool parse_static_idle_loop_args(const char* args, static_idle_loop_config_t* config) {
   char buffer[256];
   if (config == NULL) {
@@ -269,6 +297,230 @@ static bool parse_static_idle_loop_args(const char* args, static_idle_loop_confi
 
     token = strtok(NULL, " ");
   }
+  return true;
+}
+
+static bool parse_level_list(char* text, uint32_t* levels, uint32_t* level_count) {
+  if (text == NULL || levels == NULL || level_count == NULL) {
+    return false;
+  }
+
+  uint32_t count = 0;
+  char* item = strtok(text, ",");
+  while (item != NULL) {
+    if (count >= CAL_GAIN_MAX_LEVELS || !parse_u32_value(item, &levels[count])) {
+      return false;
+    }
+    ++count;
+    item = strtok(NULL, ",");
+  }
+
+  if (count == 0) {
+    return false;
+  }
+  *level_count = count;
+  return true;
+}
+
+static bool parse_cal_gain_begin_args(const char* args, cal_gain_begin_args_t* config) {
+  char buffer[512];
+  if (config == NULL) {
+    return false;
+  }
+
+  memset(config, 0, sizeof(*config));
+  config->frames = 1u;
+  config->threshold = 0.3f;
+
+  if (args == NULL || strlen(args) >= sizeof(buffer)) {
+    return false;
+  }
+
+  strcpy(buffer, args);
+  char* saveptr = NULL;
+  char* token = strtok_r(buffer, " ", &saveptr);
+  while (token != NULL) {
+    char* equals = strchr(token, '=');
+    if (equals == NULL) {
+      return false;
+    }
+
+    *equals = '\0';
+    char* value_text = equals + 1;
+    uint32_t value = 0;
+    if (strcmp(token, "levels") == 0) {
+      if (!parse_level_list(value_text, config->levels, &config->level_count)) {
+        return false;
+      }
+    } else if (strcmp(token, "frames") == 0 || strcmp(token, "frames_per_level") == 0) {
+      if (!parse_u32_value(value_text, &value)) {
+        return false;
+      }
+      config->frames = value;
+    } else if (strcmp(token, "threshold") == 0 || strcmp(token, "defect_threshold") == 0) {
+      if (!parse_float_value(value_text, &config->threshold)) {
+        return false;
+      }
+    } else {
+      return false;
+    }
+    token = strtok_r(NULL, " ", &saveptr);
+  }
+
+  return config->level_count >= 1u && config->frames > 0u;
+}
+
+static bool parse_float_value(const char* text, float* value) {
+  if (text == NULL || *text == '\0' || value == NULL) {
+    return false;
+  }
+
+  errno = 0;
+  char* end = NULL;
+  double parsed = strtod(text, &end);
+  if (errno != 0 || end == text || *end != '\0') {
+    return false;
+  }
+
+  *value = (float)parsed;
+  return true;
+}
+
+static void default_capture_addr_loop_config(const fpga_mem_t* fpga_mem, capture_addr_loop_config_t* config) {
+  if (config == NULL) {
+    return;
+  }
+
+  memset(config, 0, sizeof(*config));
+  config->count = 1u;
+  config->timeout_ms = PA_PU_IRQ_TIMEOUT_MS;
+  config->wait_mask = PA_PU_IRQ_IMG_CORR_END | PA_PU_IRQ_IMG_WR_END | PA_PU_IRQ_GIC_END;
+  config->stop_on_error = true;
+  config->write_ddr = true;
+  config->gic = default_gic_config();
+  config->corr = default_corr_config(fpga_mem);
+
+  /*
+   * 这个命令用于隔离 DDR/IMG_WR/GIC 联合稳定性，默认打开 GIC 数据输出，
+   * 默认关闭所有校正项，避免 offset/gain 模板内容干扰基础压测结论。
+   */
+  config->gic.dout_enable = true;
+  config->corr.offset_enable = false;
+  config->corr.gain_enable = false;
+  config->corr.defect_enable = false;
+}
+
+static bool parse_capture_addr_loop_args(const char* args, capture_addr_loop_config_t* config) {
+  char buffer[1024];
+  if (config == NULL) {
+    return false;
+  }
+  if (args == NULL) {
+    return true;
+  }
+  while (*args == ' ') {
+    ++args;
+  }
+  if (*args == '\0') {
+    return true;
+  }
+  if (strlen(args) >= sizeof(buffer)) {
+    return false;
+  }
+
+  strcpy(buffer, args);
+  char* token = strtok(buffer, " ");
+  while (token != NULL) {
+    char* equals = strchr(token, '=');
+    uint32_t value = 0;
+    if (equals == NULL) {
+      return false;
+    }
+
+    *equals = '\0';
+    if (!parse_u32_value(equals + 1, &value)) {
+      return false;
+    }
+
+    if (strcmp(token, "addr") == 0 ||
+        strcmp(token, "image_addr") == 0 ||
+        strcmp(token, "img_wr_str_addr") == 0) {
+      config->image_addr = value;
+      config->has_image_addr = true;
+    } else if (strcmp(token, "count") == 0 || strcmp(token, "times") == 0) {
+      config->count = value;
+    } else if (strcmp(token, "interval_ms") == 0 || strcmp(token, "period_ms") == 0) {
+      config->interval_ms = value;
+    } else if (strcmp(token, "interval_s") == 0 || strcmp(token, "period_s") == 0) {
+      if (value > UINT32_MAX / 1000u) {
+        return false;
+      }
+      config->interval_ms = value * 1000u;
+    } else if (strcmp(token, "timeout_ms") == 0) {
+      config->timeout_ms = value;
+    } else if (strcmp(token, "wait_mask") == 0 || strcmp(token, "irq_mask") == 0) {
+      config->wait_mask = value;
+    } else if (strcmp(token, "stop_on_error") == 0) {
+      config->stop_on_error = value != 0;
+    } else if (strcmp(token, "trace") == 0 || strcmp(token, "verbose") == 0) {
+      config->trace = value != 0;
+    } else if (strcmp(token, "req") == 0 || strcmp(token, "gic_req_code") == 0) {
+      config->gic.req_code = (uint8_t)value;
+    } else if (strcmp(token, "dout") == 0 || strcmp(token, "gic_dout_en") == 0) {
+      config->gic.dout_enable = value != 0;
+    } else if (strcmp(token, "line_time") == 0 || strcmp(token, "gic_line_time") == 0) {
+      config->gic.line_time_ns = value;
+    } else if (strcmp(token, "oe_rise") == 0 || strcmp(token, "gic_oe_raising_edge") == 0) {
+      config->gic.oe_raising_edge_ns = value;
+    } else if (strcmp(token, "oe_fall") == 0 || strcmp(token, "gic_oe_falling_edge") == 0) {
+      config->gic.oe_falling_edge_ns = value;
+    } else if (strcmp(token, "start_row") == 0 || strcmp(token, "gic_str_row_num") == 0) {
+      config->gic.start_row = (uint16_t)value;
+    } else if (strcmp(token, "end_row") == 0 || strcmp(token, "gic_end_row_num") == 0) {
+      config->gic.end_row = (uint16_t)value;
+    } else if (strcmp(token, "binning") == 0 || strcmp(token, "gic_binning_mode") == 0) {
+      config->gic.binning_mode = (uint8_t)value;
+    } else if (strcmp(token, "pkg") == 0 || strcmp(token, "pkg_num") == 0 || strcmp(token, "img_pkg_num") == 0) {
+      config->corr.pkg_num = (uint16_t)value;
+    } else if (strcmp(token, "row") == 0 || strcmp(token, "row_num") == 0 || strcmp(token, "img_row_num") == 0) {
+      config->corr.row_num = (uint16_t)value;
+    } else if (strcmp(token, "col") == 0 || strcmp(token, "col_num") == 0 || strcmp(token, "img_col_num") == 0) {
+      config->corr.col_num = (uint16_t)value;
+    } else if (strcmp(token, "offset_en") == 0 || strcmp(token, "offset_enable") == 0 || strcmp(token, "img_corr_offset_en") == 0) {
+      config->corr.offset_enable = value != 0;
+    } else if (strcmp(token, "offset_addr") == 0 || strcmp(token, "offset_template_addr") == 0 || strcmp(token, "img_corr_offset_temp_str_addr") == 0) {
+      config->corr.offset_template_addr = value;
+    } else if (strcmp(token, "offset_adder") == 0 || strcmp(token, "offset_adder_value") == 0 || strcmp(token, "img_corr_offset_adder_value") == 0) {
+      config->corr.offset_adder_value = (uint16_t)value;
+    } else if (strcmp(token, "gain_en") == 0 || strcmp(token, "gain_enable") == 0 || strcmp(token, "img_corr_gain_en") == 0) {
+      config->corr.gain_enable = value != 0;
+    } else if (strcmp(token, "gain_addr") == 0 || strcmp(token, "gain_template_addr") == 0 || strcmp(token, "img_corr_gain_temp_str_addr") == 0) {
+      config->corr.gain_template_addr = value;
+    } else if (strcmp(token, "gain_clip") == 0 || strcmp(token, "gain_clipping_value") == 0 || strcmp(token, "img_corr_gain_clipping_value") == 0) {
+      config->corr.gain_clipping_value = (uint16_t)value;
+    } else if (strcmp(token, "defect_en") == 0 || strcmp(token, "defect_enable") == 0 || strcmp(token, "img_corr_defect_en") == 0) {
+      config->corr.defect_enable = value != 0;
+    } else if (strcmp(token, "no_write") == 0 || strcmp(token, "skip_wr") == 0) {
+      /* no_write=1/skip_wr=1 表示这一轮不启动 IMG_WR，也不等待 IMG_WR_END。 */
+      config->write_ddr = value == 0;
+    } else if (strcmp(token, "write_ddr") == 0) {
+      /* write_ddr=1 显式要求写 DDR（默认行为），write_ddr=0 等价 no_write=1。 */
+      config->write_ddr = value != 0;
+    } else {
+      return false;
+    }
+
+    token = strtok(NULL, " ");
+  }
+
+  /*
+   * 参数顺序无关收尾：不写 DDR 时从等待掩码里去掉 IMG_WR_END，
+   * 避免等待一个永远不会到来的完成中断。
+   */
+  if (!config->write_ddr) {
+    config->wait_mask &= ~PA_PU_IRQ_IMG_WR_END;
+  }
+
   return true;
 }
 
@@ -932,6 +1184,194 @@ static void write_start_combo_result(char* response,
   }
 }
 
+static uint64_t command_monotonic_ms(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+    return 0;
+  }
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static int wait_capture_addr_modules_idle(unsigned timeout_ms) {
+  /*
+   * INT_VECTOR 完成 bit 表示本轮操作完成事件已经出现，但模块 state 回到空闲
+   * 可能还存在很短延迟。裸压测连续启动前也等待三模块空闲，避免 start 脉冲
+   * 打在上一轮 IMG_WR/IMG_CORR/GIC 还没完全释放的窗口里。
+   */
+  uint64_t start_ms = command_monotonic_ms();
+  pa_pu_status_t status;
+
+  for (;;) {
+    pa_pu_read_status(&status);
+    if (status.img_wr_state == 0 && status.img_corr_state == 0 && status.gic_state == 0) {
+      return 0;
+    }
+
+    uint64_t now_ms = command_monotonic_ms();
+    if (now_ms - start_ms >= timeout_ms) {
+      log_error("loop capture addr wait idle timeout wr_state=0x%08x corr_state=0x%08x gic_state=0x%08x wr_end=0x%08x corr_end=0x%08x gic_end=0x%08x",
+                status.img_wr_state,
+                status.img_corr_state,
+                status.gic_state,
+                status.img_wr_end,
+                status.img_corr_end,
+                status.gic_end);
+      return -1;
+    }
+
+    usleep(1000u);
+  }
+}
+
+static void capture_addr_trace(const capture_addr_loop_config_t* config, uint32_t iteration, const char* step) {
+  if (config == NULL || !config->trace) {
+    return;
+  }
+  fprintf(stderr,
+          "[TRACE] loop_capture_addr iteration=%u step=%s addr=0x%08x\n",
+          iteration,
+          step,
+          config->image_addr);
+  fflush(stderr);
+}
+
+static int run_capture_addr_once(const capture_addr_loop_config_t* config,
+                                 uint32_t iteration,
+                                 uint32_t* int_vector_out) {
+  if (config == NULL || int_vector_out == NULL) {
+    return -1;
+  }
+
+  /*
+   * 裸压测时每一轮都完整下发 GIC、IMG_CORR（以及可选 IMG_WR）。
+   * 这样某一轮失败时，可以确认 FPGA 收到的是同一组参数，而不是依赖上一轮残留配置。
+   */
+  capture_addr_trace(config, iteration, "wait_idle_begin");
+  if (wait_capture_addr_modules_idle(1000u) != 0) {
+    pa_pu_dump_all_registers("loop_capture_addr_wait_idle");
+    return -2;
+  }
+  capture_addr_trace(config, iteration, "wait_idle_done");
+  pa_pu_configure_gic(&config->gic);
+  capture_addr_trace(config, iteration, "config_gic_done");
+  if (config->write_ddr) {
+    pa_pu_configure_image_write(config->image_addr);
+    capture_addr_trace(config, iteration, "config_img_wr_done");
+  }
+  pa_pu_configure_correction(&config->corr);
+  capture_addr_trace(config, iteration, "config_corr_done");
+  pa_pu_prepare_irq_wait();
+  capture_addr_trace(config, iteration, "prepare_irq_done");
+  if (config->write_ddr) {
+    pa_pu_start_capture_triplet();
+    capture_addr_trace(config, iteration, "start_triplet_done");
+  } else {
+    /* 不写 DDR：只启动 CORR+GIC，写 STR 顺序与 triplet 一致（先 CORR 后 GIC）。 */
+    pa_pu_start_correction();
+    pa_pu_start_gic();
+    capture_addr_trace(config, iteration, "start_corr_gic_done");
+  }
+  int ret = pa_pu_wait_int_vector_all(config->wait_mask, config->timeout_ms, int_vector_out);
+  capture_addr_trace(config, iteration, "wait_irq_done");
+  return ret;
+}
+
+static void handle_loop_capture_addr(command_context_t* ctx,
+                                     const char* command,
+                                     char* response,
+                                     size_t response_size) {
+  capture_addr_loop_config_t config;
+  uint32_t ok_count = 0;
+  uint32_t fail_count = 0;
+  uint32_t last_iteration = 0;
+  uint32_t last_int_vector = 0;
+  int last_ret = 0;
+
+  default_capture_addr_loop_config(ctx->fpga_mem, &config);
+  if (!parse_capture_addr_loop_args(cmd_args(command), &config) ||
+      (config.write_ddr && !config.has_image_addr)) {
+    snprintf(response, response_size, "ERR LOOP_CAPTURE_ADDR ARG\r\n");
+    return;
+  }
+
+  /*
+   * 该命令专门用于硬件压测，开始前停止 Static Idle 后台线程，
+   * 避免空闲自清空和本命令同时写 GIC/IMG_WR/IMG_CORR 寄存器。
+   */
+  work_mode_stop(ctx->work_mode);
+  log_info("loop capture addr start addr=0x%08x count=%u interval_ms=%u timeout_ms=%u wait_mask=0x%08x write_ddr=%u gic_dout=%u corr=%u/%u/%u trace=%u",
+           config.image_addr,
+           config.count,
+           config.interval_ms,
+           config.timeout_ms,
+           config.wait_mask,
+           config.write_ddr ? 1u : 0u,
+           config.gic.dout_enable ? 1u : 0u,
+           config.corr.offset_enable ? 1u : 0u,
+           config.corr.gain_enable ? 1u : 0u,
+           config.corr.defect_enable ? 1u : 0u,
+           config.trace ? 1u : 0u);
+  pa_pu_set_trace(config.trace);
+
+  for (uint32_t iteration = 1; config.count == 0 || iteration <= config.count; ++iteration) {
+    last_iteration = iteration;
+    last_int_vector = 0;
+    last_ret = run_capture_addr_once(&config, iteration, &last_int_vector);
+    if (last_ret > 0) {
+      ++ok_count;
+      if (iteration == 1 || (iteration % 50u) == 0) {
+        log_info("loop capture addr progress iteration=%u count=%u ok=%u fail=%u addr=0x%08x int_vector=0x%08x",
+                 iteration,
+                 config.count,
+                 ok_count,
+                 fail_count,
+                 config.image_addr,
+                 last_int_vector);
+      }
+    } else {
+      ++fail_count;
+      log_error("loop capture addr failed iteration=%u ret=%d addr=0x%08x int_vector=0x%08x wait_mask=0x%08x",
+                iteration,
+                last_ret,
+                config.image_addr,
+                last_int_vector,
+                config.wait_mask);
+      pa_pu_dump_all_registers("loop_capture_addr_failed");
+      if (config.stop_on_error) {
+        break;
+      }
+    }
+
+    if (config.count != 0 && iteration >= config.count) {
+      break;
+    }
+    if (!sleep_ms_for_loop(config.interval_ms)) {
+      snprintf(response,
+               response_size,
+               "ERR LOOP_CAPTURE_ADDR INTERRUPTED ok=%u fail=%u last_iteration=%u addr=0x%08x\r\n",
+               ok_count,
+               fail_count,
+               last_iteration,
+               config.image_addr);
+      pa_pu_set_trace(false);
+      return;
+    }
+  }
+
+  pa_pu_set_trace(false);
+  snprintf(response,
+           response_size,
+           "%s LOOP_CAPTURE_ADDR ok=%u fail=%u last_iteration=%u addr=0x%08x last_int_vector=0x%08x wait_mask=0x%08x write_ddr=%u\r\n",
+           fail_count == 0 ? "OK" : "ERR",
+           ok_count,
+           fail_count,
+           last_iteration,
+           config.image_addr,
+           last_int_vector,
+           config.wait_mask,
+           config.write_ddr ? 1u : 0u);
+}
+
 int command_handle(command_context_t* ctx, const char* command, char* response, size_t response_size) {
   if (ctx == NULL || command == NULL || response == NULL || response_size == 0) {
     return -1;
@@ -1066,6 +1506,12 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
       snprintf(response, response_size, "ERR START_STATIC_IDLE_CAPTURE BUSY state=%s\r\n", work_mode_state_name(status.state));
       return 0;
     }
+    if (ret != 0 && status.state == WORK_STATE_STOPPED) {
+      snprintf(response,
+               response_size,
+               "ERR START_STATIC_IDLE_CAPTURE STOPPED hint=START_WORK\r\n");
+      return 0;
+    }
     if (ret != 0) {
       snprintf(response,
                response_size,
@@ -1113,20 +1559,21 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
 
     for (uint32_t iteration = 1; loop_config.count == 0 || iteration <= loop_config.count; ++iteration) {
       last_iteration = iteration;
-      log_info("static idle loop capture begin iteration=%u count=%u interval_ms=%u",
-               iteration,
-               loop_config.count,
-               loop_config.interval_ms);
 
       int ret = work_mode_start_static_idle_capture(ctx->work_mode, &status);
       if (ret == 0) {
         ++ok_count;
-        log_info("static idle loop capture ok iteration=%u capture_id=%u offset_addr=0x%08x output_addr=0x%08x int_vector=0x%08x",
-                 iteration,
-                 status.capture_id,
-                 status.last_bright_addr,
-                 status.last_dark_addr,
-                 status.last_int_vector);
+        if (iteration == 1 || (iteration % 50u) == 0) {
+          log_info("static idle loop progress iteration=%u count=%u ok=%u fail=%u capture_id=%u offset_addr=0x%08x output_addr=0x%08x int_vector=0x%08x",
+                   iteration,
+                   loop_config.count,
+                   ok_count,
+                   fail_count,
+                   status.capture_id,
+                   status.last_bright_addr,
+                   status.last_dark_addr,
+                   status.last_int_vector);
+        }
       } else {
         ++fail_count;
         log_error("static idle loop capture failed iteration=%u ret=%d phase=%s int_vector=0x%08x wait_mask=0x%08x",
@@ -1163,6 +1610,106 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
              last_iteration,
              status.capture_id,
              status.last_dark_addr);
+    return 0;
+  }
+
+  if (cmd_has_name(command, "LOOP_CAPTURE_ADDR") || cmd_has_name(command, "STRESS_CAPTURE_ADDR")) {
+    /*
+     * 固定地址裸压测命令：
+     * 不走 Static Idle 亮/暗场业务流程，只重复执行“配置三模块 -> 同时启动 -> 等待中断”。
+     */
+    handle_loop_capture_addr(ctx, command, response, response_size);
+    return 0;
+  }
+
+  if (cmd_has_name(command, "CAL_GAIN_BEGIN")) {
+    cal_gain_begin_args_t args;
+    if (!parse_cal_gain_begin_args(cmd_args(command), &args)) {
+      snprintf(response, response_size, "ERR CAL_GAIN_BEGIN ARG\r\n");
+      return 0;
+    }
+
+    if (calibration_gain_begin(args.levels, args.level_count, args.frames, args.threshold) == 0) {
+      snprintf(response,
+               response_size,
+               "OK CAL_GAIN_BEGIN levels=%u frames=%u threshold=%.3f\r\n",
+               args.level_count,
+               args.frames,
+               args.threshold);
+    } else {
+      snprintf(response, response_size, "ERR CAL_GAIN_BEGIN\r\n");
+    }
+    return 0;
+  }
+
+  if (cmd_has_name(command, "CAL_GAIN_CAPTURE")) {
+    uint32_t level = 0;
+    const char* args = cmd_args(command);
+    if (strncasecmp(args, "level=", 6) == 0) {
+      args += 6;
+    }
+    if (!parse_u32_value(args, &level)) {
+      snprintf(response, response_size, "ERR CAL_GAIN_CAPTURE ARG\r\n");
+      return 0;
+    }
+
+    /*
+     * gain 校准是独占硬件动作，开始采集前停止 Static Idle 工作线程，
+     * 避免空闲自清空或正式采图流程改写 GIC/IMG_WR/IMG_CORR 寄存器。
+     */
+    work_mode_stop(ctx->work_mode);
+    if (calibration_gain_capture_level(ctx->fpga_mem, level) == 0) {
+      snprintf(response, response_size, "OK CAL_GAIN_CAPTURE level=%u\r\n", level);
+    } else {
+      snprintf(response, response_size, "ERR CAL_GAIN_CAPTURE level=%u\r\n", level);
+    }
+    return 0;
+  }
+
+  if (cmd_is(command, "CAL_GAIN_BUILD")) {
+    work_mode_stop(ctx->work_mode);
+    if (calibration_gain_build(ctx->fpga_mem) == 0) {
+      pa_pu_corr_config_t config = default_corr_config(ctx->fpga_mem);
+      pa_pu_configure_correction(&config);
+      snprintf(response, response_size, "OK CAL_GAIN_BUILD\r\n");
+    } else {
+      snprintf(response, response_size, "ERR CAL_GAIN_BUILD\r\n");
+    }
+    return 0;
+  }
+
+  if (cmd_is(command, "CAL_GAIN_CANCEL")) {
+    calibration_gain_cancel();
+    snprintf(response, response_size, "OK CAL_GAIN_CANCEL\r\n");
+    return 0;
+  }
+
+  if (cmd_is(command, "CAL_GAIN_STATUS")) {
+    cal_gain_status_t status;
+    calibration_gain_get_status(&status);
+    int written = snprintf(response,
+                           response_size,
+                           "OK CAL_GAIN_STATUS active=%u levels=%u ready=%u frames=%u threshold=%.3f bad_pixels=%u",
+                           status.active ? 1u : 0u,
+                           status.level_count,
+                           status.levels_ready,
+                           status.frames_per_level,
+                           status.defect_threshold,
+                           status.bad_pixel_count);
+    for (uint32_t i = 0; i < status.level_count && written > 0 && (size_t)written < response_size; ++i) {
+      written += snprintf(response + written,
+                          response_size - (size_t)written,
+                          " level%u=%u:%u:%u",
+                          i,
+                          status.levels[i].level,
+                          status.levels[i].ready ? 1u : 0u,
+                          status.levels[i].median);
+    }
+    if (written > 0 && (size_t)written < response_size) {
+      snprintf(response + written, response_size - (size_t)written, "\r\n");
+    } else {
+      response[response_size - 1u] = '\0';
+    }
     return 0;
   }
 

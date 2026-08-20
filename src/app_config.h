@@ -55,17 +55,17 @@
 
 #ifndef FPGA_IMAGE_PTR
 /* /dev/uio2 实际输出图 DDR 池物理起始地址，写 IMG_WR_STR_ADDR 时使用。 */
-#define FPGA_IMAGE_PTR 0x21000000u
+#define FPGA_IMAGE_PTR 0x26A00000u
 #endif
 
 #ifndef FPGA_OFFSET_PTR
 /* /dev/uio0 offset/暗场模板物理起始地址。 */
-#define FPGA_OFFSET_PTR 0x16000000u
+#define FPGA_OFFSET_PTR 0x1EA00000u
 #endif
 
 #ifndef FPGA_GAIN_PTR
 /* /dev/uio1 gain/亮场模板物理起始地址。 */
-#define FPGA_GAIN_PTR 0x1A000000u
+#define FPGA_GAIN_PTR 0x22A00000u
 #endif
 
 #ifndef FPGA_MEM_MAP_SIZE
@@ -86,8 +86,11 @@
 #endif
 
 #ifndef FPGA_IMAGE_UIO_SIZE
-/* /dev/uio2 实际输出图 DDR 池映射大小。 */
-#define FPGA_IMAGE_UIO_SIZE 0x1F000000u
+/*
+ * /dev/uio2 实际输出图 DDR 池映射大小。
+ * 当前从 0x26A00000 到 1GB 顶部 0x40000000，共 0x19600000，只能完整放 9 张图。
+ */
+#define FPGA_IMAGE_UIO_SIZE 0x19600000u
 #endif
 
 #ifndef FPGA_OFFSET_UIO_SIZE
@@ -116,8 +119,8 @@
 #endif
 
 #ifndef DDR_IMAGE_POOL_FRAME_COUNT
-/* Static Idle 输出图环形池最大帧数；0 表示按 DDR_IMAGE_POOL_UIO_SIZE 自动使用全部可用帧。 */
-#define DDR_IMAGE_POOL_FRAME_COUNT 0u
+/* Static Idle 输出图环形池最大帧数；当前 uio2 空间只能完整放 9 张图。 */
+#define DDR_IMAGE_POOL_FRAME_COUNT 9u
 #endif
 
 #ifndef STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU
@@ -138,15 +141,6 @@
 #define GAIN_TEMPLATE_REPEAT_COUNT 1u
 #endif
 
-#ifndef CORR_DEFAULT_PKG_NUM
-/*
- * CONFIG_CORR 不带参数时使用的默认图像校正分包数量。
- * 写入 IMG_PKG_NUM 寄存器，按 16bit 图像字节数除以 1KB 计算：
- *   img_pkg_num = 行 * 列 * 2 / 1024
- */
-#define CORR_DEFAULT_PKG_NUM ((CORR_DEFAULT_ROW_NUM * CORR_DEFAULT_COL_NUM * 2u) / 1024u)
-#endif
-
 #ifndef CORR_DEFAULT_ROW_NUM
 /* CONFIG_CORR 默认校正行数，写入 IMG_ROW_NUM。 */
 #define CORR_DEFAULT_ROW_NUM 7680u
@@ -155,6 +149,15 @@
 #ifndef CORR_DEFAULT_COL_NUM
 /* CONFIG_CORR 默认校正列数，写入 IMG_COL_NUM。 */
 #define CORR_DEFAULT_COL_NUM 3072u
+#endif
+
+#ifndef CORR_DEFAULT_PKG_NUM
+/*
+ * CONFIG_CORR 不带参数时使用的默认图像校正分包数量。
+ * 写入 IMG_PKG_NUM 寄存器，按 16bit 图像字节数除以 1KB 计算：
+ *   img_pkg_num = 行 * 列 * 2 / 1024
+ */
+#define CORR_DEFAULT_PKG_NUM ((CORR_DEFAULT_ROW_NUM * CORR_DEFAULT_COL_NUM * 2u) / 1024u)
 #endif
 
 #ifndef CORR_DEFAULT_OFFSET_EN
@@ -193,8 +196,8 @@
 #endif
 
 #ifndef PA_PU_IRQ_TIMEOUT_MS
-/* start 类命令等待 INT_VECTOR 对应完成 bit 的默认超时时间。 */
-#define PA_PU_IRQ_TIMEOUT_MS 5000u
+/* start 类命令等待 INT_VECTOR 对应完成 bit 的默认超时时间，单位 ms。 */
+#define PA_PU_IRQ_TIMEOUT_MS 1000u
 #endif
 
 #ifndef PA_PU_IRQ_POLL_INTERVAL_US
@@ -219,7 +222,7 @@
 
 #ifndef STATIC_IDLE_DARK_WINDOW_MS
 /* Static Idle 亮场采图完成后的暗场窗口时间，单位 ms。 */
-#define STATIC_IDLE_DARK_WINDOW_MS 50u
+#define STATIC_IDLE_DARK_WINDOW_MS 300u
 #endif
 
 #ifndef TEMPLATE_OFFSET_FILE

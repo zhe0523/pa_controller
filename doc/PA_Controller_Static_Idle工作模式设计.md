@@ -329,7 +329,7 @@ typedef struct {
 
 ```text
 STATIC_IDLE_CLEAN_INTERVAL_MS  默认 50 ms
-STATIC_IDLE_EXPOSURE_MS        默认 50 ms
+STATIC_IDLE_EXPOSURE_MS        默认 100 ms
 STATIC_IDLE_DARK_WINDOW_MS     默认 50 ms
 ```
 

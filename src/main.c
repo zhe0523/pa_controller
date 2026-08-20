@@ -191,6 +191,7 @@ int main(int argc, char* argv[]) {
     pa_pu_close();
     fpga_mem_close(&fpga_mem);
     log_info("pa_controller stop");
+    log_shutdown();
     return 0;
   }
 
@@ -232,5 +233,6 @@ int main(int argc, char* argv[]) {
   pa_pu_close();
   fpga_mem_close(&fpga_mem);
   log_info("pa_controller stop");
+  log_shutdown();
   return 0;
 }

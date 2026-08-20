@@ -18,7 +18,7 @@ APP_VERSION ?= 0.1.0
 BUILD_TIME ?= $(shell date '+%Y-%m-%d %H:%M:%S %z')
 
 # 开发板部署/运行参数，deploy-board 和 run-board 目标使用。
-BOARD_HOST ?= 192.168.3.17
+BOARD_HOST ?= 192.168.3.54
 BOARD_USER ?= root
 BOARD_PASS ?= root
 BOARD_DIR ?= /root
@@ -50,10 +50,16 @@ FPGA_GAIN_UIO_DEVICE ?= /dev/uio1
 FPGA_IMAGE_UIO_DEVICE ?= /dev/uio2
 
 # 三块共享 DDR 的物理地址和 UIO 窗口大小。
-FPGA_IMAGE_PTR ?= 0x21000000
-FPGA_OFFSET_PTR ?= 0x16000000
-FPGA_GAIN_PTR ?= 0x1A000000
-FPGA_IMAGE_UIO_SIZE ?= 0x1F000000
+# 当前布局：
+#   uio0/offset：0x1EA00000，64MB
+#   uio1/gain  ：0x22A00000，64MB
+#   uio2/image ：0x26A00000 ~ 0x40000000，0x19600000
+# 注意：当前单帧步进为 0x02D00000，因此 0x19600000 只能完整容纳 9 张图。
+# 若必须保存 10 张图，uio2 至少需要 0x1C200000，当前 1GB 地址空间放不下。
+FPGA_IMAGE_PTR ?= 0x26A00000
+FPGA_OFFSET_PTR ?= 0x1EA00000
+FPGA_GAIN_PTR ?= 0x22A00000
+FPGA_IMAGE_UIO_SIZE ?= 0x19600000
 FPGA_OFFSET_UIO_SIZE ?= 0x04000000
 FPGA_GAIN_UIO_SIZE ?= 0x04000000
 
@@ -61,11 +67,11 @@ FPGA_GAIN_UIO_SIZE ?= 0x04000000
 DDR_IMAGE_POOL_BASE ?= $(FPGA_IMAGE_PTR)
 DDR_IMAGE_POOL_UIO_SIZE ?= $(FPGA_IMAGE_UIO_SIZE)
 DDR_IMAGE_FRAME_ALIGN ?= 4096
-# Static Idle 输出图环形池最大帧数。0 表示按 DDR_IMAGE_POOL_UIO_SIZE 自动使用全部可用帧。
-DDR_IMAGE_POOL_FRAME_COUNT ?= 2
+# Static Idle 输出图环形池最大帧数。当前 uio2 空间只能完整放 9 张图。
+DDR_IMAGE_POOL_FRAME_COUNT ?= 9
 # Static Idle 第一帧 light 是否先写 uio2 后由 ARM 复制到 offset 模板区。
 # 0 表示 FPGA 直接写 uio0；1 用于定位 FPGA 直写 uio0 是否有风险。
-STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU ?= 1
+STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU ?= 0
 
 # UIO 打开失败时是否允许回退 /dev/mem，默认关闭。
 FPGA_MEM_USE_DEVMEM_FALLBACK ?= 0
@@ -87,14 +93,15 @@ CORR_DEFAULT_GAIN_CLIPPING_VALUE ?= 55000
 CORR_DEFAULT_DEFECT_EN ?= 0
 
 # START_GIC/START_ROIC/START_CORR/SEND_SINGLE 等命令等待中断的参数。
-PA_PU_IRQ_TIMEOUT_MS ?= 5000
+# FPGA 正常完成很快，默认 1s 用于尽早暴露异常；调试时可通过 make PA_PU_IRQ_TIMEOUT_MS=500 覆盖。
+PA_PU_IRQ_TIMEOUT_MS ?= 1000
 PA_PU_IRQ_POLL_INTERVAL_US ?= 1000
 PA_IRQ_DEVICE ?= /dev/pa_irq
 
 # Static Idle 工作模式默认时间窗口，单位 ms。
 STATIC_IDLE_CLEAN_INTERVAL_MS ?= 50
 STATIC_IDLE_EXPOSURE_MS ?= 50
-STATIC_IDLE_DARK_WINDOW_MS ?= 50
+STATIC_IDLE_DARK_WINDOW_MS ?= 300
 
 # CONFIG_GIC 不带参数时使用的 GIC 时序和行范围默认配置。
 GIC_DEFAULT_REQ_CODE ?= 0
@@ -110,7 +117,7 @@ GIC_DEFAULT_BINNING ?= 0
 ROIC_DEFAULT_START_COL ?= 0
 ROIC_DEFAULT_END_COL ?= $(shell expr $(IMAGE_WIDTH) - 1)
 
-ROIC_DEFAULT_BINNING ?= 1
+ROIC_DEFAULT_BINNING ?= 0
 
 # CONFIG_ROIC 下发的 ROIC 芯片寄存器默认值，当前为占位值，现场按 panel 参数覆盖。
 ROIC_DEFAULT_REG_00 ?= 0
@@ -216,6 +223,7 @@ SRCS = src/main.c \
        src/work_mode.c \
        src/rs422.c \
        src/template_builder.c \
+       src/calibration_builder.c \
        src/command_handler.c
 
 OBJS = $(SRCS:%.c=$(BUILD_DIR)/%.o)

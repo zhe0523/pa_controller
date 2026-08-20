@@ -171,16 +171,13 @@ static bool alloc_frame_locked(work_mode_context_t* wm, const char* phase, uint3
     *addr_out = addr;
   }
 
-  log_info("ddr image pool alloc capture_id=%u phase=%s addr=0x%08x offset=0x%lx stride=0x%lx size=0x%lx frames=%lu first_output_offset=0x%lx wrapped=%u",
-           wm->status.capture_id,
-           phase,
-           addr,
-           (unsigned long)offset,
-           (unsigned long)wm->status.ddr_frame_stride,
-           (unsigned long)pool_limit,
-           (unsigned long)wm->status.ddr_frame_count,
-           (unsigned long)first_output_offset,
-           wrapped ? 1u : 0u);
+  if (wrapped) {
+    log_info("ddr image pool wrapped capture_id=%u phase=%s addr=0x%08x frames=%lu",
+             wm->status.capture_id,
+             phase,
+             addr,
+             (unsigned long)wm->status.ddr_frame_count);
+  }
   return true;
 }
 
@@ -267,31 +264,11 @@ static int run_capture_phase(work_mode_context_t* wm,
    * 3. 配置校正模块；
    * 4. 清理上一轮中断后连续写三个 STR 寄存器。
    */
-  log_info("static capture phase start phase=%s addr=0x%08x offset_en=%u gain_en=%u defect_en=%u",
-           phase_name,
-           image_addr,
-           corr->offset_enable ? 1u : 0u,
-           corr->gain_enable ? 1u : 0u,
-           corr->defect_enable ? 1u : 0u);
-  log_info("static capture phase step phase=%s step=config_gic begin", phase_name);
   pa_pu_configure_gic(gic);
-  log_info("static capture phase step phase=%s step=config_gic done", phase_name);
-  log_info("static capture phase step phase=%s step=config_image_write begin addr=0x%08x", phase_name, image_addr);
   pa_pu_configure_image_write(image_addr);
-  log_info("static capture phase step phase=%s step=config_image_write done", phase_name);
-  log_info("static capture phase step phase=%s step=config_correction begin offset_addr=0x%08x gain_addr=0x%08x",
-           phase_name,
-           corr->offset_template_addr,
-           corr->gain_template_addr);
   pa_pu_configure_correction(corr);
-  log_info("static capture phase step phase=%s step=config_correction done", phase_name);
-  log_info("static capture phase step phase=%s step=prepare_irq begin", phase_name);
   pa_pu_prepare_irq_wait();
-  log_info("static capture phase step phase=%s step=prepare_irq done", phase_name);
-  log_info("static capture phase step phase=%s step=start_triplet begin", phase_name);
   pa_pu_start_capture_triplet();
-  log_info("static capture phase step phase=%s step=start_triplet done", phase_name);
-  log_info("static capture phase wait phase=%s wait_mask=0x%08x", phase_name, STATIC_CAPTURE_WAIT_MASK);
 
   int ret = pa_pu_wait_int_vector_all(STATIC_CAPTURE_WAIT_MASK, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
   pthread_mutex_lock(&wm->mutex);
@@ -320,9 +297,6 @@ static int run_capture_phase(work_mode_context_t* wm,
   }
   pthread_mutex_unlock(&wm->mutex);
 
-  if (ret > 0) {
-    log_info("static capture phase done phase=%s addr=0x%08x int_vector=0x%08x", phase_name, image_addr, int_vector);
-  }
   return ret > 0 ? 0 : -1;
 }
 
@@ -376,11 +350,6 @@ static int run_static_capture(work_mode_context_t* wm, const static_idle_config_
     pa_pu_dump_all_registers("ddr_alloc_failed");
     return -1;
   }
-  log_info("static offset light fixed addr=0x%08x offset_addr=0x%08x output_addr=0x%08x via_cpu=%u",
-           bright_addr,
-           wm->fpga_mem->offset_phys_base,
-           dark_addr,
-           STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU ? 1u : 0u);
   wm->status.last_bright_addr = bright_addr;
   wm->status.last_dark_addr = dark_addr;
   set_state_locked(wm, WORK_STATE_EXPOSURE_WINDOW, WORK_PHASE_EXPOSURE_WINDOW);
@@ -390,6 +359,23 @@ static int run_static_capture(work_mode_context_t* wm, const static_idle_config_
            wm->status.capture_id,
            bright_addr,
            dark_addr);
+  log_info("static capture config capture_id=%u bright_dout=%u bright_line_time=%u bright_rows=%u-%u bright_binning=%u dark_dout=%u dark_line_time=%u dark_rows=%u-%u dark_binning=%u dark_corr=%u/%u/%u offset_template=0x%08x gain_template=0x%08x",
+           wm->status.capture_id,
+           config->bright_gic.dout_enable ? 1u : 0u,
+           config->bright_gic.line_time_ns,
+           config->bright_gic.start_row,
+           config->bright_gic.end_row,
+           config->bright_gic.binning_mode,
+           config->dark_gic.dout_enable ? 1u : 0u,
+           config->dark_gic.line_time_ns,
+           config->dark_gic.start_row,
+           config->dark_gic.end_row,
+           config->dark_gic.binning_mode,
+           config->dark_corr.offset_enable ? 1u : 0u,
+           config->dark_corr.gain_enable ? 1u : 0u,
+           config->dark_corr.defect_enable ? 1u : 0u,
+           config->dark_corr.offset_template_addr,
+           config->dark_corr.gain_template_addr);
 
   /* 曝光窗口结束后先采未校正 light 写 offset 模板，再进入窗口采实际输出图。 */
   sleep_ms_interruptible(config->exposure_window_ms);
@@ -406,11 +392,6 @@ static int run_static_capture(work_mode_context_t* wm, const static_idle_config_
     return -1;
   }
 #endif
-  log_info("static bright phase done, enter dark window capture_id=%u dark_window_ms=%u output_addr=0x%08x",
-           wm->status.capture_id,
-           config->dark_window_ms,
-           dark_addr);
-
   pthread_mutex_lock(&wm->mutex);
   set_state_locked(wm, WORK_STATE_DARK_WINDOW, WORK_PHASE_DARK_WINDOW);
   pthread_mutex_unlock(&wm->mutex);

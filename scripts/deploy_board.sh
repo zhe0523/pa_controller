@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-BOARD_HOST="${BOARD_HOST:-192.168.3.17}"
+BOARD_HOST="${BOARD_HOST:-192.168.3.54}"
 BOARD_USER="${BOARD_USER:-root}"
 BOARD_PASS="${BOARD_PASS:-root}"
 BOARD_DIR="${BOARD_DIR:-/root}"
