@@ -5,6 +5,8 @@
  *
  * 来源：
  * - fpga/pa_pu_com_definition.xlsx
+ * - fpga/pa_pu_com_definition_add.xlsx
+ * - fpga/dynamic.txt
  * - fpga/pa_pu_com.v
  *
  * RTL 中使用 upm_pu_awaddr[15:0] / upm_pu_araddr[15:0] 与这些地址比较，
@@ -57,7 +59,7 @@ enum {
   PA_PU_GIC_STR_ROW_NUM_REG = 0x0238,
   /* 0x0240, pu->pa, 16bit：GIC 结束行号，用于 ROI/行范围配置。 */
   PA_PU_GIC_END_ROW_NUM_REG = 0x0240,
-  /* 0x0248, pu->pa, 8bit：GIC binning 模式，1=1x1，2=2x2，4=4x4，其它按 1x1。 */
+  /* 0x0248, pu->pa, 8bit：GIC binning 模式，新表定义 0=1x1，1=2x2，...，7=8x8，其它按 1x1。 */
   PA_PU_GIC_BINNING_MODE_REG = 0x0248,
   /* 0x03a0, pa->pu, 1bit：GIC 模块状态，高电平表示 busy。 */
   PA_PU_GIC_STATE_REG = 0x03a0,
@@ -117,7 +119,7 @@ enum {
   PA_PU_ROIC_STR_COL_NUM_REG = 0x04a8,
   /* 0x04b0, pu->pa, 16bit：ROIC 结束列号，用于列方向 ROI。 */
   PA_PU_ROIC_END_COL_NUM_REG = 0x04b0,
-  /* 0x04b8, pu->pa, 8bit：ROIC binning 模式，1=1x1，2=2x2，4=4x4，其它按 1x1。 */
+  /* 0x04b8, pu->pa, 8bit：ROIC binning 模式，新表定义 0=1x1，1=2x2，...，7=8x8，其它按 1x1。 */
   PA_PU_ROIC_BINNING_MODE_REG = 0x04b8,
   /* 0x05a0, pa->pu, 1bit：ROIC 模块状态，高电平表示 busy。 */
   PA_PU_ROIC_STATE_REG = 0x05a0,
@@ -139,6 +141,8 @@ enum {
   PA_PU_IMG_WR_STATE_REG = 0x07a0,
   /* 0x07a8, pa->pu, 1bit：图像写出完成标志，高有效。 */
   PA_PU_IMG_WR_END_REG = 0x07a8,
+  /* 0x07b0, pa->pu, 32bit：dynamic 模式本轮最终输出图 DDR 地址。 */
+  PA_PU_IMG_WR_FINAL_IMG_ADDR_REG = 0x07b0,
   /* 0x07c0, pa->pu, 8bit：图像写出调试/保留状态。 */
   PA_PU_IMG_WR_DFX_REG = 0x07c0,
   /* 0x07c8, pu->pa, 32bit：图像写出调试输入寄存器，仅调试使用。 */
@@ -169,6 +173,8 @@ enum {
   PA_PU_IMG_CORR_GAIN_CLIPPING_VALUE_REG = 0x0848,
   /* 0x0850, pu->pa, 1bit：坏点校正使能，高有效。 */
   PA_PU_IMG_CORR_DEFECT_EN_REG = 0x0850,
+  /* 0x0858, pu->pa, 1bit：offset 校正模式，0=静态 offset，1=动态 offset。 */
+  PA_PU_IMG_OFFSET_CORR_MODE_REG = 0x0858,
   /* 0x09a0, pa->pu, 1bit：图像校正模块状态，高电平表示 busy。 */
   PA_PU_IMG_CORR_STATE_REG = 0x09a0,
   /* 0x09a8, pa->pu, 1bit：图像校正完成标志，高有效。 */
@@ -179,11 +185,55 @@ enum {
   PA_PU_IMG_CORR_DEBUG_IN_REG = 0x09c8,
   /* 0x09d0, pa->pu, 32bit：图像校正调试输出寄存器，仅调试使用。 */
   PA_PU_IMG_CORR_DEBUG_OUT_REG = 0x09d0,
+
+  /* dynamic_ctrl：动态工作模式步骤表、图像环形地址范围和状态寄存器。 */
+  /* 0x0a00, pu->pa, 1bit：写 1 启动动态流程，高有效，RTL 自动清零。 */
+  PA_PU_DYNC_STR_REG = 0x0a00,
+  /* 0x0a08, pu->pa, 1bit：写 1 停止动态流程，主要用于 xao scan 等等待同步输入的场景。 */
+  PA_PU_DYNC_STOP_REG = 0x0a08,
+  /* 0x0a10, pu->pa, 32bit：动态循环次数，0 表示直到收到 dynamic stop。 */
+  PA_PU_DYNC_CYCLE_NUM_REG = 0x0a10,
+  /* 0x0a18, pu->pa, 32bit：动态模式图像环形缓冲起始地址。 */
+  PA_PU_DYNC_IMG_STR_ADDR_REG = 0x0a18,
+  /* 0x0a20, pu->pa, 32bit：动态模式图像环形缓冲结束地址。 */
+  PA_PU_DYNC_IMG_END_ADDR_REG = 0x0a20,
+  /* 0x0a28~0x0ac0, pu->pa：10 个动态步骤配置，每步 high/low 两个 32bit 配置字。 */
+  PA_PU_DYNC_STEP_0_CFG_H_REG = 0x0a28,
+  PA_PU_DYNC_STEP_0_CFG_L_REG = 0x0a30,
+  PA_PU_DYNC_STEP_1_CFG_H_REG = 0x0a38,
+  PA_PU_DYNC_STEP_1_CFG_L_REG = 0x0a40,
+  PA_PU_DYNC_STEP_2_CFG_H_REG = 0x0a48,
+  PA_PU_DYNC_STEP_2_CFG_L_REG = 0x0a50,
+  PA_PU_DYNC_STEP_3_CFG_H_REG = 0x0a58,
+  PA_PU_DYNC_STEP_3_CFG_L_REG = 0x0a60,
+  PA_PU_DYNC_STEP_4_CFG_H_REG = 0x0a68,
+  PA_PU_DYNC_STEP_4_CFG_L_REG = 0x0a70,
+  PA_PU_DYNC_STEP_5_CFG_H_REG = 0x0a78,
+  PA_PU_DYNC_STEP_5_CFG_L_REG = 0x0a80,
+  PA_PU_DYNC_STEP_6_CFG_H_REG = 0x0a88,
+  PA_PU_DYNC_STEP_6_CFG_L_REG = 0x0a90,
+  PA_PU_DYNC_STEP_7_CFG_H_REG = 0x0a98,
+  PA_PU_DYNC_STEP_7_CFG_L_REG = 0x0aa0,
+  PA_PU_DYNC_STEP_8_CFG_H_REG = 0x0aa8,
+  PA_PU_DYNC_STEP_8_CFG_L_REG = 0x0ab0,
+  PA_PU_DYNC_STEP_9_CFG_H_REG = 0x0ab8,
+  PA_PU_DYNC_STEP_9_CFG_L_REG = 0x0ac0,
+  /*
+   * 注意：pa_pu_com_definition_add.xlsx 与 dynamic.txt 对 state/end 地址描述相反。
+   * 这里按 dynamic.txt/RTL localparam 风格记录：END=0x0ba0，STATE=0x0ba8。
+   */
+  PA_PU_DYNC_END_REG = 0x0ba0,
+  PA_PU_DYNC_STATE_REG = 0x0ba8,
+  /* 0x0bc0, pu->pa, 32bit：动态模块调试输入寄存器。 */
+  PA_PU_DYNC_DEBUG_IN_REG = 0x0bc0,
+  /* 0x0bc8, pa->pu, 32bit：动态模块调试输出寄存器。 */
+  PA_PU_DYNC_DEBUG_OUT_REG = 0x0bc8,
 };
 
 /*
  * int_vector bit 定义，按 pa_pu_com_definition.xlsx 协议表执行：
- * bit31~5 reserved
+ * bit31~6 reserved
+ * bit5 dynamic interrupt
  * bit4 image correct interrupt
  * bit3 image write interrupt
  * bit2 roic interrupt
@@ -204,6 +254,8 @@ enum {
   PA_PU_IRQ_IMG_WR_END = 1u << 3,
   /* bit4：图像校正完成中断。 */
   PA_PU_IRQ_IMG_CORR_END = 1u << 4,
+  /* bit5：动态模块完成中断。 */
+  PA_PU_IRQ_DYNC_END = 1u << 5,
 };
 
 enum {
@@ -222,11 +274,11 @@ enum {
 
 enum {
   /* 不合并像素，1x1 输出。 */
-  PA_PU_BINNING_1X1 = 1u,
+  PA_PU_BINNING_1X1 = 0u,
   /* 2x2 binning。 */
-  PA_PU_BINNING_2X2 = 2u,
+  PA_PU_BINNING_2X2 = 1u,
   /* 4x4 binning。 */
-  PA_PU_BINNING_4X4 = 4u,
+  PA_PU_BINNING_4X4 = 3u,
 };
 
 /* IMG_CORR 写地址按当前协议表直接写入；保留 WR_* 名称，避免上层调用点反复改动。 */

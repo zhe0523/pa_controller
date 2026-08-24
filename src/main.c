@@ -70,6 +70,31 @@ static const char* select_rs422_device(const char* requested) {
   return requested;
 }
 
+static const char* default_work_mode_name(uint32_t mode) {
+  switch (mode) {
+    case WORK_MODE_IDLE:
+      return "Idle";
+    case WORK_MODE_AED:
+      return "AED";
+    case WORK_MODE_SYNC_OUT:
+      return "SyncOut";
+    case WORK_MODE_SYNC_IN:
+      return "SyncIn";
+    case WORK_MODE_PREP:
+      return "Prep";
+    case WORK_MODE_CONTINUOUS:
+      return "Continuous";
+    case WORK_MODE_INNER:
+      return "Inner";
+    case WORK_MODE_FREE_SYNC:
+      return "FreeSync";
+    case WORK_MODE_DDR:
+      return "DDR";
+    default:
+      return "Unknown";
+  }
+}
+
 int main(int argc, char* argv[]) {
   /* 支持 Ctrl+C / kill 优雅退出，避免 mmap 和串口 fd 泄漏。 */
   install_signal_handlers();
@@ -96,6 +121,10 @@ int main(int argc, char* argv[]) {
   }
 
   log_info("pa_controller start app_version=%s build_time=%s", APP_VERSION, APP_BUILD_TIME);
+  log_info("work mode default auto_start=%u default_mode=%u/%s",
+           (unsigned)WORK_MODE_AUTO_START,
+           (unsigned)WORK_MODE_DEFAULT_MODE,
+           default_work_mode_name(WORK_MODE_DEFAULT_MODE));
   log_info("image=%ux%u active=%ux%u offset=(%u,%u)",
            DEVICE_WIDTH, DEVICE_HEIGHT, IMAGE_WIDTH, IMAGE_HEIGHT, COL_OFFSET, ROW_OFFSET);
   log_info("fiber image header=%u bytes", DETECTOR_IMAGE_HEADER_BYTES);
@@ -126,6 +155,7 @@ int main(int argc, char* argv[]) {
       .offset_enable = CORR_DEFAULT_OFFSET_EN != 0,
       .offset_template_addr = fpga_mem.offset_phys_base,
       .offset_adder_value = CORR_DEFAULT_OFFSET_ADDER_VALUE,
+      .offset_corr_mode = CORR_DEFAULT_OFFSET_CORR_MODE,
       .gain_enable = CORR_DEFAULT_GAIN_EN != 0,
       .gain_template_addr = fpga_mem.gain_phys_base,
       .gain_clipping_value = CORR_DEFAULT_GAIN_CLIPPING_VALUE,
@@ -137,8 +167,8 @@ int main(int argc, char* argv[]) {
   }
 
   /*
-   * Static Idle 工作线程由 ARM 统一编排 FPGA 时序：
-   * 空闲自清空、上位机触发亮/暗场采图、DDR 写图地址选择都在这里完成。
+   * 工作模式上下文始终初始化，方便通过 START_WORK/CONFIG_STATIC_IDLE 手动进入。
+   * 是否开机自动启动由 WORK_MODE_AUTO_START/WORK_MODE_DEFAULT_MODE 控制。
    */
   work_mode_context_t work_mode;
   if (work_mode_init(&work_mode, &fpga_mem) != 0) {
@@ -146,11 +176,23 @@ int main(int argc, char* argv[]) {
     fpga_mem_close(&fpga_mem);
     return 1;
   }
-  if (work_mode_start(&work_mode) != 0) {
-    log_error("work mode thread start failed");
-    pa_pu_close();
-    fpga_mem_close(&fpga_mem);
-    return 1;
+  if (WORK_MODE_AUTO_START != 0) {
+    if (WORK_MODE_DEFAULT_MODE != WORK_MODE_IDLE) {
+      log_error("default work mode not implemented mode=%u/%s",
+                (unsigned)WORK_MODE_DEFAULT_MODE,
+                default_work_mode_name(WORK_MODE_DEFAULT_MODE));
+      pa_pu_close();
+      fpga_mem_close(&fpga_mem);
+      return 1;
+    }
+    if (work_mode_start(&work_mode) != 0) {
+      log_error("work mode thread start failed");
+      pa_pu_close();
+      fpga_mem_close(&fpga_mem);
+      return 1;
+    }
+  } else {
+    log_info("work mode auto start disabled, use START_WORK to enter Static Idle");
   }
 
   command_context_t ctx = {

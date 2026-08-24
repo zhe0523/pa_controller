@@ -214,6 +214,7 @@ typedef struct {
   uint32_t count;
   uint32_t interval_ms;
   bool stop_on_error;
+  bool trace;
 } static_idle_loop_config_t;
 
 static pa_pu_gic_config_t default_gic_config(void);
@@ -243,6 +244,13 @@ typedef struct {
   float threshold;
 } cal_gain_begin_args_t;
 
+typedef struct {
+  /* dynamic 模块调试配置；默认使用当前 uio2 图像池作为环形输出范围。 */
+  pa_pu_dync_config_t config;
+  bool wait_done;
+  bool has_config_write;
+} dync_command_config_t;
+
 static bool parse_static_idle_loop_args(const char* args, static_idle_loop_config_t* config) {
   char buffer[256];
   if (config == NULL) {
@@ -252,6 +260,7 @@ static bool parse_static_idle_loop_args(const char* args, static_idle_loop_confi
   config->count = 0;
   config->interval_ms = 5000u;
   config->stop_on_error = true;
+  config->trace = false;
 
   if (args == NULL) {
     return true;
@@ -291,6 +300,8 @@ static bool parse_static_idle_loop_args(const char* args, static_idle_loop_confi
       config->interval_ms = value * 1000u;
     } else if (strcmp(token, "stop_on_error") == 0) {
       config->stop_on_error = value != 0;
+    } else if (strcmp(token, "trace") == 0 || strcmp(token, "verbose") == 0) {
+      config->trace = value != 0;
     } else {
       return false;
     }
@@ -383,6 +394,135 @@ static bool parse_float_value(const char* text, float* value) {
   }
 
   *value = (float)parsed;
+  return true;
+}
+
+static void default_dync_command_config(const fpga_mem_t* fpga_mem, dync_command_config_t* command_config) {
+  if (command_config == NULL) {
+    return;
+  }
+
+  memset(command_config, 0, sizeof(*command_config));
+  command_config->config.cycle_num = 1u;
+  if (fpga_mem != NULL) {
+    command_config->config.image_start_addr = fpga_mem->image_pool_phys_base;
+    if (fpga_mem->image_pool_map_size > 0u) {
+      command_config->config.image_end_addr =
+          fpga_mem->image_pool_phys_base + (uint32_t)fpga_mem->image_pool_map_size - 1u;
+    }
+  } else {
+    command_config->config.image_start_addr = FPGA_IMAGE_PTR;
+    command_config->config.image_end_addr = FPGA_IMAGE_PTR + FPGA_IMAGE_UIO_SIZE - 1u;
+  }
+}
+
+static bool parse_dync_step_token(const char* name, const char** suffix_out, unsigned* index_out) {
+  const char* text = name;
+  unsigned index = 0;
+
+  if (name == NULL || suffix_out == NULL || index_out == NULL) {
+    return false;
+  }
+
+  if (strncmp(text, "step", 4) == 0) {
+    text += 4;
+  } else if (strncmp(text, "dync_step_", 10) == 0) {
+    text += 10;
+  } else {
+    return false;
+  }
+
+  if (*text < '0' || *text > '9') {
+    return false;
+  }
+  index = (unsigned)(*text - '0');
+  ++text;
+  if (index >= PA_PU_DYNC_STEP_COUNT || *text != '_') {
+    return false;
+  }
+
+  *suffix_out = text + 1;
+  *index_out = index;
+  return true;
+}
+
+static bool parse_dync_config_args(const char* args, dync_command_config_t* command_config) {
+  char buffer[1024];
+  if (command_config == NULL) {
+    return false;
+  }
+  if (args == NULL) {
+    return true;
+  }
+  while (*args == ' ') {
+    ++args;
+  }
+  if (*args == '\0') {
+    return true;
+  }
+  if (strlen(args) >= sizeof(buffer)) {
+    return false;
+  }
+
+  strcpy(buffer, args);
+  char* token = strtok(buffer, " ");
+  while (token != NULL) {
+    char* equals = strchr(token, '=');
+    uint32_t value = 0;
+    if (equals == NULL) {
+      return false;
+    }
+
+    *equals = '\0';
+    if (!parse_u32_value(equals + 1, &value)) {
+      return false;
+    }
+
+    const char* step_suffix = NULL;
+    unsigned step_index = 0;
+    if (strcmp(token, "cycle") == 0 || strcmp(token, "cycle_num") == 0 || strcmp(token, "dync_cycle_num") == 0) {
+      command_config->config.cycle_num = value;
+      command_config->has_config_write = true;
+    } else if (strcmp(token, "img_start") == 0 ||
+               strcmp(token, "image_start") == 0 ||
+               strcmp(token, "dync_img_str_addr") == 0) {
+      command_config->config.image_start_addr = value;
+      command_config->has_config_write = true;
+    } else if (strcmp(token, "img_end") == 0 ||
+               strcmp(token, "image_end") == 0 ||
+               strcmp(token, "dync_img_end_addr") == 0) {
+      command_config->config.image_end_addr = value;
+      command_config->has_config_write = true;
+    } else if (strcmp(token, "wait") == 0 || strcmp(token, "wait_done") == 0) {
+      command_config->wait_done = value != 0;
+    } else if (parse_dync_step_token(token, &step_suffix, &step_index)) {
+      if (strcmp(step_suffix, "h") == 0 || strcmp(step_suffix, "cfg_h") == 0) {
+        command_config->config.step_cfg_h[step_index] = value;
+        command_config->has_config_write = true;
+      } else if (strcmp(step_suffix, "l") == 0 || strcmp(step_suffix, "cfg_l") == 0 || strcmp(step_suffix, "time") == 0) {
+        command_config->config.step_cfg_l[step_index] = value;
+        command_config->has_config_write = true;
+      } else if (strcmp(step_suffix, "req") == 0 || strcmp(step_suffix, "req_code") == 0) {
+        command_config->config.step_cfg_h[step_index] =
+            (command_config->config.step_cfg_h[step_index] & ~0xffu) | (value & 0xffu);
+        command_config->has_config_write = true;
+      } else if (strcmp(step_suffix, "en") == 0 || strcmp(step_suffix, "enable") == 0) {
+        if (value != 0) {
+          command_config->config.step_cfg_h[step_index] |= 0x80000000u;
+        } else {
+          command_config->config.step_cfg_h[step_index] &= ~0x80000000u;
+        }
+        command_config->has_config_write = true;
+      } else {
+        return false;
+      }
+    } else {
+      return false;
+    }
+
+    token = strtok(NULL, " ");
+  }
+
   return true;
 }
 
@@ -609,6 +749,8 @@ static const register_name_t k_register_names[] = {
   {"img_wr_str_addr", PA_PU_IMG_WR_STR_ADDR_REG},
   {"img_wr_state", PA_PU_IMG_WR_STATE_REG},
   {"img_wr_end", PA_PU_IMG_WR_END_REG},
+  {"img_wr_final_img_addr", PA_PU_IMG_WR_FINAL_IMG_ADDR_REG},
+  {"final_img_addr", PA_PU_IMG_WR_FINAL_IMG_ADDR_REG},
   {"img_wr_dfx", PA_PU_IMG_WR_DFX_REG},
   {"img_wr_debug_in", PA_PU_IMG_WR_DEBUG_IN_REG},
   {"img_wr_debug_out", PA_PU_IMG_WR_DEBUG_OUT_REG},
@@ -623,11 +765,43 @@ static const register_name_t k_register_names[] = {
   {"img_corr_gain_temp_str_addr", PA_PU_IMG_CORR_GAIN_TEMP_STR_ADDR_REG},
   {"img_corr_gain_clipping_value", PA_PU_IMG_CORR_GAIN_CLIPPING_VALUE_REG},
   {"img_corr_defect_en", PA_PU_IMG_CORR_DEFECT_EN_REG},
+  {"img_offset_corr_mode", PA_PU_IMG_OFFSET_CORR_MODE_REG},
   {"img_corr_state", PA_PU_IMG_CORR_STATE_REG},
   {"img_corr_end", PA_PU_IMG_CORR_END_REG},
   {"img_corr_dfx", PA_PU_IMG_CORR_DFX_REG},
   {"img_corr_debug_in", PA_PU_IMG_CORR_DEBUG_IN_REG},
   {"img_corr_debug_out", PA_PU_IMG_CORR_DEBUG_OUT_REG},
+  {"dync_str", PA_PU_DYNC_STR_REG},
+  {"dynamic_str", PA_PU_DYNC_STR_REG},
+  {"dync_stop", PA_PU_DYNC_STOP_REG},
+  {"dynamic_stop", PA_PU_DYNC_STOP_REG},
+  {"dync_cycle_num", PA_PU_DYNC_CYCLE_NUM_REG},
+  {"dync_img_str_addr", PA_PU_DYNC_IMG_STR_ADDR_REG},
+  {"dync_img_end_addr", PA_PU_DYNC_IMG_END_ADDR_REG},
+  {"dync_step_0_cfg_h", PA_PU_DYNC_STEP_0_CFG_H_REG},
+  {"dync_step_0_cfg_l", PA_PU_DYNC_STEP_0_CFG_L_REG},
+  {"dync_step_1_cfg_h", PA_PU_DYNC_STEP_1_CFG_H_REG},
+  {"dync_step_1_cfg_l", PA_PU_DYNC_STEP_1_CFG_L_REG},
+  {"dync_step_2_cfg_h", PA_PU_DYNC_STEP_2_CFG_H_REG},
+  {"dync_step_2_cfg_l", PA_PU_DYNC_STEP_2_CFG_L_REG},
+  {"dync_step_3_cfg_h", PA_PU_DYNC_STEP_3_CFG_H_REG},
+  {"dync_step_3_cfg_l", PA_PU_DYNC_STEP_3_CFG_L_REG},
+  {"dync_step_4_cfg_h", PA_PU_DYNC_STEP_4_CFG_H_REG},
+  {"dync_step_4_cfg_l", PA_PU_DYNC_STEP_4_CFG_L_REG},
+  {"dync_step_5_cfg_h", PA_PU_DYNC_STEP_5_CFG_H_REG},
+  {"dync_step_5_cfg_l", PA_PU_DYNC_STEP_5_CFG_L_REG},
+  {"dync_step_6_cfg_h", PA_PU_DYNC_STEP_6_CFG_H_REG},
+  {"dync_step_6_cfg_l", PA_PU_DYNC_STEP_6_CFG_L_REG},
+  {"dync_step_7_cfg_h", PA_PU_DYNC_STEP_7_CFG_H_REG},
+  {"dync_step_7_cfg_l", PA_PU_DYNC_STEP_7_CFG_L_REG},
+  {"dync_step_8_cfg_h", PA_PU_DYNC_STEP_8_CFG_H_REG},
+  {"dync_step_8_cfg_l", PA_PU_DYNC_STEP_8_CFG_L_REG},
+  {"dync_step_9_cfg_h", PA_PU_DYNC_STEP_9_CFG_H_REG},
+  {"dync_step_9_cfg_l", PA_PU_DYNC_STEP_9_CFG_L_REG},
+  {"dync_end", PA_PU_DYNC_END_REG},
+  {"dync_state", PA_PU_DYNC_STATE_REG},
+  {"dync_debug_in", PA_PU_DYNC_DEBUG_IN_REG},
+  {"dync_debug_out", PA_PU_DYNC_DEBUG_OUT_REG},
 };
 
 static bool lookup_register_name(const char* name, uint16_t* reg) {
@@ -760,6 +934,7 @@ static pa_pu_corr_config_t default_corr_config(const fpga_mem_t* fpga_mem) {
     .offset_enable = CORR_DEFAULT_OFFSET_EN != 0,
     .offset_template_addr = fpga_mem != NULL ? fpga_mem->offset_phys_base : CORR_DEFAULT_OFFSET_ADDR,
     .offset_adder_value = CORR_DEFAULT_OFFSET_ADDER_VALUE,
+    .offset_corr_mode = CORR_DEFAULT_OFFSET_CORR_MODE,
     .gain_enable = CORR_DEFAULT_GAIN_EN != 0,
     .gain_template_addr = fpga_mem != NULL ? fpga_mem->gain_phys_base : CORR_DEFAULT_GAIN_ADDR,
     .gain_clipping_value = CORR_DEFAULT_GAIN_CLIPPING_VALUE,
@@ -803,6 +978,10 @@ static bool parse_corr_config_args(const char* args, pa_pu_corr_config_t* config
       config->offset_template_addr = value;
     } else if (strcmp(token, "offset_adder") == 0 || strcmp(token, "offset_adder_value") == 0 || strcmp(token, "img_corr_offset_adder_value") == 0) {
       config->offset_adder_value = (uint16_t)value;
+    } else if (strcmp(token, "offset_mode") == 0 ||
+               strcmp(token, "offset_corr_mode") == 0 ||
+               strcmp(token, "img_offset_corr_mode") == 0) {
+      config->offset_corr_mode = (uint8_t)value;
     } else if (strcmp(token, "gain_en") == 0 || strcmp(token, "gain_enable") == 0 || strcmp(token, "img_corr_gain_en") == 0) {
       config->gain_enable = value != 0;
     } else if (strcmp(token, "gain_addr") == 0 || strcmp(token, "gain_template_addr") == 0 || strcmp(token, "img_corr_gain_temp_str_addr") == 0) {
@@ -1070,7 +1249,7 @@ static void write_status_response(char* response, size_t response_size) {
 
   /* STATUS 响应保持短格式，方便串口助手查看，也方便上位机按字段解析。 */
   snprintf(response, response_size,
-           "OK STATUS pa_version=0x%08x pa_build_information=0x%08x adapted_main_board_version=0x%08x adapted_gic_board_version=0x%08x adapted_roic_board_version=0x%08x adapted_reserved_board_0_version=0x%08x adapted_reserved_board_1_version=0x%08x adapted_reserved_board_2_version=0x%08x pa_pu_com_version=0x%08x pa_rst_init_state=0x%08x wr_state=0x%08x wr_end=0x%08x corr_state=0x%08x corr_end=0x%08x gic_state=0x%08x gic_end=0x%08x gic_dfx=0x%08x roic_state=0x%08x roic_end=0x%08x roic_dfx=0x%08x\r\n",
+           "OK STATUS pa_version=0x%08x pa_build_information=0x%08x adapted_main_board_version=0x%08x adapted_gic_board_version=0x%08x adapted_roic_board_version=0x%08x adapted_reserved_board_0_version=0x%08x adapted_reserved_board_1_version=0x%08x adapted_reserved_board_2_version=0x%08x pa_pu_com_version=0x%08x pa_rst_init_state=0x%08x wr_state=0x%08x wr_end=0x%08x wr_final_img_addr=0x%08x corr_state=0x%08x corr_end=0x%08x gic_state=0x%08x gic_end=0x%08x gic_dfx=0x%08x roic_state=0x%08x roic_end=0x%08x roic_dfx=0x%08x dync_state=0x%08x dync_end=0x%08x dync_debug_out=0x%08x\r\n",
            status.pa_version,
            status.pa_build_information,
            status.adapted_main_board_version,
@@ -1083,6 +1262,7 @@ static void write_status_response(char* response, size_t response_size) {
            status.rst_init_state,
            status.img_wr_state,
            status.img_wr_end,
+           status.img_wr_final_img_addr,
            status.img_corr_state,
            status.img_corr_end,
            status.gic_state,
@@ -1090,7 +1270,10 @@ static void write_status_response(char* response, size_t response_size) {
            status.gic_dfx,
            status.roic_state,
            status.roic_end,
-           status.roic_dfx);
+           status.roic_dfx,
+           status.dync_state,
+           status.dync_end,
+           status.dync_debug_out);
 }
 
 static void format_fpga_version(uint32_t value, char* text, size_t text_size) {
@@ -1163,9 +1346,74 @@ static void write_start_result(char* response,
   if (ret > 0) {
     snprintf(response, response_size, "OK %s int_vector=0x%08x\r\n", command, int_vector);
   } else if (ret == 0) {
-    snprintf(response, response_size, "ERR %s TIMEOUT int_vector=0x%08x\r\n", command, int_vector);
+    snprintf(response, response_size, "ERR %s TIMEOUT int_vector=0x%08x expect=0x%08x\r\n", command, int_vector, irq_mask);
   } else {
     snprintf(response, response_size, "ERR %s IRQ_WAIT\r\n", command);
+  }
+}
+
+static int wait_dync_state_idle(uint32_t* state_out) {
+  uint32_t state = 0;
+
+  for (;;) {
+    /*
+     * dynamic 状态为高表示模块仍在运行。硬件约定只有 state 回到低后才会产生
+     * dynamic interrupt。dynamic 循环次数可能很大或由 FPGA 决定，因此这里不设
+     * 超时，一直等 state 释放，再进入 INT_VECTOR bit5 等待。
+     */
+    state = pa_pu_read(PA_PU_DYNC_STATE_REG);
+    if (state == 0) {
+      if (state_out != NULL) {
+        *state_out = state;
+      }
+      return 1;
+    }
+
+    if (usleep(PA_PU_IRQ_POLL_INTERVAL_US) != 0 && errno == EINTR) {
+      if (state_out != NULL) {
+        *state_out = state;
+      }
+      return -1;
+    }
+  }
+}
+
+static void write_start_dync_result(char* response, size_t response_size) {
+  uint32_t int_vector = 0;
+  uint32_t dync_state = 0;
+
+  int state_ret = wait_dync_state_idle(&dync_state);
+  if (state_ret < 0) {
+    snprintf(response, response_size, "ERR START_DYNC STATE_WAIT dync_state=0x%08x\r\n", dync_state);
+    return;
+  }
+
+  int ret = pa_pu_wait_int_vector(PA_PU_IRQ_DYNC_END, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
+  if (ret > 0) {
+    /*
+     * dynamic interrupt 表示 FPGA 动态流程已经结束，此时读取 IMG_WR 返回的最终 DDR 地址。
+     * 该地址用于上位机知道本次动态模式图像实际落在哪一帧 DDR 缓冲中。
+     */
+    uint32_t final_img_addr = pa_pu_read(PA_PU_IMG_WR_FINAL_IMG_ADDR_REG);
+    log_info("dynamic final image addr=0x%08x int_vector=0x%08x dync_state=0x%08x",
+             final_img_addr,
+             int_vector,
+             dync_state);
+    snprintf(response,
+             response_size,
+             "OK START_DYNC int_vector=0x%08x dync_state=0x%08x final_img_addr=0x%08x\r\n",
+             int_vector,
+             dync_state,
+             final_img_addr);
+  } else if (ret == 0) {
+    snprintf(response,
+             response_size,
+             "ERR START_DYNC TIMEOUT int_vector=0x%08x expect=0x%08x dync_state=0x%08x\r\n",
+             int_vector,
+             PA_PU_IRQ_DYNC_END,
+             dync_state);
+  } else {
+    snprintf(response, response_size, "ERR START_DYNC IRQ_WAIT dync_state=0x%08x\r\n", dync_state);
   }
 }
 
@@ -1182,6 +1430,40 @@ static void write_start_combo_result(char* response,
   } else {
     snprintf(response, response_size, "ERR %s IRQ_WAIT\r\n", command);
   }
+}
+
+static bool prepare_manual_hardware_action(command_context_t* ctx,
+                                           const char* command_name,
+                                           char* response,
+                                           size_t response_size) {
+  if (ctx == NULL || ctx->work_mode == NULL) {
+    return true;
+  }
+
+  work_mode_status_t status;
+  work_mode_get_status(ctx->work_mode, &status);
+  if (status.state == WORK_STATE_STOPPED) {
+    return true;
+  }
+
+  if (status.state == WORK_STATE_IDLE_WAIT || status.state == WORK_STATE_IDLE_CLEANING) {
+    /*
+     * 人工 CONFIG/START/WRITE_REG 调试需要独占 PA/PU 寄存器。
+     * 后台 Static Idle 处于等待或自清空时，先停掉工作线程，避免刚检查完空闲又进入下一轮自清空。
+     */
+    log_info("%s stops Static Idle work thread for manual hardware access state=%s",
+             command_name,
+             work_mode_state_name(status.state));
+    work_mode_stop(ctx->work_mode);
+    return true;
+  }
+
+  snprintf(response,
+           response_size,
+           "ERR %s BUSY state=%s hint=retry_after_capture_or_STOP_WORK\r\n",
+           command_name,
+           work_mode_state_name(status.state));
+  return false;
 }
 
 static uint64_t command_monotonic_ms(void) {
@@ -1232,6 +1514,35 @@ static void capture_addr_trace(const capture_addr_loop_config_t* config, uint32_
           iteration,
           step,
           config->image_addr);
+  fflush(stderr);
+}
+
+static void static_idle_loop_trace(const static_idle_loop_config_t* config,
+                                   uint32_t iteration,
+                                   const char* step,
+                                   const work_mode_status_t* status) {
+  if (config == NULL || !config->trace) {
+    return;
+  }
+
+  if (status != NULL) {
+    fprintf(stderr,
+            "[TRACE] loop_static_idle iteration=%u step=%s state=%s phase=%s capture_id=%u offset_addr=0x%08x output_addr=0x%08x int_vector=0x%08x wait_mask=0x%08x\n",
+            iteration,
+            step,
+            work_mode_state_name(status->state),
+            work_mode_phase_name(status->last_phase),
+            status->capture_id,
+            status->last_bright_addr,
+            status->last_dark_addr,
+            status->last_int_vector,
+            status->last_wait_mask);
+  } else {
+    fprintf(stderr,
+            "[TRACE] loop_static_idle iteration=%u step=%s\n",
+            iteration,
+            step);
+  }
   fflush(stderr);
 }
 
@@ -1557,12 +1868,22 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     work_mode_status_t status;
     memset(&status, 0, sizeof(status));
 
+    log_info("static idle loop start count=%u interval_ms=%u stop_on_error=%u trace=%u",
+             loop_config.count,
+             loop_config.interval_ms,
+             loop_config.stop_on_error ? 1u : 0u,
+             loop_config.trace ? 1u : 0u);
+    pa_pu_set_trace(loop_config.trace);
+    work_mode_set_trace(ctx->work_mode, loop_config.trace);
+
     for (uint32_t iteration = 1; loop_config.count == 0 || iteration <= loop_config.count; ++iteration) {
       last_iteration = iteration;
 
+      static_idle_loop_trace(&loop_config, iteration, "capture_begin", NULL);
       int ret = work_mode_start_static_idle_capture(ctx->work_mode, &status);
       if (ret == 0) {
         ++ok_count;
+        static_idle_loop_trace(&loop_config, iteration, "capture_done", &status);
         if (iteration == 1 || (iteration % 50u) == 0) {
           log_info("static idle loop progress iteration=%u count=%u ok=%u fail=%u capture_id=%u offset_addr=0x%08x output_addr=0x%08x int_vector=0x%08x",
                    iteration,
@@ -1576,6 +1897,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
         }
       } else {
         ++fail_count;
+        static_idle_loop_trace(&loop_config, iteration, "capture_failed", &status);
         log_error("static idle loop capture failed iteration=%u ret=%d phase=%s int_vector=0x%08x wait_mask=0x%08x",
                   iteration,
                   ret,
@@ -1591,6 +1913,8 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
         break;
       }
       if (!sleep_ms_for_loop(loop_config.interval_ms)) {
+        pa_pu_set_trace(false);
+        work_mode_set_trace(ctx->work_mode, false);
         snprintf(response,
                  response_size,
                  "ERR LOOP_STATIC_IDLE_CAPTURE INTERRUPTED ok=%u fail=%u last_iteration=%u\r\n",
@@ -1601,6 +1925,8 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
       }
     }
 
+    pa_pu_set_trace(false);
+    work_mode_set_trace(ctx->work_mode, false);
     snprintf(response,
              response_size,
              "%s LOOP_STATIC_IDLE_CAPTURE ok=%u fail=%u last_iteration=%u last_capture_id=%u last_output_addr=0x%08x\r\n",
@@ -1729,10 +2055,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (is_write_reg_command(command)) {
-    if (!work_mode_allows_write_reg(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR WRITE_REG BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "WRITE_REG", response, response_size)) {
       return 0;
     }
     // 写寄存器命令
@@ -1755,10 +2078,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "LOAD_TEMPLATE")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR LOAD_TEMPLATE BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "LOAD_TEMPLATE", response, response_size)) {
       return 0;
     }
     /* 从文件系统加载 offset/gain 模板，适合设备重启后恢复已有校正模板。 */
@@ -1773,10 +2093,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "MAKE_OFFSET")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR MAKE_OFFSET BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "MAKE_OFFSET", response, response_size)) {
       return 0;
     }
     /* 用当前暗场图像生成 offset 模板；上位机应先确保当前帧是有效暗场。 */
@@ -1791,10 +2108,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "MAKE_GAIN")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR MAKE_GAIN BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "MAKE_GAIN", response, response_size)) {
       return 0;
     }
     /* 用当前亮场图像和已有 offset 模板生成 gain 模板；需先执行或加载 offset。 */
@@ -1809,10 +2123,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "CONFIG_TEMPLATE")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR CONFIG_TEMPLATE BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "CONFIG_TEMPLATE", response, response_size)) {
       return 0;
     }
     /* 只重新下发模板地址/尺寸配置，不重新生成或加载模板内容。 */
@@ -1823,10 +2134,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_has_name(command, "CONFIG_CORR") || cmd_has_name(command, "CONFIG_IMG_CORR")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR CONFIG_CORR BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "CONFIG_CORR", response, response_size)) {
       return 0;
     }
     /*
@@ -1840,13 +2148,14 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     }
     pa_pu_configure_correction(&config);
     snprintf(response, response_size,
-             "OK CONFIG_CORR pkg=%u row=%u col=%u offset_en=%u offset_addr=0x%08x offset_adder=%u gain_en=%u gain_addr=0x%08x gain_clip=%u defect_en=%u\r\n",
+             "OK CONFIG_CORR pkg=%u row=%u col=%u offset_en=%u offset_addr=0x%08x offset_adder=%u offset_mode=%u gain_en=%u gain_addr=0x%08x gain_clip=%u defect_en=%u\r\n",
              config.pkg_num,
              config.row_num,
              config.col_num,
              config.offset_enable ? 1u : 0u,
              config.offset_template_addr,
              config.offset_adder_value,
+             config.offset_corr_mode,
              config.gain_enable ? 1u : 0u,
              config.gain_template_addr,
              config.gain_clipping_value,
@@ -1855,10 +2164,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_has_name(command, "CONFIG_GIC")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR CONFIG_GIC BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "CONFIG_GIC", response, response_size)) {
       return 0;
     }
     /*
@@ -1885,10 +2191,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "START_GIC")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR START_GIC BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "START_GIC", response, response_size)) {
       return 0;
     }
     /* 启动一次 GIC 操作，并等待 INT_VECTOR 中的 GIC 完成 bit。 */
@@ -1899,10 +2202,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "STOP_GIC")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR STOP_GIC BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "STOP_GIC", response, response_size)) {
       return 0;
     }
     /* 主要用于 xao scan 模式；其它模式下是否有效由 FPGA 决定。 */
@@ -1912,10 +2212,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_has_name(command, "CONFIG_ROIC")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR CONFIG_ROIC BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "CONFIG_ROIC", response, response_size)) {
       return 0;
     }
     /*
@@ -1937,10 +2234,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "START_ROIC")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR START_ROIC BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "START_ROIC", response, response_size)) {
       return 0;
     }
     /* 启动一次 ROIC 配置操作，并等待 INT_VECTOR 中的 ROIC 完成 bit。 */
@@ -1950,11 +2244,73 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     return 0;
   }
 
+  if (cmd_has_name(command, "CONFIG_DYNC") || cmd_has_name(command, "CONFIG_DYNAMIC")) {
+    if (!prepare_manual_hardware_action(ctx, "CONFIG_DYNC", response, response_size)) {
+      return 0;
+    }
+
+    /*
+     * dynamic_ctrl 是 FPGA 侧动态工作模式的步骤表。
+     * 这里只负责下发 dynamic 自身寄存器；GIC/ROIC/IMG_WR/IMG_CORR 的基础参数仍由对应命令配置。
+     */
+    dync_command_config_t dync_config;
+    default_dync_command_config(ctx->fpga_mem, &dync_config);
+    if (!parse_dync_config_args(cmd_args(command), &dync_config)) {
+      snprintf(response, response_size, "ERR CONFIG_DYNC ARG\r\n");
+      return 0;
+    }
+    pa_pu_configure_dync(&dync_config.config);
+    snprintf(response,
+             response_size,
+             "OK CONFIG_DYNC cycle=%u img_start=0x%08x img_end=0x%08x step0_h=0x%08x step0_l=0x%08x\r\n",
+             dync_config.config.cycle_num,
+             dync_config.config.image_start_addr,
+             dync_config.config.image_end_addr,
+             dync_config.config.step_cfg_h[0],
+             dync_config.config.step_cfg_l[0]);
+    return 0;
+  }
+
+  if (cmd_has_name(command, "START_DYNC") ||
+      cmd_has_name(command, "START_DYNAMIC") ||
+      cmd_has_name(command, "START_DYNC_WAIT") ||
+      cmd_has_name(command, "START_DYNAMIC_WAIT")) {
+    if (!prepare_manual_hardware_action(ctx, "START_DYNC", response, response_size)) {
+      return 0;
+    }
+
+    dync_command_config_t dync_config;
+    default_dync_command_config(ctx->fpga_mem, &dync_config);
+    dync_config.wait_done = cmd_has_name(command, "START_DYNC_WAIT") || cmd_has_name(command, "START_DYNAMIC_WAIT");
+    if (!parse_dync_config_args(cmd_args(command), &dync_config)) {
+      snprintf(response, response_size, "ERR START_DYNC ARG\r\n");
+      return 0;
+    }
+
+    if (dync_config.has_config_write) {
+      pa_pu_configure_dync(&dync_config.config);
+    }
+    pa_pu_prepare_irq_wait();
+    pa_pu_start_dync();
+    if (dync_config.wait_done) {
+      write_start_dync_result(response, response_size);
+    } else {
+      snprintf(response, response_size, "OK START_DYNC wait=0\r\n");
+    }
+    return 0;
+  }
+
+  if (cmd_is(command, "STOP_DYNC") || cmd_is(command, "STOP_DYNAMIC")) {
+    if (!prepare_manual_hardware_action(ctx, "STOP_DYNC", response, response_size)) {
+      return 0;
+    }
+    pa_pu_stop_dync();
+    snprintf(response, response_size, "OK STOP_DYNC\r\n");
+    return 0;
+  }
+
   if (cmd_is(command, "START_CORR")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR START_CORR BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "START_CORR", response, response_size)) {
       return 0;
     }
     /* 启动 FPGA 图像校正，并等待 INT_VECTOR 中的 IMG_CORR 完成 bit。 */
@@ -1965,10 +2321,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "START_CORR_GIC") || cmd_is(command, "START_CORR_THEN_GIC")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR START_CORR_GIC BUSY state=%s\r\n", work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "START_CORR_GIC", response, response_size)) {
       return 0;
     }
     /*
@@ -1986,10 +2339,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "SEND_IMAGE") || cmd_is(command, "SEND_SINGLE") || cmd_is(command, "START_CONTINUOUS")) {
-    if (!work_mode_allows_hardware_action(ctx->work_mode)) {
-      work_mode_status_t status;
-      work_mode_get_status(ctx->work_mode, &status);
-      snprintf(response, response_size, "ERR %s BUSY state=%s\r\n", command, work_mode_state_name(status.state));
+    if (!prepare_manual_hardware_action(ctx, "SEND_IMAGE", response, response_size)) {
       return 0;
     }
     /*

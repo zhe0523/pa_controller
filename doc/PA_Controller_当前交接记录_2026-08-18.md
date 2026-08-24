@@ -84,7 +84,7 @@ GIC_DEFAULT_BINNING ?= 0
 
 ROIC_DEFAULT_START_COL ?= 0
 ROIC_DEFAULT_END_COL ?= 3071
-ROIC_DEFAULT_BINNING ?= 1
+ROIC_DEFAULT_BINNING ?= 0
 ```
 
 IMG_CORR 默认：
@@ -376,4 +376,3 @@ LOOP_CAPTURE_ADDR addr=0x2F100000 count=1000 interval_ms=300 offset_en=1 gain_en
 
 5. 如果固定地址稳定、多地址不稳定，重点查 DDR 地址边界、SFP/IMG_WR 地址递增、FPGA 内部缓存释放。
 6. 如果固定地址也不稳定，重点查 IMG_WR/GIC/IMG_CORR 连续启动复位时序、AXI 写响应、F2P 中断驱动。
-

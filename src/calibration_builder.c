@@ -116,6 +116,7 @@ static int capture_one_raw_frame(fpga_mem_t* mem) {
     .offset_enable = false,
     .offset_template_addr = mem->offset_phys_base,
     .offset_adder_value = CORR_DEFAULT_OFFSET_ADDER_VALUE,
+    .offset_corr_mode = CORR_DEFAULT_OFFSET_CORR_MODE,
     .gain_enable = false,
     .gain_template_addr = mem->gain_phys_base,
     .gain_clipping_value = CORR_DEFAULT_GAIN_CLIPPING_VALUE,

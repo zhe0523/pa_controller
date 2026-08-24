@@ -17,6 +17,17 @@ make APP_VERSION=0.1.0 PA_PU_BASE_ADDR=0x40000000 RS422_DEVICE=/dev/ttyS1 RS422_
 程序启动时会打印 `app_version` 和 `build_time`。发布时可用 `APP_VERSION=x.y.z`
 指定本软件版本；`BUILD_TIME` 默认由 Makefile 在编译时生成。
 
+程序默认只初始化 PA/PU 寄存器映射、UIO 共享 DDR 和命令入口，不自动启动后台工作模式。
+这样启动后可以直接做 `CONFIG_DYNC`、`CONFIG_GIC`、`WRITE_REG` 等寄存器级调试，不会被
+Static Idle 自清空线程抢寄存器。需要恢复开机自动进入 Static Idle 时：
+
+```sh
+make WORK_MODE_AUTO_START=1 WORK_MODE_DEFAULT_MODE=0
+```
+
+`WORK_MODE_DEFAULT_MODE` 沿用上一代 WorkMode 编号。当前 ARM 侧只实现
+`0=Idle/Static Idle`，其它模式编号先作为后续扩展预留。
+
 默认参数集中在 `src/app_config.h`，并且都可以通过 Makefile 覆盖。比如修改默认校正配置：
 
 ```sh
@@ -42,17 +53,17 @@ UIO 布局保持一致。
 当前默认物理地址和窗口大小：
 
 ```text
-FPGA_OFFSET_PTR=0x16000000 FPGA_OFFSET_UIO_SIZE=0x04000000
-FPGA_GAIN_PTR=0x1A000000 FPGA_GAIN_UIO_SIZE=0x04000000
-FPGA_IMAGE_PTR=0x21000000 FPGA_IMAGE_UIO_SIZE=0x1F000000
+FPGA_OFFSET_PTR=0x1EA00000 FPGA_OFFSET_UIO_SIZE=0x04000000
+FPGA_GAIN_PTR=0x22A00000 FPGA_GAIN_UIO_SIZE=0x04000000
+FPGA_IMAGE_PTR=0x26A00000 FPGA_IMAGE_UIO_SIZE=0x19600000
 ```
 
 对应构建参数：
 
 ```sh
-make FPGA_OFFSET_UIO_DEVICE=/dev/uio0 FPGA_OFFSET_PTR=0x16000000 FPGA_OFFSET_UIO_SIZE=0x04000000 \
-     FPGA_GAIN_UIO_DEVICE=/dev/uio1 FPGA_GAIN_PTR=0x1A000000 FPGA_GAIN_UIO_SIZE=0x04000000 \
-     FPGA_IMAGE_UIO_DEVICE=/dev/uio2 FPGA_IMAGE_PTR=0x21000000 FPGA_IMAGE_UIO_SIZE=0x1F000000
+make FPGA_OFFSET_UIO_DEVICE=/dev/uio0 FPGA_OFFSET_PTR=0x1EA00000 FPGA_OFFSET_UIO_SIZE=0x04000000 \
+     FPGA_GAIN_UIO_DEVICE=/dev/uio1 FPGA_GAIN_PTR=0x22A00000 FPGA_GAIN_UIO_SIZE=0x04000000 \
+     FPGA_IMAGE_UIO_DEVICE=/dev/uio2 FPGA_IMAGE_PTR=0x26A00000 FPGA_IMAGE_UIO_SIZE=0x19600000
 ```
 
 `GAIN_TEMPLATE_REPEAT_COUNT` 默认是 `1`。当前 3072×7680 的 16bit 图像一帧约 45MB，
@@ -68,10 +79,10 @@ make GIC_DEFAULT_LINE_TIME_NS=100000 GIC_DEFAULT_START_ROW=0 GIC_DEFAULT_END_ROW
 
 start 类命令会写启动寄存器后等待完成 bit。程序启动时会优先打开 `/dev/pa_irq`，
 如果该节点存在，则由驱动阻塞等待中断；如果不存在，则自动回退到轮询 `INT_VECTOR`。
-默认超时 5000ms：
+默认超时 1000ms：
 
 ```sh
-make PA_PU_IRQ_TIMEOUT_MS=10000 PA_PU_IRQ_POLL_INTERVAL_US=1000 PA_IRQ_DEVICE=/dev/pa_irq
+make PA_PU_IRQ_TIMEOUT_MS=500 PA_PU_IRQ_POLL_INTERVAL_US=1000 PA_IRQ_DEVICE=/dev/pa_irq
 ```
 
 PA 寄存器默认通过 `/dev/mem + PA_PU_BASE_ADDR` 访问，当前确认的默认基地址为 `0x40000000`。
@@ -100,7 +111,7 @@ make deploy-board
 默认会上传到：
 
 ```text
-root@192.168.3.17:/root/pa_controller
+root@192.168.3.54:/root/pa_controller
 ```
 
 当前默认使用 `sshpass` 自动输入开发板密码，Ubuntu 编译主机需要安装：
@@ -131,7 +142,7 @@ make run-board
 临时覆盖示例：
 
 ```sh
-make run-board BOARD_HOST=192.168.3.17 BOARD_USER=root BOARD_DIR=/root BOARD_RUN_ARGS="--stdio"
+make run-board BOARD_HOST=192.168.3.54 BOARD_USER=root BOARD_DIR=/root BOARD_RUN_ARGS="--stdio"
 ```
 
 运行时也可以指定实际 422 串口：
@@ -167,7 +178,11 @@ LOAD_TEMPLATE     -> 从 /usr/local/offset.raw 和 /usr/local/gain.raw 加载模
 MAKE_OFFSET       -> 用当前 FPGA 图像生成 offset 模板
 MAKE_GAIN         -> 用当前 FPGA 图像和 offset 模板生成 gain 模板
 CONFIG_TEMPLATE   -> 将 offset/gain 物理地址配置给 PA
-CONFIG_CORR       -> 将图像校正尺寸、模板地址和 offset/gain/defect 使能配置给 PA
+CONFIG_CORR       -> 将图像校正尺寸、模板地址、offset 模式和 offset/gain/defect 使能配置给 PA
+CONFIG_DYNC       -> 配置 dynamic 模块循环次数、图像环形地址和最多 10 个 step，CONFIG_DYNAMIC 等价
+START_DYNC        -> 启动 dynamic 模块，不等待完成中断，START_DYNAMIC 等价
+START_DYNC_WAIT   -> 启动 dynamic 模块并等待 dynamic 完成中断，START_DYNAMIC_WAIT 等价
+STOP_DYNC         -> 停止 dynamic 模块，STOP_DYNAMIC 等价
 CONFIG_STATIC_IDLE -> 配置静态 Idle 工作模式的时间窗口、GIC 时序和暗场校正开关
 START_STATIC_IDLE_CAPTURE -> 触发一次静态 Idle 采图，等待 offset 模板帧和实际输出帧完成
 LOOP_STATIC_IDLE_CAPTURE -> 循环触发 Static Idle 采图，用于稳定性测试
@@ -188,6 +203,11 @@ SEND_IMAGE        -> 早期调试命令，当前等价于 SEND_SINGLE
 QUIT              -> 退出程序
 ```
 
+调试/配置类命令会独占 PA/PU 寄存器。如果后台 Static Idle 线程正处于等待或
+GIC 自清空阶段，程序会先自动执行一次 `work_mode_stop()` 再下发寄存器；如果
+已经进入曝光或采图阶段，则仍返回 `ERR ... BUSY`，避免和正式采图流程抢寄存器。
+完成手动调试后，如需恢复后台 Static Idle 自清空，请发送 `START_WORK`。
+
 `STATUS` 当前返回字段：
 
 所有字段值按 32bit 十六进制输出，便于直接和寄存器表、`READ_REG` 结果对照。
@@ -205,6 +225,7 @@ pa_pu_com_version                  PA/PU 通信模块版本寄存器
 pa_rst_init_state                  复位初始化状态寄存器
 wr_state                           图像写出状态机状态
 wr_end                             图像写出完成标志
+wr_final_img_addr                  dynamic 模式本轮最终输出图 DDR 地址
 corr_state                         图像校正状态机状态
 corr_end                           图像校正完成标志
 gic_state                          GIC 状态机状态
@@ -213,11 +234,14 @@ gic_dfx                            GIC 调试/错误状态
 roic_state                         ROIC 状态机状态
 roic_end                           ROIC 操作完成标志
 roic_dfx                           ROIC 调试/保留状态
+dync_state                         dynamic 状态机状态
+dync_end                           dynamic 操作完成标志
+dync_debug_out                     dynamic 调试输出
 ```
 
 `VERSION` 返回字段：
 
-PA/FPGA 版本寄存器按 `fpga/pa_pu_com_definition.xlsx` 解析：
+PA/FPGA 版本寄存器按 `fpga/pa_pu_com_definition_add.xlsx` 解析：
 `bit23~16.bit15~8.bit7~0` 对应 `first.second.third`。
 `pa_build_information` 按 `bit31~24` 年、`bit23~16` 月、`bit15~8` 日、`bit7~0` 子版本解析。
 
@@ -296,13 +320,14 @@ start 类命令完成时返回示例：
 OK START_GIC int_vector=0x00000002
 OK START_ROIC int_vector=0x00000004
 OK START_CORR int_vector=0x00000010
-OK SEND_SINGLE addr=0x21000000 int_vector=0x00000008
+OK START_DYNC int_vector=0x00000020 final_img_addr=0x26A00000
+OK SEND_SINGLE addr=0x26A00000 int_vector=0x00000008
 ```
 
 超时则返回：
 
 ```text
-ERR START_GIC TIMEOUT int_vector=0x00000000
+ERR START_GIC TIMEOUT int_vector=0x00000000 expect=0x00000002
 ```
 
 GIC/ROIC 推荐的手工 bring-up 顺序：
@@ -326,35 +351,170 @@ STATUS
 `CONFIG_GIC` 不带参数时使用构建默认值，也可以用 `key=value` 临时覆盖：
 
 ```text
-CONFIG_GIC req=0 dout=1 line_time=100000 oe_rise=1000 oe_fall=90000 start_row=0 end_row=7679 binning=1
+CONFIG_GIC req=0 dout=1 line_time=100000 oe_rise=1000 oe_fall=90000 start_row=0 end_row=7679 binning=0
 ```
 
 也支持完整寄存器名：
 
 ```text
-CONFIG_GIC gic_req_code=0 gic_dout_en=1 gic_line_time=100000 gic_oe_raising_edge=1000 gic_oe_falling_edge=90000 gic_str_row_num=0 gic_end_row_num=7679 gic_binning_mode=1
+CONFIG_GIC gic_req_code=0 gic_dout_en=1 gic_line_time=100000 gic_oe_raising_edge=1000 gic_oe_falling_edge=90000 gic_str_row_num=0 gic_end_row_num=7679 gic_binning_mode=0
 ```
 
 写完这些配置寄存器后，再发 `START_GIC`，程序会写 `GIC_STR=1` 让配置生效并启动一次 GIC 操作。
+
+新协议中 GIC/ROIC 的 binning 统一按下面方式解释：
+
+```text
+0 -> 1x1
+1 -> 2x2
+2 -> 3x3
+3 -> 4x4
+4 -> 5x5
+5 -> 6x6
+6 -> 7x7
+7 -> 8x8
+其它 -> 1x1
+```
 
 `CONFIG_CORR` 不带参数时使用默认图像尺寸，模板地址默认来自 `FPGA_OFFSET_PTR` 和
 `FPGA_GAIN_PTR`；也可以用 `key=value` 临时覆盖：
 
 ```text
-CONFIG_CORR pkg=46080 row=7680 col=3072 offset_en=1 offset_addr=0x16000000 offset_adder=100 gain_en=1 gain_addr=0x1a000000 gain_clip=55000 defect_en=0
+CONFIG_CORR pkg=46080 row=7680 col=3072 offset_en=1 offset_addr=0x1EA00000 offset_adder=100 offset_mode=0 gain_en=1 gain_addr=0x22A00000 gain_clip=55000 defect_en=0
 ```
 
 也支持完整寄存器名：
 
 ```text
-CONFIG_CORR img_pkg_num=46080 img_row_num=7680 img_col_num=3072 img_corr_offset_en=1 img_corr_offset_temp_str_addr=0x16000000 img_corr_offset_adder_value=100 img_corr_gain_en=1 img_corr_gain_temp_str_addr=0x1a000000 img_corr_gain_clipping_value=55000 img_corr_defect_en=0
+CONFIG_CORR img_pkg_num=46080 img_row_num=7680 img_col_num=3072 img_corr_offset_en=1 img_corr_offset_temp_str_addr=0x1EA00000 img_corr_offset_adder_value=100 img_offset_corr_mode=0 img_corr_gain_en=1 img_corr_gain_temp_str_addr=0x22A00000 img_corr_gain_clipping_value=55000 img_corr_defect_en=0
 ```
 
 写完图像校正配置后，再发 `START_CORR`，程序会写 `IMG_CORR_STR=1` 并等待表格协议中的
 IMG_CORR 完成中断 bit。
 
-Static Idle 是正式业务流程入口。启动后后台工作线程会按 `idle_clean_interval_ms`
-周期执行 GIC 自清空，`gic_req_code=0`、`gic_dout_en=0`。可以用下面命令配置：
+`offset_mode` / `img_offset_corr_mode` 的含义：
+
+```text
+0 -> static offset 模板
+1 -> dynamic offset 模式
+```
+
+Static Idle 默认使用 `offset_mode=0`，避免静态采图流程误进入动态 offset 模式。
+
+dynamic 模块当前先作为寄存器级调试入口接入，尚未纳入正式工作模式状态机。它负责配置
+FPGA 侧 dynamic_ctrl 的循环次数、图像环形缓冲范围和最多 10 个 step。基础的
+GIC/ROIC/IMG_CORR/IMG_WR 参数仍由 `CONFIG_GIC`、`CONFIG_ROIC`、`CONFIG_CORR`
+等命令先行配置。
+
+`CONFIG_DYNC` / `CONFIG_DYNAMIC` 只写 dynamic 配置寄存器，不启动：
+
+```text
+CONFIG_DYNC cycle=1 img_start=0x26A00000 img_end=0x3FFFFFFF step0_en=1 step0_req=4 step0_time=50
+```
+
+也可以配置多个步骤：
+
+```text
+CONFIG_DYNC cycle=1 img_start=0x26A00000 img_end=0x3FFFFFFF step0_en=1 step0_req=1 step0_time=50 step1_en=1 step1_req=4 step1_time=50
+```
+
+上面的命令等价于写：
+
+```text
+dync_cycle_num       = 1
+dync_img_str_addr    = 0x26A00000
+dync_img_end_addr    = 0x3FFFFFFF
+dync_step_0_cfg_h    = 0x80000001
+dync_step_0_cfg_l    = 50
+dync_step_1_cfg_h    = 0x80000004
+dync_step_1_cfg_l    = 50
+```
+
+step high/low 配置字也可以直接写：
+
+```text
+CONFIG_DYNC cycle=1 img_start=0x26A00000 img_end=0x3FFFFFFF step0_h=0x80000001 step0_l=50 step1_h=0x80000004 step1_l=50
+```
+
+step high 配置字含义：
+
+```text
+bit31  -> 当前 step 使能
+bit7~0 -> 当前 step req_code
+```
+
+目前表格定义的 req_code：
+
+```text
+0 -> idle
+1 -> serial clear
+2 -> parallel clear
+3 -> xao clear
+4 -> capture one image
+5 -> wait sync in signals
+6 -> wait sync out
+```
+
+step low 配置字当前表示该 step 的定时参数，单位 ms。按照协议表，它主要在
+`xao clear` 和 `wait sync in signals` 等需要等待窗口的 step 中使用。
+
+启动 dynamic：
+
+```text
+START_DYNC
+```
+
+`START_DYNC` 只写 `DYNC_STR=1`，不等待完成中断，适合 `cycle=0` 这类需要后续
+`STOP_DYNC` 才结束的持续流程。如果启动命令中携带了 `cycle/img_start/img_end/step*`
+参数，程序会先写这些 dynamic 配置，再启动：
+
+```text
+START_DYNC cycle=1 img_start=0x26A00000 img_end=0x3FFFFFFF step0_en=1 step0_req=4 step0_time=50
+```
+
+启动并等待 dynamic 完成中断：
+
+```text
+START_DYNC_WAIT
+START_DYNC_WAIT cycle=1 img_start=0x26A00000 img_end=0x3FFFFFFF step0_en=1 step0_req=4 step0_time=50
+```
+
+`START_DYNC_WAIT` 的等待顺序：
+
+```text
+1. 先轮询 dync_state(0x0BA8)，高电平表示 dynamic 模块仍在运行；该阶段不设超时。
+2. dync_state 变低后，再等待 INT_VECTOR bit5，即 dynamic interrupt。
+3. 收到 bit5 后读取 IMG_WR_FINAL_IMG_ADDR_ADDR(0x07B0)，返回本轮最终输出图 DDR 地址。
+```
+
+```text
+OK START_DYNC int_vector=0x00000020 dync_state=0x00000000 final_img_addr=0x26A00000
+ERR START_DYNC TIMEOUT int_vector=0x0000001a expect=0x00000020 dync_state=0x00000000
+```
+
+如果 `dync_state` 一直为高，`START_DYNC_WAIT` 会一直阻塞等待；如果返回普通
+`TIMEOUT`，说明 dynamic 状态机已经结束，但 bit5 中断没有出现。
+
+停止 dynamic：
+
+```text
+STOP_DYNC
+```
+
+`STOP_DYNC` 只写 `DYNC_STOP=1` 并立即返回，不额外等待完成中断。需要直接调试 dynamic
+寄存器时也可以使用：
+
+```text
+READ_REG dync_state
+READ_REG dync_end
+WRITE_REG dync_step_0_cfg_h 0x80000004
+WRITE_REG dync_step_0_cfg_l 50
+```
+
+Static Idle 是当前已实现的正式业务流程入口。默认启动后该后台线程不自动运行；
+发送 `START_WORK` 或使用 `WORK_MODE_AUTO_START=1 WORK_MODE_DEFAULT_MODE=0` 编译后，
+后台工作线程会按 `idle_clean_interval_ms` 周期执行 GIC 自清空，
+`gic_req_code=0`、`gic_dout_en=0`。可以用下面命令配置：
 
 ```text
 CONFIG_STATIC_IDLE idle_clean_interval_ms=50 exposure_ms=50 dark_window_ms=50 offset_en=1 gain_en=1 defect_en=0 line_time=25600 start_row=0 end_row=7679 binning=0
@@ -370,7 +530,11 @@ START_STATIC_IDLE_CAPTURE
 
 ```text
 LOOP_STATIC_IDLE_CAPTURE count=100 interval_ms=5000
+LOOP_STATIC_IDLE_CAPTURE count=0 interval_ms=10 stop_on_error=1 trace=1
 ```
+
+`trace=1` 时会向 `stderr` 输出每轮 `capture_begin/capture_done/capture_failed`
+等详细过程，并临时打开 PA/PU 中断等待 trace；`count=0` 表示一直循环。
 
 `count=0` 表示一直循环；不带参数时默认 `count=0 interval_ms=5000 stop_on_error=1`。
 该命令同步运行，长时间测试时可用 Ctrl+C 结束程序。
@@ -409,13 +573,13 @@ IMG_CORR 和 GIC 两个完成中断 bit。`START_CORR_THEN_GIC` 是等价别名�
 `CONFIG_ROIC` 不带参数时使用构建默认值，也可以用 `key=value` 临时覆盖：
 
 ```text
-CONFIG_ROIC start_col=0 end_col=3071 binning=1 reg_00=0x0000 reg_02=0x0000 reg_05=0x0000 reg_06=0x0000 reg_07=0x0000 reg_09=0x0000 reg_0a=0x0000 reg_0b=0x0000 reg_0c=0x0000 reg_0d=0x0000 reg_0e=0x0000 reg_0f=0x0000 reg_10=0x0000 reg_11=0x0000 reg_17=0x0000 reg_24=0x0000 reg_28=0x0000 reg_2d=0x0000 reg_3b=0x0000
+CONFIG_ROIC start_col=0 end_col=3071 binning=0 reg_00=0x0000 reg_02=0x0000 reg_05=0x0000 reg_06=0x0000 reg_07=0x0000 reg_09=0x0000 reg_0a=0x0000 reg_0b=0x0000 reg_0c=0x0000 reg_0d=0x0000 reg_0e=0x0000 reg_0f=0x0000 reg_10=0x0000 reg_11=0x0000 reg_17=0x0000 reg_24=0x0000 reg_28=0x0000 reg_2d=0x0000 reg_3b=0x0000
 ```
 
 也可以只覆盖本次需要改的字段，其它字段继续使用构建默认值：
 
 ```text
-CONFIG_ROIC start_col=0 end_col=3071 binning=1
+CONFIG_ROIC start_col=0 end_col=3071 binning=0
 ```
 
 也支持完整寄存器名：
@@ -493,7 +657,7 @@ Trig PTO 输出给射线源/加速器
 
 ```text
 src/main.c              主流程：初始化 FPGA/PA、RS422 循环
-src/pa_pu.c/h           PA 寄存器控制，地址来自 fpga/pa_pu_com.v
+src/pa_pu.c/h           PA 寄存器控制，地址来自 fpga/pa_pu_com_definition_add.xlsx 和 fpga/dynamic.txt
 src/fpga_mem.c/h        FPGA image/offset/gain 三个 UIO 内存映射
 src/image_frame.h       光口图像头格式
 src/template_builder.c  offset/gain 模板生成与加载
@@ -504,21 +668,24 @@ src/command_handler.c   临时调试命令分发
 
 ## 注意
 
-根据 `fpga/pa_pu_com_definition.xlsx` 和 `fpga/pa_pu_com.v` 对照，目前有几个需要和 FPGA 继续确认的点：
+当前寄存器定义以 `fpga/pa_pu_com_definition_add.xlsx` 为主，其中 dynamic 模块地址以
+`fpga/dynamic.txt` 为准。
 
 ```text
-1. IMG_CORR 地址按当前协议表使用 0x0800~0x0850 的 8 字节对齐地址。
+1. IMG_CORR 地址按当前协议表使用 0x0800~0x0858 的 8 字节对齐地址。
    defect_en 写 0x0850，debug_in 写 0x09C8，不再做旧 RTL 的 defect/debug 地址互换兼容。
+   img_offset_corr_mode 写 0x0858，0 表示 static offset，1 表示 dynamic offset。
 
-2. 软件协议以 `pa_pu_com_definition.xlsx` 为准：int_vector bit0 是 pa reset init done interrupt，
+2. 软件协议以 `pa_pu_com_definition_add.xlsx` 为准：int_vector bit0 是 pa reset init done interrupt，
    bit1 是 gic interrupt，bit2 是 roic interrupt，bit3 是 image write interrupt，
-   bit4 是 image correct interrupt。若当前 RTL 返回 `{img_corr_end,img_wr_end,roic_end,gic_end}`，
-   则属于 FPGA/表格协议不一致，软件侧仍按表格协议等待，并通过日志打印所有非 0 int_vector
-   方便现场定位。
+   bit4 是 image correct interrupt，bit5 是 dynamic interrupt。
+
+3. dynamic 模块中 dync_end/dync_state 地址按 fpga/dynamic.txt：
+   dync_end=0x0BA0，dync_state=0x0BA8。
 ```
 
-当前完成中断优先通过 `/dev/pa_irq` 驱动处理。`gic_str`、`roic_str`、`img_wr_str`
-和 `img_corr_str` 触发后，驱动读取 `INT_VECTOR` 清硬件 sticky，并把 int_vector 事件交给
+当前完成中断优先通过 `/dev/pa_irq` 驱动处理。`gic_str`、`roic_str`、`img_wr_str`、
+`img_corr_str` 和 `dync_str` 触发后，驱动读取 `INT_VECTOR` 清硬件 sticky，并把 int_vector 事件交给
 `pa_controller`；如果没有加载驱动或没有 `/dev/pa_irq` 节点，应用会回退到原来的
 1ms `INT_VECTOR` 轮询。
 RS422 调试协议不再暴露 `WAIT_IRQ`。

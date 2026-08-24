@@ -23,6 +23,22 @@
 #define APP_BUILD_TIME __DATE__ " " __TIME__
 #endif
 
+#ifndef WORK_MODE_AUTO_START
+/*
+ * 程序启动后是否自动启动工作模式线程。
+ * 0：只初始化寄存器/DDR/命令入口，不启动后台自清空；1：按 WORK_MODE_DEFAULT_MODE 启动。
+ */
+#define WORK_MODE_AUTO_START 0u
+#endif
+
+#ifndef WORK_MODE_DEFAULT_MODE
+/*
+ * 启动时默认进入的工作模式编号，沿用上一代 WorkMode 枚举。
+ * 当前 ARM 侧只实现 0=Idle/Static Idle；其它模式会初始化但不会自动启动。
+ */
+#define WORK_MODE_DEFAULT_MODE 0u
+#endif
+
 #ifndef DEVICE_WIDTH
 /* FPGA 内存中一行的总像素数，包含有效图像之外的边界/偏移区域。 */
 #define DEVICE_WIDTH 3072u
@@ -175,6 +191,11 @@
 #define CORR_DEFAULT_OFFSET_ADDER_VALUE 100u
 #endif
 
+#ifndef CORR_DEFAULT_OFFSET_CORR_MODE
+/* CONFIG_CORR 默认 offset 校正模式，0=静态 offset，1=动态 offset。 */
+#define CORR_DEFAULT_OFFSET_CORR_MODE 0u
+#endif
+
 #ifndef CORR_DEFAULT_GAIN_EN
 /* CONFIG_CORR 默认是否启用 gain/亮场校正，写入 IMG_CORR_GAIN_EN。 */
 #define CORR_DEFAULT_GAIN_EN 1u
@@ -203,6 +224,16 @@
 #ifndef PA_PU_IRQ_POLL_INTERVAL_US
 /* 轮询 INT_VECTOR 的间隔。读取 INT_VECTOR 会清除已置位中断。 */
 #define PA_PU_IRQ_POLL_INTERVAL_US 1000u
+#endif
+
+#ifndef PA_PU_IRQ_POLL_BUSY_WAIT
+/* 无中断驱动回退轮询时是否用忙等替代 usleep，1=忙等，0=usleep。 */
+#define PA_PU_IRQ_POLL_BUSY_WAIT 1u
+#endif
+
+#ifndef PA_PU_IRQ_POLL_BUSY_SPINS
+/* 忙等轮询每轮空转次数，仅用于调试规避 Linux sleep 唤醒卡死问题。 */
+#define PA_PU_IRQ_POLL_BUSY_SPINS 20000u
 #endif
 
 #ifndef PA_IRQ_DEVICE
@@ -281,7 +312,7 @@
 #endif
 
 #ifndef ROIC_DEFAULT_BINNING
-#define ROIC_DEFAULT_BINNING 1u
+#define ROIC_DEFAULT_BINNING 0u
 #endif
 
 #ifndef ROIC_DEFAULT_REG_00

@@ -39,6 +39,8 @@ typedef struct {
   uint32_t offset_template_addr;
   /* offset 扣除后的附加补偿值，公式需 FPGA 确认。 */
   uint16_t offset_adder_value;
+  /* offset 校正模式：0=静态模板，1=动态模板/动态 offset。 */
+  uint8_t offset_corr_mode;
   /* 是否启用 gain 校正。 */
   bool gain_enable;
   /* gain 模板物理地址，必须是 PA/FPGA 可访问地址。 */
@@ -87,6 +89,30 @@ typedef struct {
   uint8_t binning_mode;
 } pa_pu_roic_config_t;
 
+enum {
+  /* dynamic 模块当前协议最多支持 10 个步骤，每步由 high/low 两个 32bit 配置字组成。 */
+  PA_PU_DYNC_STEP_COUNT = 10,
+};
+
+/*
+ * dynamic_ctrl 动态流程配置。
+ *
+ * step_cfg_h bit31 表示该 step 使能，bit[7:0] 为 req_code；
+ * step_cfg_l 当前按协议表表示该 step 的等待时间，单位 ms。
+ */
+typedef struct {
+  /* 动态流程循环次数，0 表示一直运行到收到 DYNC_STOP。 */
+  uint32_t cycle_num;
+  /* 动态模式写图环形缓冲起始物理地址。 */
+  uint32_t image_start_addr;
+  /* 动态模式写图环形缓冲结束物理地址。 */
+  uint32_t image_end_addr;
+  /* 每个动态步骤的 high 配置字。 */
+  uint32_t step_cfg_h[PA_PU_DYNC_STEP_COUNT];
+  /* 每个动态步骤的 low 配置字。 */
+  uint32_t step_cfg_l[PA_PU_DYNC_STEP_COUNT];
+} pa_pu_dync_config_t;
+
 /* STATUS 命令返回给上位机的核心 PA 状态快照。 */
 typedef struct {
   /* PA 版本号。 */
@@ -113,6 +139,8 @@ typedef struct {
   uint32_t img_wr_state;
   /* 图像写出完成标志。 */
   uint32_t img_wr_end;
+  /* dynamic 模式下图像写出模块返回的最终输出图 DDR 地址。 */
+  uint32_t img_wr_final_img_addr;
   /* 图像校正状态机状态。 */
   uint32_t img_corr_state;
   /* 图像校正完成标志。 */
@@ -129,6 +157,12 @@ typedef struct {
   uint32_t roic_end;
   /* ROIC 调试/保留状态。 */
   uint32_t roic_dfx;
+  /* dynamic 模块状态，高电平表示 busy。 */
+  uint32_t dync_state;
+  /* dynamic 操作完成标志。 */
+  uint32_t dync_end;
+  /* dynamic 调试输出。 */
+  uint32_t dync_debug_out;
 } pa_pu_status_t;
 
 /* 打开 PA 寄存器映射：优先 UIO，失败后回退 /dev/mem + base_addr。 */
@@ -211,6 +245,15 @@ void pa_pu_start_roic(void);
 
 /* 写 IMG_CORR_STR，启动一次图像校正。 */
 void pa_pu_start_correction(void);
+
+/* 按调用者给定参数配置 dynamic 模块步骤表和图像环形地址范围。 */
+void pa_pu_configure_dync(const pa_pu_dync_config_t* config);
+
+/* 写 DYNC_STR，启动 dynamic 流程。 */
+void pa_pu_start_dync(void);
+
+/* 写 DYNC_STOP，停止 dynamic 流程。 */
+void pa_pu_stop_dync(void);
 
 /* 只配置 IMG_WR_STR_ADDR，不触发 IMG_WR_STR；image_addr 必须是 FPGA 可访问的 DDR 物理地址。 */
 void pa_pu_configure_image_write(uint32_t image_addr);

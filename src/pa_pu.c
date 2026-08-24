@@ -115,6 +115,7 @@ static const pa_pu_reg_desc_t k_pa_pu_reg_descs[] = {
   {"img_wr_str_addr", PA_PU_IMG_WR_STR_ADDR_REG},
   {"img_wr_state", PA_PU_IMG_WR_STATE_REG},
   {"img_wr_end", PA_PU_IMG_WR_END_REG},
+  {"img_wr_final_img_addr", PA_PU_IMG_WR_FINAL_IMG_ADDR_REG},
   {"img_wr_dfx", PA_PU_IMG_WR_DFX_REG},
   {"img_wr_debug_in", PA_PU_IMG_WR_DEBUG_IN_REG},
   {"img_wr_debug_out", PA_PU_IMG_WR_DEBUG_OUT_REG},
@@ -129,11 +130,41 @@ static const pa_pu_reg_desc_t k_pa_pu_reg_descs[] = {
   {"img_corr_gain_temp_str_addr", PA_PU_IMG_CORR_GAIN_TEMP_STR_ADDR_REG},
   {"img_corr_gain_clipping_value", PA_PU_IMG_CORR_GAIN_CLIPPING_VALUE_REG},
   {"img_corr_defect_en", PA_PU_IMG_CORR_DEFECT_EN_REG},
+  {"img_offset_corr_mode", PA_PU_IMG_OFFSET_CORR_MODE_REG},
   {"img_corr_state", PA_PU_IMG_CORR_STATE_REG},
   {"img_corr_end", PA_PU_IMG_CORR_END_REG},
   {"img_corr_dfx", PA_PU_IMG_CORR_DFX_REG},
   {"img_corr_debug_in", PA_PU_IMG_CORR_DEBUG_IN_REG},
   {"img_corr_debug_out", PA_PU_IMG_CORR_DEBUG_OUT_REG},
+  {"dync_str", PA_PU_DYNC_STR_REG},
+  {"dync_stop", PA_PU_DYNC_STOP_REG},
+  {"dync_cycle_num", PA_PU_DYNC_CYCLE_NUM_REG},
+  {"dync_img_str_addr", PA_PU_DYNC_IMG_STR_ADDR_REG},
+  {"dync_img_end_addr", PA_PU_DYNC_IMG_END_ADDR_REG},
+  {"dync_step_0_cfg_h", PA_PU_DYNC_STEP_0_CFG_H_REG},
+  {"dync_step_0_cfg_l", PA_PU_DYNC_STEP_0_CFG_L_REG},
+  {"dync_step_1_cfg_h", PA_PU_DYNC_STEP_1_CFG_H_REG},
+  {"dync_step_1_cfg_l", PA_PU_DYNC_STEP_1_CFG_L_REG},
+  {"dync_step_2_cfg_h", PA_PU_DYNC_STEP_2_CFG_H_REG},
+  {"dync_step_2_cfg_l", PA_PU_DYNC_STEP_2_CFG_L_REG},
+  {"dync_step_3_cfg_h", PA_PU_DYNC_STEP_3_CFG_H_REG},
+  {"dync_step_3_cfg_l", PA_PU_DYNC_STEP_3_CFG_L_REG},
+  {"dync_step_4_cfg_h", PA_PU_DYNC_STEP_4_CFG_H_REG},
+  {"dync_step_4_cfg_l", PA_PU_DYNC_STEP_4_CFG_L_REG},
+  {"dync_step_5_cfg_h", PA_PU_DYNC_STEP_5_CFG_H_REG},
+  {"dync_step_5_cfg_l", PA_PU_DYNC_STEP_5_CFG_L_REG},
+  {"dync_step_6_cfg_h", PA_PU_DYNC_STEP_6_CFG_H_REG},
+  {"dync_step_6_cfg_l", PA_PU_DYNC_STEP_6_CFG_L_REG},
+  {"dync_step_7_cfg_h", PA_PU_DYNC_STEP_7_CFG_H_REG},
+  {"dync_step_7_cfg_l", PA_PU_DYNC_STEP_7_CFG_L_REG},
+  {"dync_step_8_cfg_h", PA_PU_DYNC_STEP_8_CFG_H_REG},
+  {"dync_step_8_cfg_l", PA_PU_DYNC_STEP_8_CFG_L_REG},
+  {"dync_step_9_cfg_h", PA_PU_DYNC_STEP_9_CFG_H_REG},
+  {"dync_step_9_cfg_l", PA_PU_DYNC_STEP_9_CFG_L_REG},
+  {"dync_end", PA_PU_DYNC_END_REG},
+  {"dync_state", PA_PU_DYNC_STATE_REG},
+  {"dync_debug_in", PA_PU_DYNC_DEBUG_IN_REG},
+  {"dync_debug_out", PA_PU_DYNC_DEBUG_OUT_REG},
 };
 
 static size_t pa_pu_reg_desc_count(void) {
@@ -276,6 +307,101 @@ void pa_pu_write(uint16_t reg, uint32_t value) {
   *(volatile uint32_t*)(g_base + reg) = value;
 }
 
+static bool pa_pu_write_verify(uint16_t reg, uint32_t value, const char* name) {
+  /*
+   * PA/PU 配置寄存器经 AXI-lite 写入 FPGA。现场观察到连续快速写 IMG_CORR 尺寸时，
+   * 偶发出现 IMG_ROW_NUM 读回等于 IMG_PKG_NUM 的情况；对关键配置做写后读回，
+   * 如果未锁存成功就短延迟重写，避免带着错误尺寸启动硬件状态机。
+   */
+  enum { kMaxAttempts = 3 };
+  for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+    pa_pu_write(reg, value);
+    uint32_t readback = pa_pu_read(reg);
+    if (readback == value) {
+      if (attempt > 1) {
+        log_warn("pa_pu write verify recovered reg=%s offset=0x%04x value=0x%08x attempts=%d",
+                 name != NULL ? name : "unknown",
+                 reg,
+                 value,
+                 attempt);
+      }
+      return true;
+    }
+
+    log_warn("pa_pu write verify mismatch reg=%s offset=0x%04x expect=0x%08x read=0x%08x attempt=%d",
+             name != NULL ? name : "unknown",
+             reg,
+             value,
+             readback,
+             attempt);
+    usleep(1000u);
+  }
+
+  return false;
+}
+
+static void pa_pu_trace_write_reg(const char* scope, const char* name, uint16_t reg, uint32_t value) {
+  /*
+   * 寄存器访问卡死时，普通函数级 trace 只能看到“进入配置函数”。
+   * 这里在关键写寄存器前后输出更细粒度信息，用于判断 AXI-lite 总线具体卡在哪个地址。
+   */
+  if (!g_trace) {
+    return;
+  }
+  printf("[TRACE] pa_pu %s write %s offset=0x%04x value=0x%08x\n",
+         scope != NULL ? scope : "reg",
+         name != NULL ? name : "unknown",
+         reg,
+         value);
+  fflush(stdout);
+}
+
+static void pa_pu_write_traced(const char* scope, const char* name, uint16_t reg, uint32_t value) {
+  pa_pu_trace_write_reg(scope, name, reg, value);
+  pa_pu_write(reg, value);
+  if (g_trace) {
+    printf("[TRACE] pa_pu %s write_done %s offset=0x%04x\n",
+           scope != NULL ? scope : "reg",
+           name != NULL ? name : "unknown",
+           reg);
+    fflush(stdout);
+  }
+}
+
+static void pa_pu_read_irq_probe_registers(void) {
+  /*
+   * 仅用于无 /dev/pa_irq 时的 INT_VECTOR 轮询调试。
+   * 每次读取 read-clear 的 0x00 前，额外读 0x08~0x50 这 10 个只读/状态寄存器，
+   * 方便 FPGA 侧用 ILA 对齐 AXI-lite 读访问节奏；这些寄存器不会消费中断。
+   */
+  static const uint16_t probe_regs[] = {
+    PA_PU_PA_VERSION_REG,
+    PA_PU_PA_BUILD_INFORMATION_REG,
+    PA_PU_ADAPTED_MAIN_BOARD_VERSION_REG,
+    PA_PU_ADAPTED_GIC_BOARD_VERSION_REG,
+    PA_PU_ADAPTED_ROIC_BOARD_VERSION_REG,
+    PA_PU_ADAPTED_RESERVED_BOARD_0_VERSION_REG,
+    PA_PU_ADAPTED_RESERVED_BOARD_1_VERSION_REG,
+    PA_PU_ADAPTED_RESERVED_BOARD_2_VERSION_REG,
+    PA_PU_COM_VERSION_REG,
+    PA_PU_RST_INIT_STATE_REG,
+  };
+  static volatile uint32_t sink;
+
+  for (size_t i = 0; i < sizeof(probe_regs) / sizeof(probe_regs[0]); ++i) {
+    if (g_trace) {
+      fprintf(stderr, "[TRACE] pa_pu irq_probe_read_begin offset=0x%04x\n", probe_regs[i]);
+      fflush(stderr);
+    }
+    uint32_t value = pa_pu_read(probe_regs[i]);
+    sink ^= value;
+    if (g_trace) {
+      fprintf(stderr, "[TRACE] pa_pu irq_probe_read_done offset=0x%04x value=0x%08x\n", probe_regs[i], value);
+      fflush(stderr);
+    }
+  }
+}
+
 void pa_pu_read_status(pa_pu_status_t* status) {
   if (status == NULL) {
     return;
@@ -296,6 +422,7 @@ void pa_pu_read_status(pa_pu_status_t* status) {
   status->rst_init_state = pa_pu_read(PA_PU_RST_INIT_STATE_REG);
   status->img_wr_state = pa_pu_read(PA_PU_IMG_WR_STATE_REG);
   status->img_wr_end = pa_pu_read(PA_PU_IMG_WR_END_REG);
+  status->img_wr_final_img_addr = pa_pu_read(PA_PU_IMG_WR_FINAL_IMG_ADDR_REG);
   status->img_corr_state = pa_pu_read(PA_PU_IMG_CORR_STATE_REG);
   status->img_corr_end = pa_pu_read(PA_PU_IMG_CORR_END_REG);
   status->gic_state = pa_pu_read(PA_PU_GIC_STATE_REG);
@@ -304,6 +431,9 @@ void pa_pu_read_status(pa_pu_status_t* status) {
   status->roic_state = pa_pu_read(PA_PU_ROIC_STATE_REG);
   status->roic_end = pa_pu_read(PA_PU_ROIC_END_REG);
   status->roic_dfx = pa_pu_read(PA_PU_ROIC_DFX_REG);
+  status->dync_state = pa_pu_read(PA_PU_DYNC_STATE_REG);
+  status->dync_end = pa_pu_read(PA_PU_DYNC_END_REG);
+  status->dync_debug_out = pa_pu_read(PA_PU_DYNC_DEBUG_OUT_REG);
 }
 
 void pa_pu_dump_all_registers(const char* reason) {
@@ -372,6 +502,7 @@ size_t pa_pu_dump_safe_registers(const char* reason, size_t* skipped_out) {
 }
 
 uint32_t pa_pu_read_int_vector(void) {
+  pa_pu_read_irq_probe_registers();
   return pa_pu_read(PA_PU_INT_VECTOR_REG);
 }
 
@@ -381,6 +512,26 @@ static uint64_t monotonic_ms(void) {
     return 0;
   }
   return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static int pa_pu_poll_delay(void) {
+  /*
+   * 无 /dev/pa_irq 时的轮询等待。现场曾观察到 FPGA 某次启动后 Linux usleep
+   * 不再返回，因此默认使用纯 CPU 忙等做对比测试；正式版本可再切回 usleep。
+   */
+  if (PA_PU_IRQ_POLL_BUSY_WAIT != 0) {
+    volatile uint32_t spin = 0;
+    for (uint32_t i = 0; i < PA_PU_IRQ_POLL_BUSY_SPINS; ++i) {
+      spin += i;
+    }
+    (void)spin;
+    return 0;
+  }
+
+  if (usleep(PA_PU_IRQ_POLL_INTERVAL_US) != 0 && errno == EINTR) {
+    return -1;
+  }
+  return 0;
 }
 
 static void pa_pu_drain_irq_driver(void) {
@@ -433,6 +584,7 @@ void pa_pu_prepare_irq_wait(void) {
 static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* int_vector_out) {
   const uint64_t start_ms = monotonic_ms();
   uint32_t last_vector = 0;
+  uint32_t seen_vector = 0;
 
   pa_pu_trace("wait_irq_driver_enter", mask, timeout_ms);
   while (g_irq_fd != -1) {
@@ -455,6 +607,7 @@ static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* i
       .events = POLLIN,
     };
 
+    pa_pu_trace("wait_irq_driver_before_poll", mask, (uint32_t)poll_timeout);
     int pret = poll(&pfd, 1, poll_timeout);
     pa_pu_trace("wait_irq_driver_poll_return", mask, (uint32_t)pret);
     if (pret == 0) {
@@ -489,10 +642,11 @@ static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* i
       ssize_t n = read(g_irq_fd, &event, sizeof(event));
       if (n == (ssize_t)sizeof(event)) {
         last_vector = event.int_vector;
+        seen_vector |= last_vector;
         pa_pu_trace("wait_irq_driver_event", mask, last_vector);
         if ((last_vector & mask) != 0) {
           if (int_vector_out != NULL) {
-            *int_vector_out = last_vector;
+            *int_vector_out = seen_vector;
           }
           return 1;
         }
@@ -519,7 +673,7 @@ static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* i
   }
 
   if (int_vector_out != NULL) {
-    *int_vector_out = last_vector;
+    *int_vector_out = seen_vector != 0 ? seen_vector : last_vector;
   }
   return -2;
 }
@@ -540,14 +694,18 @@ int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vect
 
   const uint64_t start_ms = monotonic_ms();
   uint32_t last_vector = 0;
+  uint32_t seen_vector = 0;
 
   for (;;) {
     /*
      * INT_VECTOR 是 read-clear：每次读取都会消费当前 pending 中断。
      * 如果读到了非目标 bit，也保留在 last_vector 中返回给调用方诊断。
      */
+    pa_pu_trace("wait_int_vector_read_begin", mask, PA_PU_INT_VECTOR_REG);
     last_vector = pa_pu_read_int_vector();
-    if (last_vector != 0) {
+    pa_pu_trace("wait_int_vector_read_done", mask, last_vector);
+    seen_vector |= last_vector;
+    if (last_vector != 0 || g_trace) {
       pa_pu_trace("wait_int_vector_poll_value", mask, last_vector);
     }
     if (last_vector != 0 && (last_vector & mask) == 0) {
@@ -557,22 +715,26 @@ int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vect
     }
     if ((last_vector & mask) != 0) {
       if (int_vector_out != NULL) {
-        *int_vector_out = last_vector;
+        *int_vector_out = seen_vector;
       }
       return 1;
     }
 
+    pa_pu_trace("wait_int_vector_before_clock", mask, last_vector);
     const uint64_t now_ms = monotonic_ms();
+    pa_pu_trace("wait_int_vector_after_clock", mask, (uint32_t)(now_ms - start_ms));
     if (now_ms - start_ms >= timeout_ms) {
       if (int_vector_out != NULL) {
-        *int_vector_out = last_vector;
+        *int_vector_out = seen_vector != 0 ? seen_vector : last_vector;
       }
       return 0;
     }
 
-    if (usleep(PA_PU_IRQ_POLL_INTERVAL_US) != 0 && errno == EINTR) {
+    pa_pu_trace("wait_int_vector_before_delay", mask, PA_PU_IRQ_POLL_BUSY_WAIT != 0 ? PA_PU_IRQ_POLL_BUSY_SPINS : PA_PU_IRQ_POLL_INTERVAL_US);
+    if (pa_pu_poll_delay() != 0) {
       return -1;
     }
+    pa_pu_trace("wait_int_vector_after_delay", mask, PA_PU_IRQ_POLL_BUSY_WAIT != 0 ? PA_PU_IRQ_POLL_BUSY_SPINS : PA_PU_IRQ_POLL_INTERVAL_US);
   }
 }
 
@@ -641,18 +803,22 @@ void pa_pu_configure_correction(const pa_pu_corr_config_t* config) {
     return;
   }
 
-  /* 这些写寄存器顺序按“尺寸 -> offset -> gain -> defect”组织，便于对照结构体字段。 */
-  pa_pu_write(PA_PU_IMG_PKG_NUM_REG, config->pkg_num);
-  pa_pu_write(PA_PU_IMG_ROW_NUM_REG, config->row_num);
-  pa_pu_write(PA_PU_IMG_COL_NUM_REG, config->col_num);
   /*
-   * 现场曾观察到 IMG_ROW_NUM 读回等于 IMG_PKG_NUM。
-   * 这里做一次尺寸寄存器读回校验，正常不打印；异常时优先排查地址表/FPGA 地址解码/配置覆盖。
+   * 这些写寄存器顺序按“尺寸 -> offset -> gain -> defect”组织，便于对照结构体字段。
+   * 尺寸寄存器会直接决定 IMG_CORR/IMG_WR 本轮处理长度，必须确认读回正确后再启动 STR。
    */
+  bool size_ok = true;
+  pa_pu_trace_write_reg("config_corr", "img_pkg_num", PA_PU_IMG_PKG_NUM_REG, config->pkg_num);
+  size_ok &= pa_pu_write_verify(PA_PU_IMG_PKG_NUM_REG, config->pkg_num, "img_pkg_num");
+  pa_pu_trace_write_reg("config_corr", "img_row_num", PA_PU_IMG_ROW_NUM_REG, config->row_num);
+  size_ok &= pa_pu_write_verify(PA_PU_IMG_ROW_NUM_REG, config->row_num, "img_row_num");
+  pa_pu_trace_write_reg("config_corr", "img_col_num", PA_PU_IMG_COL_NUM_REG, config->col_num);
+  size_ok &= pa_pu_write_verify(PA_PU_IMG_COL_NUM_REG, config->col_num, "img_col_num");
   uint32_t pkg_readback = pa_pu_read(PA_PU_IMG_PKG_NUM_REG);
   uint32_t row_readback = pa_pu_read(PA_PU_IMG_ROW_NUM_REG);
   uint32_t col_readback = pa_pu_read(PA_PU_IMG_COL_NUM_REG);
-  if (pkg_readback != config->pkg_num ||
+  if (!size_ok ||
+      pkg_readback != config->pkg_num ||
       row_readback != config->row_num ||
       col_readback != config->col_num) {
     log_warn("img corr size readback mismatch pkg=%u/0x%08x row=%u/0x%08x col=%u/0x%08x",
@@ -663,13 +829,22 @@ void pa_pu_configure_correction(const pa_pu_corr_config_t* config) {
              config->col_num,
              col_readback);
   }
-  pa_pu_write(PA_PU_IMG_CORR_OFFSET_EN_REG, config->offset_enable ? 1u : 0u);
-  pa_pu_write(PA_PU_IMG_CORR_OFFSET_TEMP_STR_ADDR_REG, config->offset_template_addr);
-  pa_pu_write(PA_PU_IMG_CORR_OFFSET_ADDER_VALUE_REG, config->offset_adder_value);
-  pa_pu_write(PA_PU_IMG_CORR_GAIN_EN_REG, config->gain_enable ? 1u : 0u);
-  pa_pu_write(PA_PU_IMG_CORR_GAIN_TEMP_STR_ADDR_REG, config->gain_template_addr);
-  pa_pu_write(PA_PU_IMG_CORR_GAIN_CLIPPING_VALUE_REG, config->gain_clipping_value);
-  pa_pu_write(PA_PU_WR_IMG_CORR_DEFECT_EN_REG, config->defect_enable ? 1u : 0u);
+  pa_pu_trace_write_reg("config_corr", "img_corr_offset_en", PA_PU_IMG_CORR_OFFSET_EN_REG, config->offset_enable ? 1u : 0u);
+  pa_pu_write_verify(PA_PU_IMG_CORR_OFFSET_EN_REG, config->offset_enable ? 1u : 0u, "img_corr_offset_en");
+  pa_pu_trace_write_reg("config_corr", "img_corr_offset_temp_str_addr", PA_PU_IMG_CORR_OFFSET_TEMP_STR_ADDR_REG, config->offset_template_addr);
+  pa_pu_write_verify(PA_PU_IMG_CORR_OFFSET_TEMP_STR_ADDR_REG, config->offset_template_addr, "img_corr_offset_temp_str_addr");
+  pa_pu_trace_write_reg("config_corr", "img_corr_offset_adder_value", PA_PU_IMG_CORR_OFFSET_ADDER_VALUE_REG, config->offset_adder_value);
+  pa_pu_write_verify(PA_PU_IMG_CORR_OFFSET_ADDER_VALUE_REG, config->offset_adder_value, "img_corr_offset_adder_value");
+  pa_pu_trace_write_reg("config_corr", "img_offset_corr_mode", PA_PU_IMG_OFFSET_CORR_MODE_REG, config->offset_corr_mode);
+  pa_pu_write_verify(PA_PU_IMG_OFFSET_CORR_MODE_REG, config->offset_corr_mode, "img_offset_corr_mode");
+  pa_pu_trace_write_reg("config_corr", "img_corr_gain_en", PA_PU_IMG_CORR_GAIN_EN_REG, config->gain_enable ? 1u : 0u);
+  pa_pu_write_verify(PA_PU_IMG_CORR_GAIN_EN_REG, config->gain_enable ? 1u : 0u, "img_corr_gain_en");
+  pa_pu_trace_write_reg("config_corr", "img_corr_gain_temp_str_addr", PA_PU_IMG_CORR_GAIN_TEMP_STR_ADDR_REG, config->gain_template_addr);
+  pa_pu_write_verify(PA_PU_IMG_CORR_GAIN_TEMP_STR_ADDR_REG, config->gain_template_addr, "img_corr_gain_temp_str_addr");
+  pa_pu_trace_write_reg("config_corr", "img_corr_gain_clipping_value", PA_PU_IMG_CORR_GAIN_CLIPPING_VALUE_REG, config->gain_clipping_value);
+  pa_pu_write_verify(PA_PU_IMG_CORR_GAIN_CLIPPING_VALUE_REG, config->gain_clipping_value, "img_corr_gain_clipping_value");
+  pa_pu_trace_write_reg("config_corr", "img_corr_defect_en", PA_PU_WR_IMG_CORR_DEFECT_EN_REG, config->defect_enable ? 1u : 0u);
+  pa_pu_write_verify(PA_PU_WR_IMG_CORR_DEFECT_EN_REG, config->defect_enable ? 1u : 0u, "img_corr_defect_en");
 }
 
 void pa_pu_configure_templates(void) {
@@ -681,6 +856,7 @@ void pa_pu_configure_templates(void) {
     .offset_enable = CORR_DEFAULT_OFFSET_EN != 0,
     .offset_template_addr = CORR_DEFAULT_OFFSET_ADDR,
     .offset_adder_value = CORR_DEFAULT_OFFSET_ADDER_VALUE,
+    .offset_corr_mode = CORR_DEFAULT_OFFSET_CORR_MODE,
     .gain_enable = CORR_DEFAULT_GAIN_EN != 0,
     .gain_template_addr = CORR_DEFAULT_GAIN_ADDR,
     .gain_clipping_value = CORR_DEFAULT_GAIN_CLIPPING_VALUE,
@@ -708,14 +884,14 @@ void pa_pu_configure_gic(const pa_pu_gic_config_t* config) {
     return;
   }
 
-  pa_pu_write(PA_PU_GIC_REQ_CODE_REG, config->req_code);
-  pa_pu_write(PA_PU_GIC_DOUT_EN_REG, config->dout_enable ? 1u : 0u);
-  pa_pu_write(PA_PU_GIC_LINE_TIME_REG, config->line_time_ns);
-  pa_pu_write(PA_PU_GIC_OE_RAISING_EDGE_REG, config->oe_raising_edge_ns);
-  pa_pu_write(PA_PU_GIC_OE_FALLING_EDGE_REG, config->oe_falling_edge_ns);
-  pa_pu_write(PA_PU_GIC_STR_ROW_NUM_REG, config->start_row);
-  pa_pu_write(PA_PU_GIC_END_ROW_NUM_REG, config->end_row);
-  pa_pu_write(PA_PU_GIC_BINNING_MODE_REG, config->binning_mode);
+  pa_pu_write_traced("config_gic", "gic_req_code", PA_PU_GIC_REQ_CODE_REG, config->req_code);
+  pa_pu_write_traced("config_gic", "gic_dout_en", PA_PU_GIC_DOUT_EN_REG, config->dout_enable ? 1u : 0u);
+  pa_pu_write_traced("config_gic", "gic_line_time", PA_PU_GIC_LINE_TIME_REG, config->line_time_ns);
+  pa_pu_write_traced("config_gic", "gic_oe_raising_edge", PA_PU_GIC_OE_RAISING_EDGE_REG, config->oe_raising_edge_ns);
+  pa_pu_write_traced("config_gic", "gic_oe_falling_edge", PA_PU_GIC_OE_FALLING_EDGE_REG, config->oe_falling_edge_ns);
+  pa_pu_write_traced("config_gic", "gic_str_row_num", PA_PU_GIC_STR_ROW_NUM_REG, config->start_row);
+  pa_pu_write_traced("config_gic", "gic_end_row_num", PA_PU_GIC_END_ROW_NUM_REG, config->end_row);
+  pa_pu_write_traced("config_gic", "gic_binning_mode", PA_PU_GIC_BINNING_MODE_REG, config->binning_mode);
 }
 
 void pa_pu_start_gic(void) {
@@ -793,9 +969,60 @@ void pa_pu_start_correction(void) {
   pa_pu_write(PA_PU_IMG_CORR_STR_REG, 1);
 }
 
+void pa_pu_configure_dync(const pa_pu_dync_config_t* config) {
+  static const uint16_t step_h_regs[PA_PU_DYNC_STEP_COUNT] = {
+    PA_PU_DYNC_STEP_0_CFG_H_REG,
+    PA_PU_DYNC_STEP_1_CFG_H_REG,
+    PA_PU_DYNC_STEP_2_CFG_H_REG,
+    PA_PU_DYNC_STEP_3_CFG_H_REG,
+    PA_PU_DYNC_STEP_4_CFG_H_REG,
+    PA_PU_DYNC_STEP_5_CFG_H_REG,
+    PA_PU_DYNC_STEP_6_CFG_H_REG,
+    PA_PU_DYNC_STEP_7_CFG_H_REG,
+    PA_PU_DYNC_STEP_8_CFG_H_REG,
+    PA_PU_DYNC_STEP_9_CFG_H_REG,
+  };
+  static const uint16_t step_l_regs[PA_PU_DYNC_STEP_COUNT] = {
+    PA_PU_DYNC_STEP_0_CFG_L_REG,
+    PA_PU_DYNC_STEP_1_CFG_L_REG,
+    PA_PU_DYNC_STEP_2_CFG_L_REG,
+    PA_PU_DYNC_STEP_3_CFG_L_REG,
+    PA_PU_DYNC_STEP_4_CFG_L_REG,
+    PA_PU_DYNC_STEP_5_CFG_L_REG,
+    PA_PU_DYNC_STEP_6_CFG_L_REG,
+    PA_PU_DYNC_STEP_7_CFG_L_REG,
+    PA_PU_DYNC_STEP_8_CFG_L_REG,
+    PA_PU_DYNC_STEP_9_CFG_L_REG,
+  };
+
+  if (config == NULL) {
+    return;
+  }
+
+  /*
+   * dynamic 模块一次性下发循环次数、图像环形缓冲范围和步骤表。
+   * 调用者需要先保证 GIC/ROIC/IMG_CORR/IMG_WR 等基础模块参数已经配置到期望值。
+   */
+  pa_pu_write(PA_PU_DYNC_CYCLE_NUM_REG, config->cycle_num);
+  pa_pu_write(PA_PU_DYNC_IMG_STR_ADDR_REG, config->image_start_addr);
+  pa_pu_write(PA_PU_DYNC_IMG_END_ADDR_REG, config->image_end_addr);
+  for (size_t i = 0; i < PA_PU_DYNC_STEP_COUNT; ++i) {
+    pa_pu_write(step_h_regs[i], config->step_cfg_h[i]);
+    pa_pu_write(step_l_regs[i], config->step_cfg_l[i]);
+  }
+}
+
+void pa_pu_start_dync(void) {
+  pa_pu_write(PA_PU_DYNC_STR_REG, 1);
+}
+
+void pa_pu_stop_dync(void) {
+  pa_pu_write(PA_PU_DYNC_STOP_REG, 1);
+}
+
 void pa_pu_configure_image_write(uint32_t image_addr) {
   /* 这里只写首地址，真正开始写图由 IMG_WR_STR 触发。 */
-  pa_pu_write(PA_PU_IMG_WR_STR_ADDR_REG, image_addr);
+  pa_pu_write_traced("config_img_wr", "img_wr_str_addr", PA_PU_IMG_WR_STR_ADDR_REG, image_addr);
 }
 
 void pa_pu_start_capture_triplet(void) {
@@ -803,9 +1030,9 @@ void pa_pu_start_capture_triplet(void) {
    * 软件侧尽量连续写三个启动寄存器，实现“同时启动”的业务语义。
    * FPGA 侧最终时序仍以各模块 STR 采样和内部同步逻辑为准。
    */
-  pa_pu_write(PA_PU_IMG_CORR_STR_REG, 1);
-  pa_pu_write(PA_PU_IMG_WR_STR_REG, 1);
-  pa_pu_write(PA_PU_GIC_STR_REG, 1);
+  pa_pu_write_traced("start_triplet", "img_corr_str", PA_PU_IMG_CORR_STR_REG, 1);
+  pa_pu_write_traced("start_triplet", "img_wr_str", PA_PU_IMG_WR_STR_REG, 1);
+  pa_pu_write_traced("start_triplet", "gic_str", PA_PU_GIC_STR_REG, 1);
 }
 
 void pa_pu_start_image_write(uint32_t image_addr) {

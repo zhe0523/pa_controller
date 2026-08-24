@@ -1,6 +1,7 @@
 #include "work_mode.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -74,6 +75,26 @@ const char* work_mode_phase_name(work_phase_t phase) {
   }
 }
 
+static void work_trace(work_mode_context_t* wm,
+                       const char* phase_name,
+                       const char* step,
+                       uint32_t image_addr) {
+  if (wm == NULL || !wm->trace_enabled) {
+    return;
+  }
+
+  fprintf(stderr,
+          "[TRACE] static_capture capture_id=%u phase=%s step=%s addr=0x%08x state=%s last_int_vector=0x%08x wait_mask=0x%08x\n",
+          wm->status.capture_id,
+          phase_name != NULL ? phase_name : "none",
+          step != NULL ? step : "none",
+          image_addr,
+          work_mode_state_name(wm->status.state),
+          wm->status.last_int_vector,
+          wm->status.last_wait_mask);
+  fflush(stderr);
+}
+
 void work_mode_default_static_idle_config(static_idle_config_t* config) {
   if (config == NULL) {
     return;
@@ -110,6 +131,7 @@ void work_mode_default_static_idle_config(static_idle_config_t* config) {
     .offset_enable = false,
     .offset_template_addr = CORR_DEFAULT_OFFSET_ADDR,
     .offset_adder_value = CORR_DEFAULT_OFFSET_ADDER_VALUE,
+    .offset_corr_mode = CORR_DEFAULT_OFFSET_CORR_MODE,
     .gain_enable = false,
     .gain_template_addr = CORR_DEFAULT_GAIN_ADDR,
     .gain_clipping_value = CORR_DEFAULT_GAIN_CLIPPING_VALUE,
@@ -189,9 +211,17 @@ static int run_idle_clean(work_mode_context_t* wm, const static_idle_config_t* c
   pthread_mutex_unlock(&wm->mutex);
 
   /* 空闲清空只启动 GIC，等待 GIC 完成 bit；不会触发 IMG_WR/IMG_CORR。 */
+  log_info("static idle clean start req=%u dout=%u line_time=%u rows=%u-%u binning=%u",
+           config->clean_gic.req_code,
+           config->clean_gic.dout_enable ? 1u : 0u,
+           config->clean_gic.line_time_ns,
+           config->clean_gic.start_row,
+           config->clean_gic.end_row,
+           config->clean_gic.binning_mode);
   pa_pu_configure_gic(&config->clean_gic);
   pa_pu_prepare_irq_wait();
   pa_pu_start_gic();
+  log_info("static idle clean wait wait_mask=0x%08x", PA_PU_IRQ_GIC_END);
 
   int ret = pa_pu_wait_int_vector(PA_PU_IRQ_GIC_END, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
   pthread_mutex_lock(&wm->mutex);
@@ -200,6 +230,8 @@ static int run_idle_clean(work_mode_context_t* wm, const static_idle_config_t* c
   if (ret <= 0) {
     record_error_locked(wm, ret == 0 ? ETIMEDOUT : EIO, WORK_PHASE_IDLE_CLEAN, PA_PU_IRQ_GIC_END, int_vector);
     log_error("static idle clean failed ret=%d wait_mask=0x%08x int_vector=0x%08x", ret, PA_PU_IRQ_GIC_END, int_vector);
+  } else {
+    log_info("static idle clean done int_vector=0x%08x", int_vector);
   }
   pthread_mutex_unlock(&wm->mutex);
   return ret > 0 ? 0 : -1;
@@ -245,17 +277,24 @@ static int run_capture_phase(work_mode_context_t* wm,
                              uint32_t image_addr) {
   uint32_t int_vector = 0;
 
+  work_trace(wm, phase_name, "phase_enter", image_addr);
+  work_trace(wm, phase_name, "state_lock_begin", image_addr);
   pthread_mutex_lock(&wm->mutex);
+  work_trace(wm, phase_name, "state_lock_acquired", image_addr);
   set_state_locked(wm, state, phase);
   pthread_mutex_unlock(&wm->mutex);
+  work_trace(wm, phase_name, "state_lock_released", image_addr);
 
+  work_trace(wm, phase_name, "wait_idle_begin", image_addr);
   if (wait_capture_modules_idle(phase_name, 1000u) != 0) {
+    work_trace(wm, phase_name, "wait_idle_failed", image_addr);
     pthread_mutex_lock(&wm->mutex);
     record_error_locked(wm, EBUSY, phase, 0, 0);
     pthread_mutex_unlock(&wm->mutex);
     pa_pu_dump_all_registers("wait_idle_failed");
     return -1;
   }
+  work_trace(wm, phase_name, "wait_idle_done", image_addr);
 
   /*
    * 每帧采图的硬件配置顺序：
@@ -264,13 +303,25 @@ static int run_capture_phase(work_mode_context_t* wm,
    * 3. 配置校正模块；
    * 4. 清理上一轮中断后连续写三个 STR 寄存器。
    */
+  work_trace(wm, phase_name, "config_gic_begin", image_addr);
   pa_pu_configure_gic(gic);
+  work_trace(wm, phase_name, "config_gic_done", image_addr);
+  work_trace(wm, phase_name, "config_img_wr_begin", image_addr);
   pa_pu_configure_image_write(image_addr);
+  work_trace(wm, phase_name, "config_img_wr_done", image_addr);
+  work_trace(wm, phase_name, "config_corr_begin", image_addr);
   pa_pu_configure_correction(corr);
+  work_trace(wm, phase_name, "config_corr_done", image_addr);
+  work_trace(wm, phase_name, "prepare_irq_begin", image_addr);
   pa_pu_prepare_irq_wait();
+  work_trace(wm, phase_name, "prepare_irq_done", image_addr);
+  work_trace(wm, phase_name, "start_triplet_begin", image_addr);
   pa_pu_start_capture_triplet();
+  work_trace(wm, phase_name, "start_triplet_done", image_addr);
 
+  work_trace(wm, phase_name, "wait_irq_begin", image_addr);
   int ret = pa_pu_wait_int_vector_all(STATIC_CAPTURE_WAIT_MASK, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
+  work_trace(wm, phase_name, "wait_irq_done", image_addr);
   pthread_mutex_lock(&wm->mutex);
   wm->status.last_int_vector = int_vector;
   wm->status.last_wait_mask = STATIC_CAPTURE_WAIT_MASK;
@@ -378,7 +429,9 @@ static int run_static_capture(work_mode_context_t* wm, const static_idle_config_
            config->dark_corr.gain_template_addr);
 
   /* 曝光窗口结束后先采未校正 light 写 offset 模板，再进入窗口采实际输出图。 */
+  work_trace(wm, "exposure", "wait_begin", bright_addr);
   sleep_ms_interruptible(config->exposure_window_ms);
+  work_trace(wm, "exposure", "wait_done", bright_addr);
   if (run_capture_phase(wm, "bright", WORK_STATE_BRIGHT_CAPTURE, WORK_PHASE_BRIGHT_CAPTURE,
                         &config->bright_gic, &config->bright_corr, bright_addr) != 0) {
     return -1;
@@ -396,11 +449,15 @@ static int run_static_capture(work_mode_context_t* wm, const static_idle_config_
   set_state_locked(wm, WORK_STATE_DARK_WINDOW, WORK_PHASE_DARK_WINDOW);
   pthread_mutex_unlock(&wm->mutex);
 
+  work_trace(wm, "dark_window", "wait_begin", dark_addr);
   sleep_ms_interruptible(config->dark_window_ms);
+  work_trace(wm, "dark_window", "wait_done", dark_addr);
+  work_trace(wm, "dark", "phase_call_begin", dark_addr);
   if (run_capture_phase(wm, "dark", WORK_STATE_DARK_CAPTURE, WORK_PHASE_DARK_CAPTURE,
                         &config->dark_gic, &config->dark_corr, dark_addr) != 0) {
     return -1;
   }
+  work_trace(wm, "dark", "phase_call_done", dark_addr);
 
   log_info("static capture done capture_id=%u offset_addr=0x%08x output_addr=0x%08x",
            wm->status.capture_id,
@@ -590,6 +647,20 @@ int work_mode_start(work_mode_context_t* wm) {
     return -1;
   }
   return 0;
+}
+
+void work_mode_set_trace(work_mode_context_t* wm, bool enabled) {
+  if (wm == NULL || !wm->initialized) {
+    return;
+  }
+
+  /*
+   * trace 只用于现场定位卡死阶段。这里单独加锁修改开关，实际打印处不加锁，
+   * 避免调试日志反过来影响采图状态机和条件变量等待路径。
+   */
+  pthread_mutex_lock(&wm->mutex);
+  wm->trace_enabled = enabled;
+  pthread_mutex_unlock(&wm->mutex);
 }
 
 void work_mode_stop(work_mode_context_t* wm) {

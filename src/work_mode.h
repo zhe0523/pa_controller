@@ -113,6 +113,7 @@ typedef struct work_mode_context {
   bool stop_requested;
   bool pending_capture;
   bool request_done;
+  bool trace_enabled;
   int request_result;
   fpga_mem_t* fpga_mem;
   static_idle_config_t config;
@@ -131,6 +132,8 @@ void work_mode_stop(work_mode_context_t* wm);
 int work_mode_update_static_idle_config(work_mode_context_t* wm, const static_idle_config_t* config);
 /* 读取当前 Static Idle 参数快照。 */
 void work_mode_get_static_idle_config(work_mode_context_t* wm, static_idle_config_t* config);
+/* 调试用：打开后 Static Idle 内部阶段会向 stderr 输出细粒度 trace。 */
+void work_mode_set_trace(work_mode_context_t* wm, bool enabled);
 /* 发起一次同步 Static Idle 采图请求，等待 offset 模板帧和实际输出帧完成后返回。 */
 int work_mode_start_static_idle_capture(work_mode_context_t* wm, work_mode_status_t* result);
 /* 读取工作线程状态快照。 */
