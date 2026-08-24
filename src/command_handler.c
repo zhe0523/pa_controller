@@ -251,6 +251,12 @@ typedef struct {
   bool has_config_write;
 } dync_command_config_t;
 
+typedef struct {
+  uint32_t frames;
+  uint32_t valid_frames;
+  dync_command_config_t dync;
+} dynamic_offset_args_t;
+
 static bool parse_static_idle_loop_args(const char* args, static_idle_loop_config_t* config) {
   char buffer[256];
   if (config == NULL) {
@@ -410,9 +416,6 @@ static void default_dync_command_config(const fpga_mem_t* fpga_mem, dync_command
       command_config->config.image_end_addr =
           fpga_mem->image_pool_phys_base + (uint32_t)fpga_mem->image_pool_map_size - 1u;
     }
-  } else {
-    command_config->config.image_start_addr = FPGA_IMAGE_PTR;
-    command_config->config.image_end_addr = FPGA_IMAGE_PTR + FPGA_IMAGE_UIO_SIZE - 1u;
   }
 }
 
@@ -524,6 +527,94 @@ static bool parse_dync_config_args(const char* args, dync_command_config_t* comm
   }
 
   return true;
+}
+
+static bool parse_dynamic_offset_args(const char* args, dynamic_offset_args_t* config) {
+  char buffer[1024];
+  if (config == NULL) {
+    return false;
+  }
+  if (args == NULL) {
+    return false;
+  }
+  while (*args == ' ') {
+    ++args;
+  }
+  if (*args == '\0' || strlen(args) >= sizeof(buffer)) {
+    return false;
+  }
+
+  strcpy(buffer, args);
+  char* token = strtok(buffer, " ");
+  while (token != NULL) {
+    char* equals = strchr(token, '=');
+    uint32_t value = 0;
+    if (equals == NULL) {
+      return false;
+    }
+
+    *equals = '\0';
+    if (!parse_u32_value(equals + 1, &value)) {
+      return false;
+    }
+
+    const char* step_suffix = NULL;
+    unsigned step_index = 0;
+    if (strcmp(token, "frames") == 0 || strcmp(token, "frame_count") == 0 || strcmp(token, "count") == 0 ||
+        strcmp(token, "total_frames") == 0 || strcmp(token, "total") == 0) {
+      config->frames = value;
+    } else if (strcmp(token, "valid_frames") == 0 ||
+               strcmp(token, "effective_frames") == 0 ||
+               strcmp(token, "valid") == 0 ||
+               strcmp(token, "avg_frames") == 0) {
+      config->valid_frames = value;
+    } else if (strcmp(token, "cycle") == 0 || strcmp(token, "cycle_num") == 0 || strcmp(token, "dync_cycle_num") == 0) {
+      config->dync.config.cycle_num = value;
+      config->dync.has_config_write = true;
+    } else if (strcmp(token, "img_start") == 0 ||
+               strcmp(token, "image_start") == 0 ||
+               strcmp(token, "dync_img_str_addr") == 0) {
+      config->dync.config.image_start_addr = value;
+      config->dync.has_config_write = true;
+    } else if (strcmp(token, "img_end") == 0 ||
+               strcmp(token, "image_end") == 0 ||
+               strcmp(token, "dync_img_end_addr") == 0) {
+      config->dync.config.image_end_addr = value;
+      config->dync.has_config_write = true;
+    } else if (strcmp(token, "wait") == 0 || strcmp(token, "wait_done") == 0) {
+      /*
+       * MAKE_DYNC_OFFSET 本身一定会等待每帧 dynamic 完成。
+       * 接受该字段只是为了和 START_DYNC_WAIT 参数保持兼容。
+       */
+    } else if (parse_dync_step_token(token, &step_suffix, &step_index)) {
+      if (strcmp(step_suffix, "h") == 0 || strcmp(step_suffix, "cfg_h") == 0) {
+        config->dync.config.step_cfg_h[step_index] = value;
+        config->dync.has_config_write = true;
+      } else if (strcmp(step_suffix, "l") == 0 || strcmp(step_suffix, "cfg_l") == 0 || strcmp(step_suffix, "time") == 0) {
+        config->dync.config.step_cfg_l[step_index] = value;
+        config->dync.has_config_write = true;
+      } else if (strcmp(step_suffix, "req") == 0 || strcmp(step_suffix, "req_code") == 0) {
+        config->dync.config.step_cfg_h[step_index] =
+            (config->dync.config.step_cfg_h[step_index] & ~0xffu) | (value & 0xffu);
+        config->dync.has_config_write = true;
+      } else if (strcmp(step_suffix, "en") == 0 || strcmp(step_suffix, "enable") == 0) {
+        if (value != 0) {
+          config->dync.config.step_cfg_h[step_index] |= 0x80000000u;
+        } else {
+          config->dync.config.step_cfg_h[step_index] &= ~0x80000000u;
+        }
+        config->dync.has_config_write = true;
+      } else {
+        return false;
+      }
+    } else {
+      return false;
+    }
+
+    token = strtok(NULL, " ");
+  }
+
+  return config->frames > 0u && config->valid_frames > 0u && config->valid_frames <= config->frames;
 }
 
 static void default_capture_addr_loop_config(const fpga_mem_t* fpga_mem, capture_addr_loop_config_t* config) {
@@ -2107,6 +2198,53 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     return 0;
   }
 
+  if (cmd_has_name(command, "MAKE_DYNC_OFFSET") || cmd_has_name(command, "MAKE_DYNAMIC_OFFSET")) {
+    if (!prepare_manual_hardware_action(ctx, "MAKE_DYNC_OFFSET", response, response_size)) {
+      return 0;
+    }
+
+    /*
+     * 动态模式 offset 模板制作：
+     * frames 为总采集张数，valid_frames 为最后参与均值的有效张数。
+     * 每帧 dynamic 完成后读取 IMG_WR_FINAL_IMG_ADDR，ARM 从对应 uio2 地址取图；
+     * 只有最后 valid_frames 帧会参与逐像素均值。
+     */
+    dynamic_offset_args_t args;
+    memset(&args, 0, sizeof(args));
+    default_dync_command_config(ctx->fpga_mem, &args.dync);
+    if (!parse_dynamic_offset_args(cmd_args(command), &args)) {
+      snprintf(response, response_size, "ERR MAKE_DYNC_OFFSET ARG\r\n");
+      return 0;
+    }
+
+    cal_dynamic_offset_result_t result;
+    memset(&result, 0, sizeof(result));
+    if (calibration_dynamic_offset_make(ctx->fpga_mem,
+                                        &args.dync.config,
+                                        args.dync.has_config_write,
+                                        args.frames,
+                                        args.valid_frames,
+                                        &result) == 0) {
+      pa_pu_corr_config_t corr = default_corr_config(ctx->fpga_mem);
+      pa_pu_configure_correction(&corr);
+      snprintf(response,
+               response_size,
+               "OK MAKE_DYNC_OFFSET frames=%u valid_frames=%u offset_addr=0x%08x last_img_addr=0x%08x int_vector=0x%08x\r\n",
+               result.frames,
+               result.valid_frames,
+               result.offset_addr,
+               result.last_img_addr,
+               result.last_int_vector);
+    } else {
+      snprintf(response,
+               response_size,
+               "ERR MAKE_DYNC_OFFSET frames=%u valid_frames=%u\r\n",
+               args.frames,
+               args.valid_frames);
+    }
+    return 0;
+  }
+
   if (cmd_is(command, "MAKE_GAIN")) {
     if (!prepare_manual_hardware_action(ctx, "MAKE_GAIN", response, response_size)) {
       return 0;
@@ -2351,7 +2489,11 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
      * 同一次写图流程，后续硬件支持持续模式后只需要在这里拆分实现。
      */
     pa_pu_prepare_irq_wait();
-    uint32_t image_addr = ctx->fpga_mem != NULL ? ctx->fpga_mem->image_phys_base : FPGA_IMAGE_PTR;
+    if (ctx->fpga_mem == NULL || ctx->fpga_mem->image_phys_base == 0) {
+      snprintf(response, response_size, "ERR %s NO_IMAGE_UIO\r\n", command);
+      return 0;
+    }
+    uint32_t image_addr = ctx->fpga_mem->image_phys_base;
     pa_pu_start_image_write(image_addr);
     uint32_t int_vector = 0;
     int ret = pa_pu_wait_int_vector(PA_PU_IRQ_IMG_WR_END, PA_PU_IRQ_TIMEOUT_MS, &int_vector);

@@ -69,21 +69,6 @@
 #define COL_OFFSET 0u
 #endif
 
-#ifndef FPGA_IMAGE_PTR
-/* /dev/uio2 实际输出图 DDR 池物理起始地址，写 IMG_WR_STR_ADDR 时使用。 */
-#define FPGA_IMAGE_PTR 0x26A00000u
-#endif
-
-#ifndef FPGA_OFFSET_PTR
-/* /dev/uio0 offset/暗场模板物理起始地址。 */
-#define FPGA_OFFSET_PTR 0x1EA00000u
-#endif
-
-#ifndef FPGA_GAIN_PTR
-/* /dev/uio1 gain/亮场模板物理起始地址。 */
-#define FPGA_GAIN_PTR 0x22A00000u
-#endif
-
 #ifndef FPGA_MEM_MAP_SIZE
 /* /dev/mem fallback 映射窗口大小；正常使用三个 UIO 节点分别映射。 */
 #define FPGA_MEM_MAP_SIZE 0x1F000000u
@@ -99,34 +84,6 @@
 
 #ifndef FPGA_GAIN_UIO_DEVICE
 #define FPGA_GAIN_UIO_DEVICE "/dev/uio1"
-#endif
-
-#ifndef FPGA_IMAGE_UIO_SIZE
-/*
- * /dev/uio2 实际输出图 DDR 池映射大小。
- * 当前从 0x26A00000 到 1GB 顶部 0x40000000，共 0x19600000，只能完整放 9 张图。
- */
-#define FPGA_IMAGE_UIO_SIZE 0x19600000u
-#endif
-
-#ifndef FPGA_OFFSET_UIO_SIZE
-/* /dev/uio0 offset/暗场模板映射大小。 */
-#define FPGA_OFFSET_UIO_SIZE 0x04000000u
-#endif
-
-#ifndef FPGA_GAIN_UIO_SIZE
-/* /dev/uio1 gain/亮场模板映射大小。 */
-#define FPGA_GAIN_UIO_SIZE 0x04000000u
-#endif
-
-#ifndef DDR_IMAGE_POOL_BASE
-/* Static Idle 实际输出图环形池物理起始地址；当前复用 FPGA_IMAGE_PTR。 */
-#define DDR_IMAGE_POOL_BASE FPGA_IMAGE_PTR
-#endif
-
-#ifndef DDR_IMAGE_POOL_UIO_SIZE
-/* Static Idle 实际输出图环形池大小；当前复用 FPGA_IMAGE_UIO_SIZE。 */
-#define DDR_IMAGE_POOL_UIO_SIZE FPGA_IMAGE_UIO_SIZE
 #endif
 
 #ifndef DDR_IMAGE_FRAME_ALIGN
@@ -150,11 +107,6 @@
 #ifndef FPGA_MEM_USE_DEVMEM_FALLBACK
 /* UIO 映射失败时是否回退 /dev/mem；默认关闭，避免误碰裸物理地址。 */
 #define FPGA_MEM_USE_DEVMEM_FALLBACK 0u
-#endif
-
-#ifndef GAIN_TEMPLATE_REPEAT_COUNT
-/* 新亮场 UIO 窗口为 64MB，默认只存放一份有效 gain 模板。 */
-#define GAIN_TEMPLATE_REPEAT_COUNT 1u
 #endif
 
 #ifndef CORR_DEFAULT_ROW_NUM
@@ -182,8 +134,8 @@
 #endif
 
 #ifndef CORR_DEFAULT_OFFSET_ADDR
-/* CONFIG_CORR 默认 offset/暗场模板物理地址，写入 IMG_CORR_OFFSET_TEMP_STR_ADDR。 */
-#define CORR_DEFAULT_OFFSET_ADDR FPGA_OFFSET_PTR
+/* CONFIG_CORR 默认模板地址在启动后由 UIO map0 填充；这里只保留无硬件上下文占位值。 */
+#define CORR_DEFAULT_OFFSET_ADDR 0u
 #endif
 
 #ifndef CORR_DEFAULT_OFFSET_ADDER_VALUE
@@ -202,8 +154,8 @@
 #endif
 
 #ifndef CORR_DEFAULT_GAIN_ADDR
-/* CONFIG_CORR 默认 gain/亮场模板物理地址，写入 IMG_CORR_GAIN_TEMP_STR_ADDR。 */
-#define CORR_DEFAULT_GAIN_ADDR FPGA_GAIN_PTR
+/* CONFIG_CORR 默认模板地址在启动后由 UIO map0 填充；这里只保留无硬件上下文占位值。 */
+#define CORR_DEFAULT_GAIN_ADDR 0u
 #endif
 
 #ifndef CORR_DEFAULT_GAIN_CLIPPING_VALUE
@@ -246,6 +198,11 @@
 #define STATIC_IDLE_CLEAN_INTERVAL_MS 50u
 #endif
 
+#ifndef STATIC_IDLE_CLEAN_LOG_ENABLE
+/* Static Idle 自清空正常流程日志开关；0 仅打印错误，1 打印 start/wait/done。 */
+#define STATIC_IDLE_CLEAN_LOG_ENABLE 0u
+#endif
+
 #ifndef STATIC_IDLE_EXPOSURE_MS
 /* Static Idle 收到采图请求后的曝光窗口时间，单位 ms。 */
 #define STATIC_IDLE_EXPOSURE_MS 50u
@@ -264,6 +221,11 @@
 #ifndef TEMPLATE_GAIN_FILE
 /* gain 模板落盘文件，现场生成后重启仍可加载。 */
 #define TEMPLATE_GAIN_FILE "/usr/local/gain.raw"
+#endif
+
+#ifndef CAL_GAIN_DIR
+/* gain/defect 多灰阶校准的均值图中间文件目录。 */
+#define CAL_GAIN_DIR "/usr/local/calib"
 #endif
 
 #ifndef GIC_DEFAULT_REQ_CODE

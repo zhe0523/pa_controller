@@ -502,7 +502,8 @@ size_t pa_pu_dump_safe_registers(const char* reason, size_t* skipped_out) {
 }
 
 uint32_t pa_pu_read_int_vector(void) {
-  pa_pu_read_irq_probe_registers();
+  // 调试测试使用 后续删除
+  // pa_pu_read_irq_probe_registers();
   return pa_pu_read(PA_PU_INT_VECTOR_REG);
 }
 

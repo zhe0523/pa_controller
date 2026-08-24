@@ -2,12 +2,85 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include "app_config.h"
 #include "log.h"
+
+static const char* uio_device_name(const char* device) {
+  const char* slash = strrchr(device, '/');
+  return slash != NULL ? slash + 1 : device;
+}
+
+static int read_uio_map_value(const char* device, const char* name, unsigned long long* value_out) {
+  char path[160];
+  char text[64];
+
+  if (device == NULL || name == NULL || value_out == NULL) {
+    return -1;
+  }
+
+  /*
+   * 共享 DDR 的物理地址和窗口大小以设备树 UIO map0 为准。
+   * 这样设备树调整内存布局后，应用只需要继续指向正确的 /dev/uioX。
+   */
+  int written = snprintf(path,
+                         sizeof(path),
+                         "/sys/class/uio/%s/maps/map0/%s",
+                         uio_device_name(device),
+                         name);
+  if (written <= 0 || (size_t)written >= sizeof(path)) {
+    log_error("uio sysfs path too long device=%s name=%s", device, name);
+    return -1;
+  }
+
+  FILE* fp = fopen(path, "r");
+  if (fp == NULL) {
+    log_error("open %s failed: %d", path, errno);
+    return -1;
+  }
+
+  if (fscanf(fp, "%63s", text) != 1) {
+    log_error("read %s failed", path);
+    fclose(fp);
+    return -1;
+  }
+  fclose(fp);
+
+  errno = 0;
+  char* end = NULL;
+  unsigned long long value = strtoull(text, &end, 0);
+  if (errno != 0 || end == text || *end != '\0') {
+    log_error("parse %s value=%s failed errno=%d", path, text, errno);
+    return -1;
+  }
+
+  *value_out = value;
+  return 0;
+}
+
+static int read_uio_map_info(const char* device, uint32_t* phys_base_out, size_t* size_out) {
+  unsigned long long addr = 0;
+  unsigned long long size = 0;
+
+  if (read_uio_map_value(device, "addr", &addr) != 0 ||
+      read_uio_map_value(device, "size", &size) != 0) {
+    return -1;
+  }
+
+  if (addr > 0xffffffffull || size == 0 || size > (unsigned long long)((size_t)-1)) {
+    log_error("invalid uio map device=%s addr=0x%llx size=0x%llx", device, addr, size);
+    return -1;
+  }
+
+  *phys_base_out = (uint32_t)addr;
+  *size_out = (size_t)size;
+  return 0;
+}
 
 static int map_uio_region(const char* device, size_t size, uint8_t** ptr_out) {
   /* 所有共享 DDR 都按 UIO map0 映射，返回 fd 供 fpga_mem_close 释放。 */
@@ -53,17 +126,16 @@ static int fpga_mem_open_uio(fpga_mem_t* mem) {
   /*
    * 当前板上只有 uio0/uio1/uio2：
    * uio0/uio1 用于 offset/gain 模板区，uio2 用于 Static Idle 实际输出图环形池。
-   * 物理地址和 size 由 Makefile/app_config.h 显式配置，必须和设备树保持一致。
+   * 物理地址和 size 直接读取 UIO map0，避免 Makefile 与设备树重复维护内存布局。
    */
-  mem->offset_phys_base = FPGA_OFFSET_PTR;
-  mem->gain_phys_base = FPGA_GAIN_PTR;
-  mem->image_phys_base = FPGA_IMAGE_PTR;
-  mem->offset_map_size = FPGA_OFFSET_UIO_SIZE;
-  mem->gain_map_size = FPGA_GAIN_UIO_SIZE;
-  mem->image_map_size = FPGA_IMAGE_UIO_SIZE;
+  if (read_uio_map_info(FPGA_OFFSET_UIO_DEVICE, &mem->offset_phys_base, &mem->offset_map_size) != 0 ||
+      read_uio_map_info(FPGA_GAIN_UIO_DEVICE, &mem->gain_phys_base, &mem->gain_map_size) != 0 ||
+      read_uio_map_info(FPGA_IMAGE_UIO_DEVICE, &mem->image_phys_base, &mem->image_map_size) != 0) {
+    return -1;
+  }
   mem->image_pool = NULL;
-  mem->image_pool_phys_base = DDR_IMAGE_POOL_BASE;
-  mem->image_pool_map_size = DDR_IMAGE_POOL_UIO_SIZE;
+  mem->image_pool_phys_base = mem->image_phys_base;
+  mem->image_pool_map_size = mem->image_map_size;
 
   mem->offset_fd = map_uio_region(FPGA_OFFSET_UIO_DEVICE, mem->offset_map_size, &mem->offset_template);
   if (mem->offset_fd == -1) {
@@ -108,7 +180,7 @@ static int fpga_mem_open_devmem(fpga_mem_t* mem) {
   (void)mem;
   /*
    * 当前三块 DDR 是离散 UIO 区域，不能再按一个 /dev/mem 连续窗口推导偏移。
-   * 正式路径使用 UIO 节点，物理地址仍由 Makefile/app_config.h 显式给出。
+   * 正式路径使用 UIO 节点，物理地址和窗口大小由设备树 UIO map0 给出。
    */
   log_error("split DDR layout requires UIO mapping; /dev/mem fallback is not supported");
   return -1;
@@ -116,8 +188,6 @@ static int fpga_mem_open_devmem(fpga_mem_t* mem) {
 #endif
 
 static bool fpga_mem_layout_is_valid(const fpga_mem_t* mem) {
-  const size_t gain_bytes = (size_t)GAIN_TEMPLATE_REPEAT_COUNT * DEVICE_IMAGE_BYTES;
-
   /* 启动阶段做一次保守检查，避免后续模板生成或采图写地址时越过映射窗口。 */
   if (mem->image_map_size < DEVICE_IMAGE_BYTES) {
     log_error("image uio window too small: need=%lu size=%lu",
@@ -141,9 +211,9 @@ static bool fpga_mem_layout_is_valid(const fpga_mem_t* mem) {
     return false;
   }
 
-  if (mem->gain_map_size != 0 && mem->gain_map_size < gain_bytes) {
+  if (mem->gain_map_size != 0 && mem->gain_map_size < DEVICE_IMAGE_BYTES) {
     log_error("gain uio window too small: need=%lu size=%lu",
-              (unsigned long)gain_bytes,
+              (unsigned long)DEVICE_IMAGE_BYTES,
               (unsigned long)mem->gain_map_size);
     return false;
   }

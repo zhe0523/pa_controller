@@ -1,10 +1,14 @@
 # Makefile for PA controller application
 
+# 交叉编译工具链 bin 目录；Ubuntu 编译时通常指向厂家 SDK 内的 aarch64 gcc。
 TOOLCHAIN_DIR ?= /home/zhe/sdk/kosmo2/pango_config/misc/toolchain/gcc-linaro-7.5.0-2019.12-i686_aarch64-linux-gnu/bin
+# 交叉编译工具前缀；CC/STRIP 默认由它拼出。
 CROSS_COMPILE ?= $(TOOLCHAIN_DIR)/aarch64-linux-gnu-
 ifeq ($(origin CC),default)
+# C 编译器；如 CLion/命令行显式传 CC，则优先使用外部传入值。
 CC = $(CROSS_COMPILE)gcc
 endif
+# strip 工具；deploy 目标用它生成去符号版本。
 STRIP ?= $(CROSS_COMPILE)strip
 
 # 输出目标与构建目录。
@@ -23,57 +27,65 @@ WORK_MODE_AUTO_START ?= 0
 WORK_MODE_DEFAULT_MODE ?= 0
 
 # 开发板部署/运行参数，deploy-board 和 run-board 目标使用。
+# 部署目标板 IP。
 BOARD_HOST ?= 192.168.3.54
+# 部署目标板用户名。
 BOARD_USER ?= root
+# 部署目标板密码；仅 deploy-board/run-board 调试使用。
 BOARD_PASS ?= root
+# 程序复制到目标板后的目录。
 BOARD_DIR ?= /root
+# run-board 远程启动参数；默认走 RS422 串口模式。
 BOARD_RUN_ARGS ?= -d $(RS422_DEVICE) -b $(RS422_BAUD)
+# 非交互 ssh/scp 密码工具；如果已经免密，也可以在命令行覆盖为空或自定义。
 SSHPASS ?= sshpass -p $(BOARD_PASS)
 
 # 编译架构和 PA/PU AXI-lite 寄存器访问入口。
+# ARMv8-A 目标架构，传给 gcc -march。
 ARCH ?= armv8-a
+# PA/PU AXI-lite 寄存器物理基地址；当前寄存器不走 UIO 时由 /dev/mem 使用。
 PA_PU_BASE_ADDR ?= 0x40000000
+# PA/PU 寄存器 UIO 节点；留空表示使用 /dev/mem + PA_PU_BASE_ADDR。
 PA_PU_UIO_DEVICE ?=
 
 # 上位机通讯串口配置。
+# RS422 设备节点。
 RS422_DEVICE ?= /dev/ttyS1
+# RS422 波特率。
 RS422_BAUD ?= 115200
 
 # FPGA 写入 DDR 的整幅图尺寸，以及应用实际处理的有效图像尺寸。
+# FPGA/DDR 中整幅图列数。
 DEVICE_WIDTH ?= 3072
+# FPGA/DDR 中整幅图行数。
 DEVICE_HEIGHT ?= 7680
+# 应用实际参与统计、模板和输出的有效图像列数。
 IMAGE_WIDTH ?= 3072
+# 应用实际参与统计、模板和输出的有效图像行数。
 IMAGE_HEIGHT ?= 7680
 
 # 有效图像在整幅 FPGA 图像中的起始偏移。
+# 有效图像起始列偏移。
 COL_OFFSET ?= 0
+# 有效图像起始行偏移。
 ROW_OFFSET ?= 0
 
 # 三块共享 DDR 对应的 UIO 设备节点。
+# offset/暗场模板 DDR 对应的 UIO 节点。
 FPGA_OFFSET_UIO_DEVICE ?= /dev/uio0
+# gain/亮场模板 DDR 对应的 UIO 节点。
 FPGA_GAIN_UIO_DEVICE ?= /dev/uio1
+# 实际输出图环形池 DDR 对应的 UIO 节点。
 FPGA_IMAGE_UIO_DEVICE ?= /dev/uio2
 
-# 三块共享 DDR 的物理地址和 UIO 窗口大小。
-# 当前布局：
-#   uio0/offset：0x1EA00000，64MB
-#   uio1/gain  ：0x22A00000，64MB
-#   uio2/image ：0x26A00000 ~ 0x40000000，0x19600000
-# 注意：当前单帧步进为 0x02D00000，因此 0x19600000 只能完整容纳 9 张图。
-# 若必须保存 10 张图，uio2 至少需要 0x1C200000，当前 1GB 地址空间放不下。
-FPGA_IMAGE_PTR ?= 0x26A00000
-FPGA_OFFSET_PTR ?= 0x1EA00000
-FPGA_GAIN_PTR ?= 0x22A00000
-FPGA_IMAGE_UIO_SIZE ?= 0x19600000
-FPGA_OFFSET_UIO_SIZE ?= 0x04000000
-FPGA_GAIN_UIO_SIZE ?= 0x04000000
-
-# Static Idle 实际输出图图像池配置。当前图像池复用 /dev/uio2。
-DDR_IMAGE_POOL_BASE ?= $(FPGA_IMAGE_PTR)
-DDR_IMAGE_POOL_UIO_SIZE ?= $(FPGA_IMAGE_UIO_SIZE)
+# 共享 DDR 的物理地址和 UIO 窗口大小由设备树 UIO map0 提供：
+#   /sys/class/uio/uioX/maps/map0/addr
+#   /sys/class/uio/uioX/maps/map0/size
+# 应用启动时自动读取，不再在 Makefile 中重复维护。
+# 输出图环形池单帧首地址/步进对齐；IMG_WR 地址协议至少要求 1KB 对齐。
 DDR_IMAGE_FRAME_ALIGN ?= 4096
-# Static Idle 输出图环形池最大帧数。当前 uio2 空间只能完整放 9 张图。
-DDR_IMAGE_POOL_FRAME_COUNT ?= 2
+# Static Idle 输出图环形池最大帧数；实际不能超过 /dev/uio2 map0/size 可容纳的帧数，目前运行的最大张数是9。
+DDR_IMAGE_POOL_FRAME_COUNT ?= 9
 # Static Idle 第一帧 light 是否先写 uio2 后由 ARM 复制到 offset 模板区。
 # 0 表示 FPGA 直接写 uio0；1 用于定位 FPGA 直写 uio0 是否有风险。
 STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU ?= 0
@@ -81,72 +93,122 @@ STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU ?= 0
 # UIO 打开失败时是否允许回退 /dev/mem，默认关闭。
 FPGA_MEM_USE_DEVMEM_FALLBACK ?= 0
 
-# gain 模板在亮场 DDR 窗口中重复写入的份数。
-# 当前 /dev/uio1 只有 64MB，只能安全保存 1 份 3072x7680x16bit 模板。
-# 这个参数和 uio2 输出图环形池帧数无关，不要用它来扩展可保存图片数量。
-GAIN_TEMPLATE_REPEAT_COUNT ?= 1
-
 # CONFIG_CORR 不带参数时使用的图像校正默认配置。
 # img_pkg_num = 行 * 列 * 2 / 1024，默认 7680x3072x16bit 图像为 46080 包。
+# 默认校正图像行数，写入 IMG_ROW_NUM。
 CORR_DEFAULT_ROW_NUM ?= 7680
+# 默认校正图像列数，写入 IMG_COL_NUM。
 CORR_DEFAULT_COL_NUM ?= 3072
+# 默认图像包数量，写入 IMG_PKG_NUM。
 CORR_DEFAULT_PKG_NUM ?= $(shell expr $(CORR_DEFAULT_ROW_NUM) \* $(CORR_DEFAULT_COL_NUM) \* 2 / 1024)
+# 默认是否启用 offset 校正，写入 IMG_CORR_OFFSET_EN。
 CORR_DEFAULT_OFFSET_EN ?= 1
+# 默认 offset 校正附加值，写入 IMG_CORR_OFFSET_ADDER_VALUE。
 CORR_DEFAULT_OFFSET_ADDER_VALUE ?= 100
+# 默认 offset 校正模式，写入 IMG_OFFSET_CORR_MODE；0=静态 offset，1=动态 offset。
 CORR_DEFAULT_OFFSET_CORR_MODE ?= 0
+# 默认是否启用 gain 校正，写入 IMG_CORR_GAIN_EN。
 CORR_DEFAULT_GAIN_EN ?= 1
+# 默认 gain 限幅值，写入 IMG_CORR_GAIN_CLIPPING_VALUE。
 CORR_DEFAULT_GAIN_CLIPPING_VALUE ?= 55000
-CORR_DEFAULT_DEFECT_EN ?= 0
+# 默认是否启用 defect 校正；当前 defect 通过 gain=0 标记。
+CORR_DEFAULT_DEFECT_EN ?= 1
 
 # START_GIC/START_ROIC/START_CORR/SEND_SINGLE 等命令等待中断的参数。
-# FPGA 正常完成很快，默认 1s 用于尽早暴露异常；调试时可通过 make PA_PU_IRQ_TIMEOUT_MS=500 覆盖。
+# 等待目标中断 bit 的总超时时间，单位 ms。
 PA_PU_IRQ_TIMEOUT_MS ?= 10000
+# 没有加载 /dev/pa_irq 驱动时，程序回退到轮询 INT_VECTOR 的间隔，单位 us。
 PA_PU_IRQ_POLL_INTERVAL_US ?= 10000
-# 无 /dev/pa_irq 回退轮询时，默认用忙等代替 usleep，避免调试阶段卡在 Linux sleep 唤醒。
-PA_PU_IRQ_POLL_BUSY_WAIT ?= 1
+# 无 /dev/pa_irq 回退轮询时是否用忙等代替 usleep；1=忙等，0=usleep。
+PA_PU_IRQ_POLL_BUSY_WAIT ?= 0
+# 忙等模式下每次轮询之间执行的空循环次数；只在 PA_PU_IRQ_POLL_BUSY_WAIT=1 时生效。
 PA_PU_IRQ_POLL_BUSY_SPINS ?= 20000
+# PA/PU F2P 中断驱动节点；存在时优先用驱动阻塞等待，不存在时回退 INT_VECTOR 轮询。
 PA_IRQ_DEVICE ?= /dev/pa_irq
 
 # Static Idle 工作模式默认时间窗口，单位 ms。
+# 空闲自清空间隔时间，单位 ms。
 STATIC_IDLE_CLEAN_INTERVAL_MS ?= 50
+# 收到采图请求后进入亮场采集前的曝光窗口时间，单位 ms。
 STATIC_IDLE_EXPOSURE_MS ?= 50
+# 亮场采集完成后进入暗场采集前的窗口时间，单位 ms。
 STATIC_IDLE_DARK_WINDOW_MS ?= 50
+# Static Idle 自清空正常流程日志开关。0 只打印错误；1 打印 start/wait/done。
+STATIC_IDLE_CLEAN_LOG_ENABLE ?= 0
+
+# 模板和校准中间文件路径。
+# offset 模板落盘文件；MAKE_OFFSET/MAKE_DYNC_OFFSET 成功后写入，启动时 LOAD_TEMPLATE 会读取。
+TEMPLATE_OFFSET_FILE ?= /usr/local/offset.raw
+# gain 模板落盘文件；MAKE_GAIN/CAL_GAIN_BUILD 成功后写入，启动时 LOAD_TEMPLATE 会读取。
+TEMPLATE_GAIN_FILE ?= /usr/local/gain.raw
+# gain/defect 多灰阶校准的均值图中间文件目录。
+CAL_GAIN_DIR ?= /usr/local/calib
 
 # CONFIG_GIC 不带参数时使用的 GIC 时序和行范围默认配置。
+# 默认 GIC 请求码；0=serial scan。
 GIC_DEFAULT_REQ_CODE ?= 0
+# 默认 GIC 是否输出数据；1=输出，0=只清空/不输出。
 GIC_DEFAULT_DOUT_EN ?= 1
+# 默认 GIC 行时间，单位 ns。
 GIC_DEFAULT_LINE_TIME_NS ?= 25600
+# 默认 OE 上升沿位置，单位 ns。
 GIC_DEFAULT_OE_RISE_NS ?= 0
+# 默认 OE 下降沿位置，单位 ns。
 GIC_DEFAULT_OE_FALL_NS ?= 0
+# 默认起始行。
 GIC_DEFAULT_START_ROW ?= 0
+# 默认结束行；默认等于有效图像最后一行。
 GIC_DEFAULT_END_ROW ?= $(shell expr $(IMAGE_HEIGHT) - 1)
+# 默认 GIC binning 模式。
 GIC_DEFAULT_BINNING ?= 0
 
 # CONFIG_ROIC 不带参数时使用的列范围和 binning 默认配置。
+# 默认 ROIC 起始列。
 ROIC_DEFAULT_START_COL ?= 0
+# 默认 ROIC 结束列；默认等于有效图像最后一列。
 ROIC_DEFAULT_END_COL ?= $(shell expr $(IMAGE_WIDTH) - 1)
 
+# 默认 ROIC binning 模式；当前新寄存器表默认 0。
 ROIC_DEFAULT_BINNING ?= 0
 
 # CONFIG_ROIC 下发的 ROIC 芯片寄存器默认值，当前为占位值，现场按 panel 参数覆盖。
+# ROIC 芯片寄存器 0x00 默认值。
 ROIC_DEFAULT_REG_00 ?= 0
+# ROIC 芯片寄存器 0x02 默认值。
 ROIC_DEFAULT_REG_02 ?= 0
+# ROIC 芯片寄存器 0x05 默认值。
 ROIC_DEFAULT_REG_05 ?= 0
+# ROIC 芯片寄存器 0x06 默认值。
 ROIC_DEFAULT_REG_06 ?= 0
+# ROIC 芯片寄存器 0x07 默认值。
 ROIC_DEFAULT_REG_07 ?= 0
+# ROIC 芯片寄存器 0x09 默认值。
 ROIC_DEFAULT_REG_09 ?= 0
+# ROIC 芯片寄存器 0x0A 默认值。
 ROIC_DEFAULT_REG_0A ?= 0
+# ROIC 芯片寄存器 0x0B 默认值。
 ROIC_DEFAULT_REG_0B ?= 0
+# ROIC 芯片寄存器 0x0C 默认值。
 ROIC_DEFAULT_REG_0C ?= 0
+# ROIC 芯片寄存器 0x0D 默认值。
 ROIC_DEFAULT_REG_0D ?= 0
+# ROIC 芯片寄存器 0x0E 默认值。
 ROIC_DEFAULT_REG_0E ?= 0
+# ROIC 芯片寄存器 0x0F 默认值。
 ROIC_DEFAULT_REG_0F ?= 0
+# ROIC 芯片寄存器 0x10 默认值。
 ROIC_DEFAULT_REG_10 ?= 0
+# ROIC 芯片寄存器 0x11 默认值。
 ROIC_DEFAULT_REG_11 ?= 0
+# ROIC 芯片寄存器 0x17 默认值。
 ROIC_DEFAULT_REG_17 ?= 0
+# ROIC 芯片寄存器 0x24 默认值。
 ROIC_DEFAULT_REG_24 ?= 0
+# ROIC 芯片寄存器 0x28 默认值。
 ROIC_DEFAULT_REG_28 ?= 0
+# ROIC 芯片寄存器 0x2D 默认值。
 ROIC_DEFAULT_REG_2D ?= 0
+# ROIC 芯片寄存器 0x3B 默认值。
 ROIC_DEFAULT_REG_3B ?= 0
 
 CFLAGS = -Wall -Wextra -O2 -g -std=c11 -D_GNU_SOURCE
@@ -167,19 +229,10 @@ CFLAGS += -DCOL_OFFSET=$(COL_OFFSET) -DROW_OFFSET=$(ROW_OFFSET)
 CFLAGS += -DFPGA_IMAGE_UIO_DEVICE='"$(FPGA_IMAGE_UIO_DEVICE)"'
 CFLAGS += -DFPGA_OFFSET_UIO_DEVICE='"$(FPGA_OFFSET_UIO_DEVICE)"'
 CFLAGS += -DFPGA_GAIN_UIO_DEVICE='"$(FPGA_GAIN_UIO_DEVICE)"'
-CFLAGS += -DFPGA_IMAGE_PTR=$(FPGA_IMAGE_PTR)
-CFLAGS += -DFPGA_OFFSET_PTR=$(FPGA_OFFSET_PTR)
-CFLAGS += -DFPGA_GAIN_PTR=$(FPGA_GAIN_PTR)
-CFLAGS += -DFPGA_IMAGE_UIO_SIZE=$(FPGA_IMAGE_UIO_SIZE)
-CFLAGS += -DFPGA_OFFSET_UIO_SIZE=$(FPGA_OFFSET_UIO_SIZE)
-CFLAGS += -DFPGA_GAIN_UIO_SIZE=$(FPGA_GAIN_UIO_SIZE)
-CFLAGS += -DDDR_IMAGE_POOL_BASE=$(DDR_IMAGE_POOL_BASE)
-CFLAGS += -DDDR_IMAGE_POOL_UIO_SIZE=$(DDR_IMAGE_POOL_UIO_SIZE)
 CFLAGS += -DDDR_IMAGE_FRAME_ALIGN=$(DDR_IMAGE_FRAME_ALIGN)
 CFLAGS += -DDDR_IMAGE_POOL_FRAME_COUNT=$(DDR_IMAGE_POOL_FRAME_COUNT)
 CFLAGS += -DSTATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU=$(STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU)
 CFLAGS += -DFPGA_MEM_USE_DEVMEM_FALLBACK=$(FPGA_MEM_USE_DEVMEM_FALLBACK)
-CFLAGS += -DGAIN_TEMPLATE_REPEAT_COUNT=$(GAIN_TEMPLATE_REPEAT_COUNT)
 CFLAGS += -DCORR_DEFAULT_PKG_NUM=$(CORR_DEFAULT_PKG_NUM)
 CFLAGS += -DCORR_DEFAULT_ROW_NUM=$(CORR_DEFAULT_ROW_NUM)
 CFLAGS += -DCORR_DEFAULT_COL_NUM=$(CORR_DEFAULT_COL_NUM)
@@ -195,8 +248,12 @@ CFLAGS += -DPA_PU_IRQ_POLL_BUSY_WAIT=$(PA_PU_IRQ_POLL_BUSY_WAIT)
 CFLAGS += -DPA_PU_IRQ_POLL_BUSY_SPINS=$(PA_PU_IRQ_POLL_BUSY_SPINS)
 CFLAGS += -DPA_IRQ_DEVICE='"$(PA_IRQ_DEVICE)"'
 CFLAGS += -DSTATIC_IDLE_CLEAN_INTERVAL_MS=$(STATIC_IDLE_CLEAN_INTERVAL_MS)
+CFLAGS += -DSTATIC_IDLE_CLEAN_LOG_ENABLE=$(STATIC_IDLE_CLEAN_LOG_ENABLE)
 CFLAGS += -DSTATIC_IDLE_EXPOSURE_MS=$(STATIC_IDLE_EXPOSURE_MS)
 CFLAGS += -DSTATIC_IDLE_DARK_WINDOW_MS=$(STATIC_IDLE_DARK_WINDOW_MS)
+CFLAGS += -DTEMPLATE_OFFSET_FILE='"$(TEMPLATE_OFFSET_FILE)"'
+CFLAGS += -DTEMPLATE_GAIN_FILE='"$(TEMPLATE_GAIN_FILE)"'
+CFLAGS += -DCAL_GAIN_DIR='"$(CAL_GAIN_DIR)"'
 CFLAGS += -DGIC_DEFAULT_REQ_CODE=$(GIC_DEFAULT_REQ_CODE)
 CFLAGS += -DGIC_DEFAULT_DOUT_EN=$(GIC_DEFAULT_DOUT_EN)
 CFLAGS += -DGIC_DEFAULT_LINE_TIME_NS=$(GIC_DEFAULT_LINE_TIME_NS)
@@ -283,10 +340,10 @@ config:
 	@echo "DEVICE = $(DEVICE_WIDTH)x$(DEVICE_HEIGHT)"
 	@echo "IMAGE = $(IMAGE_WIDTH)x$(IMAGE_HEIGHT)"
 	@echo "OFFSET = ($(COL_OFFSET),$(ROW_OFFSET))"
-	@echo "FPGA_IMAGE = ptr=$(FPGA_IMAGE_PTR) uio=$(FPGA_IMAGE_UIO_DEVICE) size=$(FPGA_IMAGE_UIO_SIZE)"
-	@echo "FPGA_OFFSET = ptr=$(FPGA_OFFSET_PTR) uio=$(FPGA_OFFSET_UIO_DEVICE) size=$(FPGA_OFFSET_UIO_SIZE)"
-	@echo "FPGA_GAIN = ptr=$(FPGA_GAIN_PTR) uio=$(FPGA_GAIN_UIO_DEVICE) size=$(FPGA_GAIN_UIO_SIZE) repeat=$(GAIN_TEMPLATE_REPEAT_COUNT)"
-	@echo "DDR_IMAGE_POOL = base=$(DDR_IMAGE_POOL_BASE) size=$(DDR_IMAGE_POOL_UIO_SIZE) frame_align=$(DDR_IMAGE_FRAME_ALIGN) frame_count=$(DDR_IMAGE_POOL_FRAME_COUNT) bright_to_offset_via_cpu=$(STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU)"
+	@echo "FPGA_IMAGE = uio=$(FPGA_IMAGE_UIO_DEVICE) phys/size=read-from-uio-map0"
+	@echo "FPGA_OFFSET = uio=$(FPGA_OFFSET_UIO_DEVICE) phys/size=read-from-uio-map0"
+	@echo "FPGA_GAIN = uio=$(FPGA_GAIN_UIO_DEVICE) phys/size=read-from-uio-map0"
+	@echo "DDR_IMAGE_POOL = uio=$(FPGA_IMAGE_UIO_DEVICE) frame_align=$(DDR_IMAGE_FRAME_ALIGN) frame_count=$(DDR_IMAGE_POOL_FRAME_COUNT) bright_to_offset_via_cpu=$(STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU)"
 	@echo "CORR = pkg=$(CORR_DEFAULT_PKG_NUM) image=$(CORR_DEFAULT_COL_NUM)x$(CORR_DEFAULT_ROW_NUM) offset_en=$(CORR_DEFAULT_OFFSET_EN) offset_adder=$(CORR_DEFAULT_OFFSET_ADDER_VALUE) offset_mode=$(CORR_DEFAULT_OFFSET_CORR_MODE) gain_en=$(CORR_DEFAULT_GAIN_EN) gain_clip=$(CORR_DEFAULT_GAIN_CLIPPING_VALUE) defect_en=$(CORR_DEFAULT_DEFECT_EN)"
 	@echo "IRQ = timeout_ms=$(PA_PU_IRQ_TIMEOUT_MS) poll_interval_us=$(PA_PU_IRQ_POLL_INTERVAL_US)"
 	@echo "IRQ_POLL = busy_wait=$(PA_PU_IRQ_POLL_BUSY_WAIT) busy_spins=$(PA_PU_IRQ_POLL_BUSY_SPINS)"

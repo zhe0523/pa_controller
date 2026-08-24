@@ -37,8 +37,9 @@ make CORR_DEFAULT_ROW_NUM=7680 CORR_DEFAULT_COL_NUM=3072 \
      CORR_DEFAULT_GAIN_CLIPPING_VALUE=55000
 ```
 
-offset/gain/image 的物理地址和 UIO size 通过 Makefile 配置，必须和设备树中的
-UIO 布局保持一致。
+offset/gain/image 的物理地址和 UIO size 由设备树中的 UIO map0 描述。程序启动时会从
+`/sys/class/uio/uioX/maps/map0/addr` 和 `size` 自动读取，Makefile 只需要配置使用哪个
+`/dev/uioX`。
 
 可用 `make config` 查看当前构建参数展开后的默认值。
 
@@ -50,25 +51,27 @@ UIO 布局保持一致。
 /dev/uio2 -> 实际输出图环形图像池
 ```
 
-当前默认物理地址和窗口大小：
+可以在板端用下面的方式确认设备树实际暴露出来的物理地址和窗口大小：
 
-```text
-FPGA_OFFSET_PTR=0x1EA00000 FPGA_OFFSET_UIO_SIZE=0x04000000
-FPGA_GAIN_PTR=0x22A00000 FPGA_GAIN_UIO_SIZE=0x04000000
-FPGA_IMAGE_PTR=0x26A00000 FPGA_IMAGE_UIO_SIZE=0x19600000
+```sh
+cat /sys/class/uio/uio0/maps/map0/addr
+cat /sys/class/uio/uio0/maps/map0/size
+cat /sys/class/uio/uio1/maps/map0/addr
+cat /sys/class/uio/uio1/maps/map0/size
+cat /sys/class/uio/uio2/maps/map0/addr
+cat /sys/class/uio/uio2/maps/map0/size
 ```
 
 对应构建参数：
 
 ```sh
-make FPGA_OFFSET_UIO_DEVICE=/dev/uio0 FPGA_OFFSET_PTR=0x1EA00000 FPGA_OFFSET_UIO_SIZE=0x04000000 \
-     FPGA_GAIN_UIO_DEVICE=/dev/uio1 FPGA_GAIN_PTR=0x22A00000 FPGA_GAIN_UIO_SIZE=0x04000000 \
-     FPGA_IMAGE_UIO_DEVICE=/dev/uio2 FPGA_IMAGE_PTR=0x26A00000 FPGA_IMAGE_UIO_SIZE=0x19600000
+make FPGA_OFFSET_UIO_DEVICE=/dev/uio0 \
+     FPGA_GAIN_UIO_DEVICE=/dev/uio1 \
+     FPGA_IMAGE_UIO_DEVICE=/dev/uio2
 ```
 
-`GAIN_TEMPLATE_REPEAT_COUNT` 默认是 `1`。当前 3072×7680 的 16bit 图像一帧约 45MB，
-64MB 的亮场 UIO 窗口只能稳定放一份完整 gain 模板；如果后续重新扩大亮场窗口，可在
-构建时改回多份。
+gain 区只保存一份完整模板。当前 3072×7680 的 16bit 图像一帧约 45MB，
+64MB 的亮场 UIO 窗口可以稳定容纳一份 gain 模板。
 
 GIC/ROIC 默认配置也可以在构建时覆盖，例如：
 
@@ -174,8 +177,9 @@ GET_TIME          -> 读取 Linux 本机当前时间，TIME 等价
 DUMP_REGS         -> 打印 PA/PU 寄存器快照到日志，跳过 read-clear 中断寄存器
 READ_REG          -> 直接读取 PA/PU 寄存器，支持寄存器名、偏移或绝对地址
 WRITE_REG         -> 直接写 PA/PU 寄存器，支持寄存器名、偏移或绝对地址
-LOAD_TEMPLATE     -> 从 /usr/local/offset.raw 和 /usr/local/gain.raw 加载模板
+LOAD_TEMPLATE     -> 从 TEMPLATE_OFFSET_FILE 和 TEMPLATE_GAIN_FILE 配置的路径加载模板
 MAKE_OFFSET       -> 用当前 FPGA 图像生成 offset 模板
+MAKE_DYNC_OFFSET  -> 动态模式采集多帧，并对最后有效帧逐像素均值生成 offset 模板，MAKE_DYNAMIC_OFFSET 等价
 MAKE_GAIN         -> 用当前 FPGA 图像和 offset 模板生成 gain 模板
 CONFIG_TEMPLATE   -> 将 offset/gain 物理地址配置给 PA
 CONFIG_CORR       -> 将图像校正尺寸、模板地址、offset 模式和 offset/gain/defect 使能配置给 PA
@@ -376,8 +380,8 @@ CONFIG_GIC gic_req_code=0 gic_dout_en=1 gic_line_time=100000 gic_oe_raising_edge
 其它 -> 1x1
 ```
 
-`CONFIG_CORR` 不带参数时使用默认图像尺寸，模板地址默认来自 `FPGA_OFFSET_PTR` 和
-`FPGA_GAIN_PTR`；也可以用 `key=value` 临时覆盖：
+`CONFIG_CORR` 不带参数时使用默认图像尺寸，模板地址默认来自当前 UIO map0 读取到的
+offset/gain 物理地址；也可以用 `key=value` 临时覆盖：
 
 ```text
 CONFIG_CORR pkg=46080 row=7680 col=3072 offset_en=1 offset_addr=0x1EA00000 offset_adder=100 offset_mode=0 gain_en=1 gain_addr=0x22A00000 gain_clip=55000 defect_en=0
@@ -608,8 +612,8 @@ ROIC 完成中断 bit。
 -> 对每个像素做多帧平均
 -> 检查均值、最大值、行噪声和相对旧模板的变化
 -> 通过后写入 FPGA offset_template
--> 先写 /usr/local/offset.raw.tmp
--> 校验大小成功后 rename 为 /usr/local/offset.raw
+-> 先写 TEMPLATE_OFFSET_FILE 对应的临时文件
+-> 校验大小成功后 rename 为 TEMPLATE_OFFSET_FILE
 -> 重新配置 PA 模板地址
 ```
 
@@ -625,6 +629,47 @@ ROIC 完成中断 bit。
 ```
 
 默认建议从 `8` 帧平均开始，空闲稳定时间暂按 `3000 ms`，质量门槛需用真实暗场样例校准。
+
+### 动态模式 Offset 模板
+
+`MAKE_DYNC_OFFSET` / `MAKE_DYNAMIC_OFFSET` 用 dynamic 模式采集多帧图像，并对最后几帧做
+点对点均值，结果同时写入 `TEMPLATE_OFFSET_FILE` 和 `/dev/uio0` 对应的 offset 模板区。
+`TEMPLATE_OFFSET_FILE` 默认是 `/usr/local/offset.raw`，可在 Makefile 中覆盖；写文件前
+程序会自动创建父目录。
+
+需要同时传入总采集张数 `frames` 和有效张数 `valid_frames`：
+
+```text
+MAKE_DYNC_OFFSET frames=12 valid_frames=8
+```
+
+上面的例子会真实采集 12 帧，前 4 帧只用于曝光/链路稳定，最后 8 帧参与均值。
+
+如果前面已经通过 `CONFIG_DYNC` 配置过 dynamic step，上面命令会直接复用当前 dynamic
+寄存器配置。也可以在同一条命令里附带 dynamic 配置参数，参数格式与 `START_DYNC_WAIT`
+一致：
+
+```text
+MAKE_DYNC_OFFSET frames=12 valid_frames=8 cycle=1 img_start=0x26A00000 img_end=0x3FFFFFFF step0_en=1 step0_req=4 step0_time=50
+```
+
+执行流程：
+
+```text
+1. 停止 Static Idle 后台工作线程，独占 PA/PU 寄存器
+2. 如命令中带 dynamic 参数，则先下发 dynamic 配置
+3. 重复 frames 次：启动 DYNC_STR，等待 dync_state 变低，再等待 dynamic interrupt bit5
+4. 每帧完成后读取 IMG_WR_FINAL_IMG_ADDR，换算到 uio2 虚拟地址并读取图像
+5. 前 frames - valid_frames 帧丢弃，只对最后 valid_frames 帧逐像素累加求均值
+6. 将均值图写入 offset 模板区和 TEMPLATE_OFFSET_FILE
+7. 重新下发 CONFIG_CORR 默认配置，使后续校正使用新的 offset 模板
+```
+
+回包示例：
+
+```text
+OK MAKE_DYNC_OFFSET frames=12 valid_frames=8 offset_addr=0x1ea00000 last_img_addr=0x26a00000 int_vector=0x00000020
+```
 
 ## 与项目要求的对应关系
 

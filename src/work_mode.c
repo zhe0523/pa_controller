@@ -210,6 +210,7 @@ static int run_idle_clean(work_mode_context_t* wm, const static_idle_config_t* c
   set_state_locked(wm, WORK_STATE_IDLE_CLEANING, WORK_PHASE_IDLE_CLEAN);
   pthread_mutex_unlock(&wm->mutex);
 
+#if STATIC_IDLE_CLEAN_LOG_ENABLE
   /* 空闲清空只启动 GIC，等待 GIC 完成 bit；不会触发 IMG_WR/IMG_CORR。 */
   log_info("static idle clean start req=%u dout=%u line_time=%u rows=%u-%u binning=%u",
            config->clean_gic.req_code,
@@ -218,10 +219,13 @@ static int run_idle_clean(work_mode_context_t* wm, const static_idle_config_t* c
            config->clean_gic.start_row,
            config->clean_gic.end_row,
            config->clean_gic.binning_mode);
+#endif
   pa_pu_configure_gic(&config->clean_gic);
   pa_pu_prepare_irq_wait();
   pa_pu_start_gic();
+#if STATIC_IDLE_CLEAN_LOG_ENABLE
   log_info("static idle clean wait wait_mask=0x%08x", PA_PU_IRQ_GIC_END);
+#endif
 
   int ret = pa_pu_wait_int_vector(PA_PU_IRQ_GIC_END, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
   pthread_mutex_lock(&wm->mutex);
@@ -230,9 +234,12 @@ static int run_idle_clean(work_mode_context_t* wm, const static_idle_config_t* c
   if (ret <= 0) {
     record_error_locked(wm, ret == 0 ? ETIMEDOUT : EIO, WORK_PHASE_IDLE_CLEAN, PA_PU_IRQ_GIC_END, int_vector);
     log_error("static idle clean failed ret=%d wait_mask=0x%08x int_vector=0x%08x", ret, PA_PU_IRQ_GIC_END, int_vector);
-  } else {
+  }
+#if STATIC_IDLE_CLEAN_LOG_ENABLE
+  else {
     log_info("static idle clean done int_vector=0x%08x", int_vector);
   }
+#endif
   pthread_mutex_unlock(&wm->mutex);
   return ret > 0 ? 0 : -1;
 }

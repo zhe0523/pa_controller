@@ -1,9 +1,11 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "fpga_mem.h"
+#include "pa_pu.h"
 
 /*
  * 多灰阶 gain/坏点模板制作接口。
@@ -52,3 +54,25 @@ void calibration_gain_cancel(void);
 
 /* 获取当前校准任务状态。 */
 void calibration_gain_get_status(cal_gain_status_t* status);
+
+typedef struct {
+  uint32_t frames;
+  uint32_t valid_frames;
+  uint32_t offset_addr;
+  uint32_t last_img_addr;
+  uint32_t last_int_vector;
+} cal_dynamic_offset_result_t;
+
+/*
+ * 动态模式 offset 模板制作。
+ *
+ * 调用者可选择先下发 dynamic 配置，然后按 frames 次重复启动 dynamic。
+ * 前面的 frames - valid_frames 帧只用于曝光/链路稳定，最后 valid_frames 帧
+ * 才参与逐像素均值。均值结果会同时写入 TEMPLATE_OFFSET_FILE 和 FPGA offset 模板 DDR。
+ */
+int calibration_dynamic_offset_make(fpga_mem_t* mem,
+                                    const pa_pu_dync_config_t* dync_config,
+                                    bool write_dync_config,
+                                    uint32_t frames,
+                                    uint32_t valid_frames,
+                                    cal_dynamic_offset_result_t* result);
