@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "fpga_mem.h"
 
 /*
@@ -18,3 +20,8 @@ int template_make_offset(fpga_mem_t* mem);
 
 /* 用当前原始图像和 offset 模板生成 gain 模板，并同时写入文件和 FPGA 模板内存。 */
 int template_make_gain(fpga_mem_t* mem);
+
+/* 后台模板任务使用的可取消版本；回调在行边界返回 true 时安全退出。 */
+typedef bool (*template_cancel_fn)(void* opaque);
+int template_make_offset_cancellable(fpga_mem_t* mem, template_cancel_fn cancel, void* opaque);
+int template_make_gain_cancellable(fpga_mem_t* mem, template_cancel_fn cancel, void* opaque);

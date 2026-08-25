@@ -219,6 +219,7 @@ typedef struct {
 
 static pa_pu_gic_config_t default_gic_config(void);
 static pa_pu_corr_config_t default_corr_config(const fpga_mem_t* fpga_mem);
+static pa_pu_img_upload_config_t default_img_upload_config(const fpga_mem_t* fpga_mem);
 static bool parse_float_value(const char* text, float* value);
 
 typedef struct {
@@ -247,7 +248,6 @@ typedef struct {
 typedef struct {
   /* dynamic 模块调试配置；默认使用当前 uio2 图像池作为环形输出范围。 */
   pa_pu_dync_config_t config;
-  bool wait_done;
   bool has_config_write;
 } dync_command_config_t;
 
@@ -256,6 +256,12 @@ typedef struct {
   uint32_t valid_frames;
   dync_command_config_t dync;
 } dynamic_offset_args_t;
+
+typedef struct {
+  pa_pu_img_upload_config_t config;
+  bool wait_done;
+  const char* source_name;
+} img_upload_command_config_t;
 
 static bool parse_static_idle_loop_args(const char* args, static_idle_loop_config_t* config) {
   char buffer[256];
@@ -409,14 +415,28 @@ static void default_dync_command_config(const fpga_mem_t* fpga_mem, dync_command
   }
 
   memset(command_config, 0, sizeof(*command_config));
-  command_config->config.cycle_num = 1u;
-  if (fpga_mem != NULL) {
-    command_config->config.image_start_addr = fpga_mem->image_pool_phys_base;
-    if (fpga_mem->image_pool_map_size > 0u) {
-      command_config->config.image_end_addr =
-          fpga_mem->image_pool_phys_base + (uint32_t)fpga_mem->image_pool_map_size - 1u;
-    }
+  dynamic_mode_config_t defaults;
+  if (fpga_mem != NULL && dynamic_mode_default_config(fpga_mem, &defaults) == 0) {
+    command_config->config = defaults.dync;
+    return;
   }
+
+  /* 无有效 UIO 上下文时仍保留 Makefile 默认 cycle/step，供参数解析和错误回包使用。 */
+  command_config->config.cycle_num = DYNAMIC_CYCLE_NUM;
+  command_config->config.image_start_addr = DYNAMIC_IMG_START_ADDR;
+  command_config->config.image_end_addr = DYNAMIC_IMG_END_ADDR;
+  const uint32_t default_step_h[PA_PU_DYNC_STEP_COUNT] = {
+    DYNAMIC_STEP_0_CFG_H, DYNAMIC_STEP_1_CFG_H, DYNAMIC_STEP_2_CFG_H, DYNAMIC_STEP_3_CFG_H,
+    DYNAMIC_STEP_4_CFG_H, DYNAMIC_STEP_5_CFG_H, DYNAMIC_STEP_6_CFG_H, DYNAMIC_STEP_7_CFG_H,
+    DYNAMIC_STEP_8_CFG_H, DYNAMIC_STEP_9_CFG_H,
+  };
+  const uint32_t default_step_l[PA_PU_DYNC_STEP_COUNT] = {
+    DYNAMIC_STEP_0_CFG_L, DYNAMIC_STEP_1_CFG_L, DYNAMIC_STEP_2_CFG_L, DYNAMIC_STEP_3_CFG_L,
+    DYNAMIC_STEP_4_CFG_L, DYNAMIC_STEP_5_CFG_L, DYNAMIC_STEP_6_CFG_L, DYNAMIC_STEP_7_CFG_L,
+    DYNAMIC_STEP_8_CFG_L, DYNAMIC_STEP_9_CFG_L,
+  };
+  memcpy(command_config->config.step_cfg_h, default_step_h, sizeof(default_step_h));
+  memcpy(command_config->config.step_cfg_l, default_step_l, sizeof(default_step_l));
 }
 
 static bool parse_dync_step_token(const char* name, const char** suffix_out, unsigned* index_out) {
@@ -497,7 +517,7 @@ static bool parse_dync_config_args(const char* args, dync_command_config_t* comm
       command_config->config.image_end_addr = value;
       command_config->has_config_write = true;
     } else if (strcmp(token, "wait") == 0 || strcmp(token, "wait_done") == 0) {
-      command_config->wait_done = value != 0;
+      /* 兼容旧调试脚本中的字段，但 START_DYNC 永远按非阻塞方式执行。 */
     } else if (parse_dync_step_token(token, &step_suffix, &step_index)) {
       if (strcmp(step_suffix, "h") == 0 || strcmp(step_suffix, "cfg_h") == 0) {
         command_config->config.step_cfg_h[step_index] = value;
@@ -583,8 +603,8 @@ static bool parse_dynamic_offset_args(const char* args, dynamic_offset_args_t* c
       config->dync.has_config_write = true;
     } else if (strcmp(token, "wait") == 0 || strcmp(token, "wait_done") == 0) {
       /*
-       * MAKE_DYNC_OFFSET 本身一定会等待每帧 dynamic 完成。
-       * 接受该字段只是为了和 START_DYNC_WAIT 参数保持兼容。
+       * MAKE_DYNC_OFFSET 后台任务内部会等待每帧 dynamic 完成。
+       * 接受该字段仅用于兼容早期调试参数，命令本身始终立即返回。
        */
     } else if (parse_dync_step_token(token, &step_suffix, &step_index)) {
       if (strcmp(step_suffix, "h") == 0 || strcmp(step_suffix, "cfg_h") == 0) {
@@ -893,6 +913,15 @@ static const register_name_t k_register_names[] = {
   {"dync_state", PA_PU_DYNC_STATE_REG},
   {"dync_debug_in", PA_PU_DYNC_DEBUG_IN_REG},
   {"dync_debug_out", PA_PU_DYNC_DEBUG_OUT_REG},
+  {"img_upload_str", PA_PU_IMG_UPLOAD_STR_REG},
+  {"img_upload_str_addr", PA_PU_IMG_UPLOAD_STR_ADDR_REG},
+  {"img_upload_addr", PA_PU_IMG_UPLOAD_STR_ADDR_REG},
+  {"img_upload_pkg_num", PA_PU_IMG_UPLOAD_PKG_NUM_REG},
+  {"img_upload_row_num", PA_PU_IMG_UPLOAD_ROW_NUM_REG},
+  {"img_upload_col_num", PA_PU_IMG_UPLOAD_COL_NUM_REG},
+  {"img_upload_state", PA_PU_IMG_UPLOAD_STATE_REG},
+  {"img_upload_end", PA_PU_IMG_UPLOAD_END_REG},
+  {"img_upload_dfx", PA_PU_IMG_UPLOAD_DFX_REG},
 };
 
 static bool lookup_register_name(const char* name, uint16_t* reg) {
@@ -1089,6 +1118,131 @@ static bool parse_corr_config_args(const char* args, pa_pu_corr_config_t* config
   }
 
   return true;
+}
+
+static pa_pu_img_upload_config_t default_img_upload_config(const fpga_mem_t* fpga_mem) {
+  uint32_t default_addr = IMG_UPLOAD_DEFAULT_ADDR;
+  if (default_addr == 0u && fpga_mem != NULL) {
+    /* IMG_UPLOAD 只用于模板回传，默认选择 uio0 中的 offset 模板。 */
+    default_addr = fpga_mem->offset_phys_base;
+  }
+
+  pa_pu_img_upload_config_t config = {
+    .image_addr = default_addr,
+    .pkg_num = IMG_UPLOAD_DEFAULT_PKG_NUM,
+    .row_num = IMG_UPLOAD_DEFAULT_ROW_NUM,
+    .col_num = IMG_UPLOAD_DEFAULT_COL_NUM,
+  };
+  return config;
+}
+
+static bool parse_img_upload_args(const char* args, img_upload_command_config_t* command_config) {
+  char buffer[256];
+  bool pkg_set = false;
+  if (command_config == NULL || args == NULL) {
+    return false;
+  }
+  if (strlen(args) >= sizeof(buffer)) {
+    return false;
+  }
+
+  strcpy(buffer, args);
+  char* token = strtok(buffer, " ");
+  while (token != NULL) {
+    char* equals = strchr(token, '=');
+    if (equals == NULL) {
+      return false;
+    }
+
+    *equals = '\0';
+    const char* value_text = equals + 1;
+    if (strcmp(token, "template") == 0 || strcmp(token, "source") == 0) {
+      if (strcmp(value_text, "offset") == 0) {
+        if (command_config->config.image_addr == 0u) {
+          return false;
+        }
+        command_config->source_name = "offset";
+      } else if (strcmp(value_text, "gain") == 0) {
+        /* gain 地址在调用者初始化默认配置后由外层根据 source_name 替换。 */
+        command_config->source_name = "gain";
+      } else {
+        return false;
+      }
+      token = strtok(NULL, " ");
+      continue;
+    }
+
+    uint32_t value = 0;
+    if (!parse_u32_value(value_text, &value)) {
+      return false;
+    }
+
+    if (strcmp(token, "addr") == 0 ||
+        strcmp(token, "image_addr") == 0 ||
+        strcmp(token, "img_addr") == 0 ||
+        strcmp(token, "img_upload_str_addr") == 0 ||
+        strcmp(token, "img_upload_addr") == 0) {
+      command_config->config.image_addr = value;
+      command_config->source_name = "custom";
+    } else if (strcmp(token, "pkg") == 0 ||
+               strcmp(token, "pkg_num") == 0 ||
+               strcmp(token, "img_upload_pkg_num") == 0) {
+      command_config->config.pkg_num = (uint16_t)value;
+      pkg_set = true;
+    } else if (strcmp(token, "row") == 0 ||
+               strcmp(token, "row_num") == 0 ||
+               strcmp(token, "img_upload_row_num") == 0) {
+      command_config->config.row_num = (uint16_t)value;
+    } else if (strcmp(token, "col") == 0 ||
+               strcmp(token, "col_num") == 0 ||
+               strcmp(token, "img_upload_col_num") == 0) {
+      command_config->config.col_num = (uint16_t)value;
+    } else if (strcmp(token, "wait") == 0 || strcmp(token, "wait_done") == 0) {
+      command_config->wait_done = value != 0;
+    } else {
+      return false;
+    }
+
+    token = strtok(NULL, " ");
+  }
+
+  /*
+   * pkg 未显式覆盖时保持默认值。若调用者改了 row/col 且希望重新按尺寸计算，
+   * 可以直接不传 pkg；这里按当前 config 的 row/col 刷新一次默认分包数。
+   */
+  if (!pkg_set) {
+    uint32_t pkg_num = ((uint32_t)command_config->config.row_num * command_config->config.col_num * 2u) / 1024u;
+    if (pkg_num > UINT16_MAX) {
+      return false;
+    }
+    command_config->config.pkg_num = (uint16_t)pkg_num;
+  }
+
+  return command_config->config.image_addr != 0u &&
+         command_config->config.pkg_num != 0u &&
+         command_config->config.row_num != 0u &&
+         command_config->config.col_num != 0u;
+}
+
+static bool resolve_img_upload_template(const fpga_mem_t* fpga_mem,
+                                        img_upload_command_config_t* command_config) {
+  if (command_config == NULL || command_config->source_name == NULL) {
+    return false;
+  }
+  if (strcmp(command_config->source_name, "custom") == 0) {
+    return command_config->config.image_addr != 0u;
+  }
+  if (fpga_mem == NULL) {
+    return false;
+  }
+  if (strcmp(command_config->source_name, "offset") == 0) {
+    command_config->config.image_addr = fpga_mem->offset_phys_base;
+  } else if (strcmp(command_config->source_name, "gain") == 0) {
+    command_config->config.image_addr = fpga_mem->gain_phys_base;
+  } else {
+    return false;
+  }
+  return command_config->config.image_addr != 0u;
 }
 
 static pa_pu_gic_config_t default_gic_config(void) {
@@ -1307,11 +1461,78 @@ static bool parse_static_idle_config_args(const char* args, static_idle_config_t
   return true;
 }
 
-static void write_work_state_response(const work_mode_status_t* status, char* response, size_t response_size) {
-  /* 给上位机和串口调试保留足够现场信息，尤其是失败阶段、等待 mask 和本次 DDR 地址。 */
+static const char* work_mode_name(work_mode_t mode) {
+  switch (mode) {
+    case WORK_MODE_IDLE: return "Idle";
+    case WORK_MODE_AED: return "AED";
+    case WORK_MODE_SYNC_OUT: return "SyncOut";
+    case WORK_MODE_SYNC_IN: return "SyncIn";
+    case WORK_MODE_PREP: return "Prep";
+    case WORK_MODE_CONTINUOUS: return "Continuous";
+    case WORK_MODE_INNER: return "Inner";
+    case WORK_MODE_FREE_SYNC: return "FreeSync";
+    case WORK_MODE_DDR: return "DDR";
+    default: return "Unknown";
+  }
+}
+
+static void write_work_state_response(const work_mode_status_t* status,
+                                      const pa_pu_dync_config_t* dync_config,
+                                      char* response,
+                                      size_t response_size) {
+  if (status->mode == WORK_MODE_CONTINUOUS && dync_config != NULL) {
+    /*
+     * Continuous 只返回本模式真实有效的配置和状态。
+     * Static Idle 的 capture/wr/corr/gic 缓存字段在 Dynamic 中从未更新，不能混在回包里冒充当前值。
+     */
+    int written = snprintf(response,
+                           response_size,
+                           "OK WORK_STATE mode=Continuous state=%s stop=%u last_error=%d last_phase=%s cycle=%u img_start=0x%08x img_end=0x%08x gic_dout=%u",
+                           work_mode_state_name(status->state),
+                           status->stop_requested ? 1u : 0u,
+                           status->last_error,
+                           work_mode_phase_name(status->last_phase),
+                           dync_config->cycle_num,
+                           dync_config->image_start_addr,
+                           dync_config->image_end_addr,
+                           GIC_DEFAULT_DOUT_EN != 0u ? 1u : 0u);
+    for (unsigned i = 0; i < PA_PU_DYNC_STEP_COUNT &&
+                         written > 0 && (size_t)written < response_size; ++i) {
+      if ((dync_config->step_cfg_h[i] & 0x80000000u) == 0u) {
+        continue;
+      }
+      written += snprintf(response + written,
+                          response_size - (size_t)written,
+                          " step%u_h=0x%08x step%u_l=0x%08x",
+                          i,
+                          dync_config->step_cfg_h[i],
+                          i,
+                          dync_config->step_cfg_l[i]);
+    }
+    if (written > 0 && (size_t)written < response_size) {
+      uint32_t img_wr_final_addr = pa_pu_read(PA_PU_IMG_WR_FINAL_IMG_ADDR_REG);
+      snprintf(response + written,
+               response_size - (size_t)written,
+               " ring_frame_stride=0x%lx ring_frame_count=%lu img_wr_final_addr=0x%08x dync_state=0x%08x dync_end=0x%08x dync_debug=0x%08x\r\n",
+               (unsigned long)status->ddr_frame_stride,
+               (unsigned long)status->ddr_frame_count,
+               img_wr_final_addr,
+               status->dynamic_dync_state,
+               status->dynamic_dync_end,
+               status->dynamic_dync_debug_out);
+    } else {
+      response[response_size - 1u] = '\0';
+    }
+    return;
+  }
+
+  cal_task_status_t cal;
+  calibration_task_get_status(&cal);
+  /* Static Idle 保留采图阶段、模块失败现场和模板后台任务状态。 */
   snprintf(response,
            response_size,
-           "OK WORK_STATE mode=Idle state=%s pending_capture=%u stop=%u last_error=%d last_phase=%s last_int_vector=0x%08x last_wait_mask=0x%08x wr_state=0x%08x wr_end=0x%08x corr_state=0x%08x corr_end=0x%08x gic_state=0x%08x gic_end=0x%08x gic_dfx=0x%08x bright_addr=0x%08x dark_addr=0x%08x capture_id=%u ddr_next_offset=0x%08x frame_stride=0x%lx frame_count=%lu\r\n",
+           "OK WORK_STATE mode=%s state=%s pending_capture=%u stop=%u last_error=%d last_phase=%s last_int_vector=0x%08x last_wait_mask=0x%08x wr_state=0x%08x wr_end=0x%08x corr_state=0x%08x corr_end=0x%08x gic_state=0x%08x gic_end=0x%08x gic_dfx=0x%08x bright_addr=0x%08x dark_addr=0x%08x capture_id=%u ddr_next_offset=0x%08x frame_stride=0x%lx frame_count=%lu dync_state=0x%08x dync_end=0x%08x dync_debug=0x%08x template_task=%s template_state=%s template_id=%u template_stop=%u template_progress=%u/%u template_error=%d\r\n",
+           work_mode_name(status->mode),
            work_mode_state_name(status->state),
            status->pending_capture ? 1u : 0u,
            status->stop_requested ? 1u : 0u,
@@ -1331,7 +1552,17 @@ static void write_work_state_response(const work_mode_status_t* status, char* re
            status->capture_id,
            status->ddr_next_offset,
            (unsigned long)status->ddr_frame_stride,
-           (unsigned long)status->ddr_frame_count);
+           (unsigned long)status->ddr_frame_count,
+           status->dynamic_dync_state,
+           status->dynamic_dync_end,
+           status->dynamic_dync_debug_out,
+           calibration_task_kind_name(cal.kind),
+           calibration_task_state_name(cal.state),
+           cal.task_id,
+           cal.stop_requested ? 1u : 0u,
+           cal.progress_current,
+           cal.progress_total,
+           cal.last_error);
 }
 
 static void write_status_response(char* response, size_t response_size) {
@@ -1340,7 +1571,7 @@ static void write_status_response(char* response, size_t response_size) {
 
   /* STATUS 响应保持短格式，方便串口助手查看，也方便上位机按字段解析。 */
   snprintf(response, response_size,
-           "OK STATUS pa_version=0x%08x pa_build_information=0x%08x adapted_main_board_version=0x%08x adapted_gic_board_version=0x%08x adapted_roic_board_version=0x%08x adapted_reserved_board_0_version=0x%08x adapted_reserved_board_1_version=0x%08x adapted_reserved_board_2_version=0x%08x pa_pu_com_version=0x%08x pa_rst_init_state=0x%08x wr_state=0x%08x wr_end=0x%08x wr_final_img_addr=0x%08x corr_state=0x%08x corr_end=0x%08x gic_state=0x%08x gic_end=0x%08x gic_dfx=0x%08x roic_state=0x%08x roic_end=0x%08x roic_dfx=0x%08x dync_state=0x%08x dync_end=0x%08x dync_debug_out=0x%08x\r\n",
+           "OK STATUS pa_version=0x%08x pa_build_information=0x%08x adapted_main_board_version=0x%08x adapted_gic_board_version=0x%08x adapted_roic_board_version=0x%08x adapted_reserved_board_0_version=0x%08x adapted_reserved_board_1_version=0x%08x adapted_reserved_board_2_version=0x%08x pa_pu_com_version=0x%08x pa_rst_init_state=0x%08x wr_state=0x%08x wr_end=0x%08x wr_final_img_addr=0x%08x corr_state=0x%08x corr_end=0x%08x gic_state=0x%08x gic_end=0x%08x gic_dfx=0x%08x roic_state=0x%08x roic_end=0x%08x roic_dfx=0x%08x dync_state=0x%08x dync_end=0x%08x dync_debug_out=0x%08x img_upload_state=0x%08x img_upload_end=0x%08x img_upload_dfx=0x%08x\r\n",
            status.pa_version,
            status.pa_build_information,
            status.adapted_main_board_version,
@@ -1364,7 +1595,10 @@ static void write_status_response(char* response, size_t response_size) {
            status.roic_dfx,
            status.dync_state,
            status.dync_end,
-           status.dync_debug_out);
+           status.dync_debug_out,
+           status.img_upload_state,
+           status.img_upload_end,
+           status.img_upload_dfx);
 }
 
 static void format_fpga_version(uint32_t value, char* text, size_t text_size) {
@@ -1443,71 +1677,6 @@ static void write_start_result(char* response,
   }
 }
 
-static int wait_dync_state_idle(uint32_t* state_out) {
-  uint32_t state = 0;
-
-  for (;;) {
-    /*
-     * dynamic 状态为高表示模块仍在运行。硬件约定只有 state 回到低后才会产生
-     * dynamic interrupt。dynamic 循环次数可能很大或由 FPGA 决定，因此这里不设
-     * 超时，一直等 state 释放，再进入 INT_VECTOR bit5 等待。
-     */
-    state = pa_pu_read(PA_PU_DYNC_STATE_REG);
-    if (state == 0) {
-      if (state_out != NULL) {
-        *state_out = state;
-      }
-      return 1;
-    }
-
-    if (usleep(PA_PU_IRQ_POLL_INTERVAL_US) != 0 && errno == EINTR) {
-      if (state_out != NULL) {
-        *state_out = state;
-      }
-      return -1;
-    }
-  }
-}
-
-static void write_start_dync_result(char* response, size_t response_size) {
-  uint32_t int_vector = 0;
-  uint32_t dync_state = 0;
-
-  int state_ret = wait_dync_state_idle(&dync_state);
-  if (state_ret < 0) {
-    snprintf(response, response_size, "ERR START_DYNC STATE_WAIT dync_state=0x%08x\r\n", dync_state);
-    return;
-  }
-
-  int ret = pa_pu_wait_int_vector(PA_PU_IRQ_DYNC_END, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
-  if (ret > 0) {
-    /*
-     * dynamic interrupt 表示 FPGA 动态流程已经结束，此时读取 IMG_WR 返回的最终 DDR 地址。
-     * 该地址用于上位机知道本次动态模式图像实际落在哪一帧 DDR 缓冲中。
-     */
-    uint32_t final_img_addr = pa_pu_read(PA_PU_IMG_WR_FINAL_IMG_ADDR_REG);
-    log_info("dynamic final image addr=0x%08x int_vector=0x%08x dync_state=0x%08x",
-             final_img_addr,
-             int_vector,
-             dync_state);
-    snprintf(response,
-             response_size,
-             "OK START_DYNC int_vector=0x%08x dync_state=0x%08x final_img_addr=0x%08x\r\n",
-             int_vector,
-             dync_state,
-             final_img_addr);
-  } else if (ret == 0) {
-    snprintf(response,
-             response_size,
-             "ERR START_DYNC TIMEOUT int_vector=0x%08x expect=0x%08x dync_state=0x%08x\r\n",
-             int_vector,
-             PA_PU_IRQ_DYNC_END,
-             dync_state);
-  } else {
-    snprintf(response, response_size, "ERR START_DYNC IRQ_WAIT dync_state=0x%08x\r\n", dync_state);
-  }
-}
-
 static void write_start_combo_result(char* response,
                                      size_t response_size,
                                      const char* command,
@@ -1531,9 +1700,22 @@ static bool prepare_manual_hardware_action(command_context_t* ctx,
     return true;
   }
 
+  if (calibration_task_is_active()) {
+    cal_task_status_t cal;
+    calibration_task_get_status(&cal);
+    snprintf(response,
+             response_size,
+             "ERR %s BUSY template_task=%s template_state=%s template_id=%u hint=GET_WORK_STATE_or_STOP_WORK\r\n",
+             command_name,
+             calibration_task_kind_name(cal.kind),
+             calibration_task_state_name(cal.state),
+             cal.task_id);
+    return false;
+  }
+
   work_mode_status_t status;
   work_mode_get_status(ctx->work_mode, &status);
-  if (status.state == WORK_STATE_STOPPED) {
+  if (status.state == WORK_STATE_STOPPED || status.state == WORK_STATE_DYNAMIC_COMPLETED) {
     return true;
   }
 
@@ -1837,8 +2019,26 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   if (cmd_is(command, "GET_WORK_STATE") || cmd_is(command, "WORK_STATE")) {
     /* 查询 ARM 工作线程状态，不访问 read-clear 类 FPGA 中断寄存器。 */
     work_mode_status_t status;
+    pa_pu_dync_config_t dync_config;
+    memset(&dync_config, 0, sizeof(dync_config));
     work_mode_get_status(ctx->work_mode, &status);
-    write_work_state_response(&status, response, response_size);
+    work_mode_get_dynamic_config(ctx->work_mode, &dync_config);
+    write_work_state_response(&status, &dync_config, response, response_size);
+    return 0;
+  }
+
+  if (cmd_is(command, "GET_TEMPLATE_STATE") || cmd_is(command, "TEMPLATE_STATE")) {
+    cal_task_status_t cal;
+    calibration_task_get_status(&cal);
+    snprintf(response,
+             response_size,
+             "OK TEMPLATE_STATE task=%s state=%s id=%u stop=%u progress=%u/%u error=%d frames=%u valid_frames=%u offset_addr=0x%08x last_img_addr=0x%08x int_vector=0x%08x\r\n",
+             calibration_task_kind_name(cal.kind), calibration_task_state_name(cal.state),
+             cal.task_id, cal.stop_requested ? 1u : 0u,
+             cal.progress_current, cal.progress_total, cal.last_error,
+             cal.dynamic_offset.frames, cal.dynamic_offset.valid_frames,
+             cal.dynamic_offset.offset_addr, cal.dynamic_offset.last_img_addr,
+             cal.dynamic_offset.last_int_vector);
     return 0;
   }
 
@@ -1943,6 +2143,10 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_has_name(command, "LOOP_STATIC_IDLE_CAPTURE") || cmd_has_name(command, "START_STATIC_IDLE_LOOP")) {
+    if (calibration_task_is_active()) {
+      snprintf(response, response_size, "ERR LOOP_STATIC_IDLE_CAPTURE BUSY template_task_running=1\r\n");
+      return 0;
+    }
     /*
      * 稳定性测试命令：周期性执行正式 Static Idle 采图流程。
      * count=0 表示一直循环；该命令同步运行，长循环时需要 Ctrl+C 或外部终止程序。
@@ -2040,6 +2244,10 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_has_name(command, "CAL_GAIN_BEGIN")) {
+    if (calibration_task_is_active()) {
+      snprintf(response, response_size, "ERR CAL_GAIN_BEGIN BUSY hint=GET_WORK_STATE_or_STOP_WORK\r\n");
+      return 0;
+    }
     cal_gain_begin_args_t args;
     if (!parse_cal_gain_begin_args(cmd_args(command), &args)) {
       snprintf(response, response_size, "ERR CAL_GAIN_BEGIN ARG\r\n");
@@ -2075,16 +2283,50 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
      * 避免空闲自清空或正式采图流程改写 GIC/IMG_WR/IMG_CORR 寄存器。
      */
     work_mode_stop(ctx->work_mode);
+#if GAIN_TASK_BACKGROUND_ENABLE
+    int ret = calibration_task_start_gain_capture(ctx->fpga_mem, level);
+    if (ret == 0) {
+      cal_task_status_t cal;
+      calibration_task_get_status(&cal);
+      snprintf(response,
+               response_size,
+               "OK CAL_GAIN_CAPTURE state=RUNNING task_id=%u level=%u\r\n",
+               cal.task_id,
+               level);
+    } else if (ret == -2) {
+      snprintf(response, response_size, "ERR CAL_GAIN_CAPTURE BUSY level=%u\r\n", level);
+    } else {
+      snprintf(response, response_size, "ERR CAL_GAIN_CAPTURE level=%u\r\n", level);
+    }
+#else
+    /*
+     * 前台模式下命令返回即代表该灰阶采集已经成功或失败，便于结合命令边界
+     * 和寄存器日志定位缺失的完成中断。
+     */
     if (calibration_gain_capture_level(ctx->fpga_mem, level) == 0) {
       snprintf(response, response_size, "OK CAL_GAIN_CAPTURE level=%u\r\n", level);
     } else {
       snprintf(response, response_size, "ERR CAL_GAIN_CAPTURE level=%u\r\n", level);
     }
+#endif
     return 0;
   }
 
   if (cmd_is(command, "CAL_GAIN_BUILD")) {
     work_mode_stop(ctx->work_mode);
+#if GAIN_TASK_BACKGROUND_ENABLE
+    int ret = calibration_task_start_gain_build(ctx->fpga_mem);
+    if (ret == 0) {
+      cal_task_status_t cal;
+      calibration_task_get_status(&cal);
+      snprintf(response, response_size, "OK CAL_GAIN_BUILD state=RUNNING task_id=%u\r\n", cal.task_id);
+    } else if (ret == -2) {
+      snprintf(response, response_size, "ERR CAL_GAIN_BUILD BUSY\r\n");
+    } else {
+      snprintf(response, response_size, "ERR CAL_GAIN_BUILD\r\n");
+    }
+#else
+    /* 前台模式在命令线程完成构建，返回 OK 后 gain 模板已经加载并重新下发校正配置。 */
     if (calibration_gain_build(ctx->fpga_mem) == 0) {
       pa_pu_corr_config_t config = default_corr_config(ctx->fpga_mem);
       pa_pu_configure_correction(&config);
@@ -2092,12 +2334,16 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     } else {
       snprintf(response, response_size, "ERR CAL_GAIN_BUILD\r\n");
     }
+#endif
     return 0;
   }
 
   if (cmd_is(command, "CAL_GAIN_CANCEL")) {
-    calibration_gain_cancel();
-    snprintf(response, response_size, "OK CAL_GAIN_CANCEL\r\n");
+    bool stopping = calibration_task_request_stop();
+    if (!stopping) {
+      calibration_gain_cancel();
+    }
+    snprintf(response, response_size, "OK CAL_GAIN_CANCEL state=%s\r\n", stopping ? "STOPPING" : "CANCELED");
     return 0;
   }
 
@@ -2188,10 +2434,11 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
       return 0;
     }
     /* 用当前暗场图像生成 offset 模板；上位机应先确保当前帧是有效暗场。 */
-    if (template_make_offset(ctx->fpga_mem) == 0) {
-      pa_pu_corr_config_t config = default_corr_config(ctx->fpga_mem);
-      pa_pu_configure_correction(&config);
-      snprintf(response, response_size, "OK MAKE_OFFSET\r\n");
+    int ret = calibration_task_start_make_offset(ctx->fpga_mem);
+    if (ret == 0) {
+      cal_task_status_t cal;
+      calibration_task_get_status(&cal);
+      snprintf(response, response_size, "OK MAKE_OFFSET state=RUNNING task_id=%u\r\n", cal.task_id);
     } else {
       snprintf(response, response_size, "ERR MAKE_OFFSET\r\n");
     }
@@ -2217,24 +2464,20 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
       return 0;
     }
 
-    cal_dynamic_offset_result_t result;
-    memset(&result, 0, sizeof(result));
-    if (calibration_dynamic_offset_make(ctx->fpga_mem,
-                                        &args.dync.config,
-                                        args.dync.has_config_write,
-                                        args.frames,
-                                        args.valid_frames,
-                                        &result) == 0) {
-      pa_pu_corr_config_t corr = default_corr_config(ctx->fpga_mem);
-      pa_pu_configure_correction(&corr);
+    int ret = calibration_task_start_dynamic_offset(ctx->fpga_mem,
+                                                    &args.dync.config,
+                                                    args.dync.has_config_write,
+                                                    args.frames,
+                                                    args.valid_frames);
+    if (ret == 0) {
+      cal_task_status_t cal;
+      calibration_task_get_status(&cal);
       snprintf(response,
                response_size,
-               "OK MAKE_DYNC_OFFSET frames=%u valid_frames=%u offset_addr=0x%08x last_img_addr=0x%08x int_vector=0x%08x\r\n",
-               result.frames,
-               result.valid_frames,
-               result.offset_addr,
-               result.last_img_addr,
-               result.last_int_vector);
+               "OK MAKE_DYNC_OFFSET state=RUNNING task_id=%u frames=%u valid_frames=%u\r\n",
+               cal.task_id,
+               args.frames,
+               args.valid_frames);
     } else {
       snprintf(response,
                response_size,
@@ -2250,6 +2493,16 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
       return 0;
     }
     /* 用当前亮场图像和已有 offset 模板生成 gain 模板；需先执行或加载 offset。 */
+#if GAIN_TASK_BACKGROUND_ENABLE
+    int ret = calibration_task_start_make_gain(ctx->fpga_mem);
+    if (ret == 0) {
+      cal_task_status_t cal;
+      calibration_task_get_status(&cal);
+      snprintf(response, response_size, "OK MAKE_GAIN state=RUNNING task_id=%u\r\n", cal.task_id);
+    } else {
+      snprintf(response, response_size, "ERR MAKE_GAIN\r\n");
+    }
+#else
     if (template_make_gain(ctx->fpga_mem) == 0) {
       pa_pu_corr_config_t config = default_corr_config(ctx->fpga_mem);
       pa_pu_configure_correction(&config);
@@ -2257,6 +2510,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     } else {
       snprintf(response, response_size, "ERR MAKE_GAIN\r\n");
     }
+#endif
     return 0;
   }
 
@@ -2340,6 +2594,17 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   }
 
   if (cmd_is(command, "STOP_GIC")) {
+    if (calibration_task_request_stop()) {
+      cal_task_status_t cal;
+      calibration_task_get_status(&cal);
+      snprintf(response,
+               response_size,
+               "OK STOP_GIC template_task=%s template_state=%s template_id=%u\r\n",
+               calibration_task_kind_name(cal.kind),
+               calibration_task_state_name(cal.state),
+               cal.task_id);
+      return 0;
+    }
     if (!prepare_manual_hardware_action(ctx, "STOP_GIC", response, response_size)) {
       return 0;
     }
@@ -2388,8 +2653,21 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     }
 
     /*
+     * START_DYNC 是非阻塞底层调试命令，不受正式工作线程状态约束，因此这里必须再读
+     * FPGA DYNC_STATE bit0，保证无论从哪条入口启动，运行中都不会改配置寄存器。
+     */
+    uint32_t hw_dync_state = pa_pu_read(PA_PU_DYNC_STATE_REG);
+    if ((hw_dync_state & 0x1u) != 0u) {
+      snprintf(response,
+               response_size,
+               "ERR CONFIG_DYNC BUSY dync_state=0x%08x hint=STOP_DYNC_or_STOP_TRANSFER\r\n",
+               hw_dync_state);
+      return 0;
+    }
+
+    /*
      * dynamic_ctrl 是 FPGA 侧动态工作模式的步骤表。
-     * 这里只负责下发 dynamic 自身寄存器；GIC/ROIC/IMG_WR/IMG_CORR 的基础参数仍由对应命令配置。
+     * FPGA 正在运行时严格禁止修改；自然结束或 DYNC_STOP 完成后才更新缓存和寄存器。
      */
     dync_command_config_t dync_config;
     default_dync_command_config(ctx->fpga_mem, &dync_config);
@@ -2397,29 +2675,39 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
       snprintf(response, response_size, "ERR CONFIG_DYNC ARG\r\n");
       return 0;
     }
+    int update_ret = ctx->work_mode != NULL
+        ? work_mode_update_dynamic_config(ctx->work_mode, &dync_config.config)
+        : 0;
+    if (update_ret == -2) {
+      snprintf(response, response_size, "ERR CONFIG_DYNC BUSY state=DYNAMIC_RUNNING hint=STOP_TRANSFER\r\n");
+      return 0;
+    }
+    if (update_ret != 0) {
+      snprintf(response, response_size, "ERR CONFIG_DYNC\r\n");
+      return 0;
+    }
     pa_pu_configure_dync(&dync_config.config);
     snprintf(response,
              response_size,
-             "OK CONFIG_DYNC cycle=%u img_start=0x%08x img_end=0x%08x step0_h=0x%08x step0_l=0x%08x\r\n",
+             "OK CONFIG_DYNC cycle=%u img_start=0x%08x img_end=0x%08x step0_h=0x%08x step0_l=0x%08x step1_h=0x%08x step1_l=0x%08x\r\n",
              dync_config.config.cycle_num,
              dync_config.config.image_start_addr,
              dync_config.config.image_end_addr,
              dync_config.config.step_cfg_h[0],
-             dync_config.config.step_cfg_l[0]);
+             dync_config.config.step_cfg_l[0],
+             dync_config.config.step_cfg_h[1],
+             dync_config.config.step_cfg_l[1]);
     return 0;
   }
 
   if (cmd_has_name(command, "START_DYNC") ||
-      cmd_has_name(command, "START_DYNAMIC") ||
-      cmd_has_name(command, "START_DYNC_WAIT") ||
-      cmd_has_name(command, "START_DYNAMIC_WAIT")) {
+      cmd_has_name(command, "START_DYNAMIC")) {
     if (!prepare_manual_hardware_action(ctx, "START_DYNC", response, response_size)) {
       return 0;
     }
 
     dync_command_config_t dync_config;
     default_dync_command_config(ctx->fpga_mem, &dync_config);
-    dync_config.wait_done = cmd_has_name(command, "START_DYNC_WAIT") || cmd_has_name(command, "START_DYNAMIC_WAIT");
     if (!parse_dync_config_args(cmd_args(command), &dync_config)) {
       snprintf(response, response_size, "ERR START_DYNC ARG\r\n");
       return 0;
@@ -2430,20 +2718,159 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     }
     pa_pu_prepare_irq_wait();
     pa_pu_start_dync();
-    if (dync_config.wait_done) {
-      write_start_dync_result(response, response_size);
-    } else {
-      snprintf(response, response_size, "OK START_DYNC wait=0\r\n");
-    }
+    /* 只做非阻塞底层调试启动，不读取 read-clear 中断，也不创建监控线程。 */
+    uint32_t dync_state = pa_pu_read(PA_PU_DYNC_STATE_REG);
+    uint32_t dync_end = pa_pu_read(PA_PU_DYNC_END_REG);
+    uint32_t dync_debug_out = pa_pu_read(PA_PU_DYNC_DEBUG_OUT_REG);
+    log_info("dynamic started wait=0 dync_state=0x%08x dync_end=0x%08x dync_debug_out=0x%08x",
+             dync_state,
+             dync_end,
+             dync_debug_out);
+    snprintf(response,
+             response_size,
+             "OK START_DYNC wait=0 dync_state=0x%08x dync_end=0x%08x dync_debug_out=0x%08x\r\n",
+             dync_state,
+             dync_end,
+             dync_debug_out);
     return 0;
   }
 
   if (cmd_is(command, "STOP_DYNC") || cmd_is(command, "STOP_DYNAMIC")) {
+    if (calibration_task_request_stop()) {
+      cal_task_status_t cal;
+      calibration_task_get_status(&cal);
+      snprintf(response,
+               response_size,
+               "OK STOP_DYNC template_task=%s template_state=%s template_id=%u\r\n",
+               calibration_task_kind_name(cal.kind),
+               calibration_task_state_name(cal.state),
+               cal.task_id);
+      return 0;
+    }
     if (!prepare_manual_hardware_action(ctx, "STOP_DYNC", response, response_size)) {
       return 0;
     }
     pa_pu_stop_dync();
-    snprintf(response, response_size, "OK STOP_DYNC\r\n");
+    /*
+     * STOP_DYNC 是写 FPGA 的 DYNC_STOP 寄存器。写完后立即读回状态，
+     * 让上位机能看到 stop 后 state/end/debug/final_addr 的现场值。
+     */
+    usleep(10000u);
+    uint32_t dync_state = pa_pu_read(PA_PU_DYNC_STATE_REG);
+    uint32_t dync_end = pa_pu_read(PA_PU_DYNC_END_REG);
+    uint32_t dync_debug_out = pa_pu_read(PA_PU_DYNC_DEBUG_OUT_REG);
+    uint32_t final_img_addr = pa_pu_read(PA_PU_IMG_WR_FINAL_IMG_ADDR_REG);
+    log_info("dynamic stop requested dync_state=0x%08x dync_end=0x%08x dync_debug_out=0x%08x final_img_addr=0x%08x",
+             dync_state,
+             dync_end,
+             dync_debug_out,
+             final_img_addr);
+    snprintf(response,
+             response_size,
+             "OK STOP_DYNC dync_state=0x%08x dync_end=0x%08x dync_debug_out=0x%08x final_img_addr=0x%08x\r\n",
+             dync_state,
+             dync_end,
+             dync_debug_out,
+             final_img_addr);
+    return 0;
+  }
+
+  if (cmd_has_name(command, "CONFIG_IMG_UPLOAD") || cmd_has_name(command, "CONFIG_UPLOAD")) {
+    if (!prepare_manual_hardware_action(ctx, "CONFIG_IMG_UPLOAD", response, response_size)) {
+      return 0;
+    }
+
+    /*
+     * 图片上传仅用于模板回传。默认 template=offset 使用 uio0；
+     * template=gain 使用 uio1；addr=... 只保留给明确地址的现场调试。
+     */
+    img_upload_command_config_t upload_config = {
+      .config = default_img_upload_config(ctx->fpga_mem),
+      .wait_done = true,
+      .source_name = "offset",
+    };
+    if (!parse_img_upload_args(cmd_args(command), &upload_config) ||
+        !resolve_img_upload_template(ctx->fpga_mem, &upload_config)) {
+      snprintf(response, response_size, "ERR CONFIG_IMG_UPLOAD ARG\r\n");
+      return 0;
+    }
+
+    pa_pu_configure_img_upload(&upload_config.config);
+    snprintf(response,
+             response_size,
+             "OK CONFIG_IMG_UPLOAD template=%s addr=0x%08x pkg=%u row=%u col=%u\r\n",
+             upload_config.source_name,
+             upload_config.config.image_addr,
+             upload_config.config.pkg_num,
+             upload_config.config.row_num,
+             upload_config.config.col_num);
+    return 0;
+  }
+
+  if (cmd_has_name(command, "START_IMG_UPLOAD") ||
+      cmd_has_name(command, "IMG_UPLOAD") ||
+      cmd_has_name(command, "UPLOAD_IMAGE")) {
+    if (!prepare_manual_hardware_action(ctx, "START_IMG_UPLOAD", response, response_size)) {
+      return 0;
+    }
+
+    /*
+     * START_IMG_UPLOAD/IMG_UPLOAD 默认配置后启动并等待 bit6。
+     * 需要只触发不等待时传 wait=0，方便排查上传模块是否能独立启动。
+     */
+    img_upload_command_config_t upload_config = {
+      .config = default_img_upload_config(ctx->fpga_mem),
+      .wait_done = true,
+      .source_name = "offset",
+    };
+    if (!parse_img_upload_args(cmd_args(command), &upload_config) ||
+        !resolve_img_upload_template(ctx->fpga_mem, &upload_config)) {
+      snprintf(response, response_size, "ERR START_IMG_UPLOAD ARG\r\n");
+      return 0;
+    }
+
+    pa_pu_configure_img_upload(&upload_config.config);
+    pa_pu_prepare_irq_wait();
+    pa_pu_start_img_upload();
+    if (!upload_config.wait_done) {
+      snprintf(response,
+               response_size,
+               "OK START_IMG_UPLOAD wait=0 template=%s addr=0x%08x pkg=%u row=%u col=%u\r\n",
+               upload_config.source_name,
+               upload_config.config.image_addr,
+               upload_config.config.pkg_num,
+               upload_config.config.row_num,
+               upload_config.config.col_num);
+      return 0;
+    }
+
+    uint32_t int_vector = 0;
+    int ret = pa_pu_wait_int_vector(PA_PU_IRQ_IMG_UPLOAD_END, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
+    if (ret > 0) {
+      snprintf(response,
+               response_size,
+               "OK START_IMG_UPLOAD template=%s addr=0x%08x pkg=%u row=%u col=%u int_vector=0x%08x\r\n",
+               upload_config.source_name,
+               upload_config.config.image_addr,
+               upload_config.config.pkg_num,
+               upload_config.config.row_num,
+               upload_config.config.col_num,
+               int_vector);
+    } else if (ret == 0) {
+      uint32_t state = pa_pu_read(PA_PU_IMG_UPLOAD_STATE_REG);
+      uint32_t end = pa_pu_read(PA_PU_IMG_UPLOAD_END_REG);
+      uint32_t dfx = pa_pu_read(PA_PU_IMG_UPLOAD_DFX_REG);
+      snprintf(response,
+               response_size,
+               "ERR START_IMG_UPLOAD TIMEOUT int_vector=0x%08x expect=0x%08x state=0x%08x end=0x%08x dfx=0x%08x\r\n",
+               int_vector,
+               PA_PU_IRQ_IMG_UPLOAD_END,
+               state,
+               end,
+               dfx);
+    } else {
+      snprintf(response, response_size, "ERR START_IMG_UPLOAD IRQ_WAIT\r\n");
+    }
     return 0;
   }
 
@@ -2476,7 +2903,37 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     return 0;
   }
 
-  if (cmd_is(command, "SEND_IMAGE") || cmd_is(command, "SEND_SINGLE") || cmd_is(command, "START_CONTINUOUS")) {
+  if (cmd_is(command, "START_CONTINUOUS") || cmd_is(command, "START_DYNAMIC_WORK")) {
+    if (!prepare_manual_hardware_action(ctx, "START_CONTINUOUS", response, response_size)) {
+      return 0;
+    }
+
+    /*
+     * 正式 Continuous 只启动一次 FPGA dynamic_ctrl。逐帧数据是否输出由
+     * GIC_DOUT_EN 决定，ARM 不再读取每帧中断或触发模板 IMG_UPLOAD。
+     */
+    int ret = work_mode_start_dynamic(ctx->work_mode);
+    if (ret == -2) {
+      snprintf(response, response_size, "ERR START_CONTINUOUS BUSY\r\n");
+      return 0;
+    }
+    if (ret != 0) {
+      snprintf(response, response_size, "ERR START_CONTINUOUS\r\n");
+      return 0;
+    }
+
+    work_mode_status_t status;
+    work_mode_get_status(ctx->work_mode, &status);
+    snprintf(response,
+             response_size,
+             "OK START_CONTINUOUS state=%s ring_frame_stride=0x%lx ring_frame_count=%lu\r\n",
+             work_mode_state_name(status.state),
+             (unsigned long)status.ddr_frame_stride,
+             (unsigned long)status.ddr_frame_count);
+    return 0;
+  }
+
+  if (cmd_is(command, "SEND_IMAGE") || cmd_is(command, "SEND_SINGLE")) {
     if (!prepare_manual_hardware_action(ctx, "SEND_IMAGE", response, response_size)) {
       return 0;
     }
@@ -2484,9 +2941,8 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
      * 图像数据不经过 ARM 发送。这里仅通知 PA 端从 FPGA 图像物理地址启动写图流程，
      * 光口传输由 PA/FPGA 逻辑完成。
      *
-     * SEND_IMAGE 是早期调试命令；SEND_SINGLE / START_CONTINUOUS 是当前 Qt 上位机
-     * 的客户入口命令。当前 FPGA 侧尚未区分单帧和持续上图，因此两者暂时都触发
-     * 同一次写图流程，后续硬件支持持续模式后只需要在这里拆分实现。
+     * SEND_IMAGE 是早期调试命令；SEND_SINGLE 保留一次 IMG_WR 调试/手动上图语义。
+     * START_CONTINUOUS 已转入正式 Dynamic 工作线程，不再经过本分支。
      */
     pa_pu_prepare_irq_wait();
     if (ctx->fpga_mem == NULL || ctx->fpga_mem->image_phys_base == 0) {
@@ -2507,23 +2963,56 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     return 0;
   }
 
-  if (cmd_is(command, "STOP_TRANSFER")) {
-    /*
-     * 当前 PA/FPGA 暂未提供明确的停流寄存器。先兼容上位机按钮流程：
-     * ARM 确认收到停止请求，但不额外操作硬件。
-     */
-    snprintf(response, response_size, "OK STOP_TRANSFER\r\n");
+  if (cmd_is(command, "STOP_TRANSFER") || cmd_is(command, "STOP_DYNAMIC_WORK")) {
+    if (calibration_task_request_stop()) {
+      cal_task_status_t cal;
+      calibration_task_get_status(&cal);
+      snprintf(response,
+               response_size,
+               "OK STOP_TRANSFER template_task=%s template_state=%s template_id=%u\r\n",
+               calibration_task_kind_name(cal.kind),
+               calibration_task_state_name(cal.state),
+               cal.task_id);
+      return 0;
+    }
+    /* Dynamic 停止只写 DYNC_STOP，并等待 FPGA dynamic state 回到 idle。 */
+    work_mode_status_t status;
+    int ret = work_mode_stop_dynamic(ctx->work_mode, &status);
+    if (ret != 0) {
+      snprintf(response,
+               response_size,
+               "ERR STOP_TRANSFER state=%s phase=%s error=%d dync_state=0x%08x dync_end=0x%08x dync_debug=0x%08x\r\n",
+               work_mode_state_name(status.state),
+               work_mode_phase_name(status.last_phase),
+               status.last_error,
+               status.dynamic_dync_state,
+               status.dynamic_dync_end,
+               status.dynamic_dync_debug_out);
+      return 0;
+    }
+    snprintf(response,
+             response_size,
+             "OK STOP_TRANSFER state=%s dync_state=0x%08x dync_end=0x%08x dync_debug=0x%08x\r\n",
+             work_mode_state_name(status.state),
+             status.dynamic_dync_state,
+             status.dynamic_dync_end,
+             status.dynamic_dync_debug_out);
     return 0;
   }
 
   if (cmd_is(command, "STOP_WORK")) {
-    /* 调试用：停止后台 Static Idle 线程，便于人工独占寄存器测试。 */
+    /* 停止请求不等待模板任务完成，命令线程保持可响应；退出时再统一 join。 */
+    bool template_stopping = calibration_task_request_stop();
     work_mode_stop(ctx->work_mode);
-    snprintf(response, response_size, "OK STOP_WORK\r\n");
+    snprintf(response, response_size, "OK STOP_WORK template_state=%s\r\n", template_stopping ? "STOPPING" : "IDLE");
     return 0;
   }
 
   if (cmd_is(command, "START_WORK")) {
+    if (calibration_task_is_active()) {
+      snprintf(response, response_size, "ERR START_WORK BUSY template_task_running=1\r\n");
+      return 0;
+    }
     /* 调试用：重新启动后台 Static Idle 线程。 */
     if (work_mode_start(ctx->work_mode) != 0) {
       snprintf(response, response_size, "ERR START_WORK\r\n");

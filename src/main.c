@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include "app_config.h"
+#include "calibration_builder.h"
 #include "command_handler.h"
 #include "fpga_mem.h"
 #include "image_frame.h"
@@ -177,7 +178,8 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   if (WORK_MODE_AUTO_START != 0) {
-    if (WORK_MODE_DEFAULT_MODE != WORK_MODE_IDLE) {
+    if (WORK_MODE_DEFAULT_MODE != WORK_MODE_IDLE &&
+        WORK_MODE_DEFAULT_MODE != WORK_MODE_CONTINUOUS) {
       log_error("default work mode not implemented mode=%u/%s",
                 (unsigned)WORK_MODE_DEFAULT_MODE,
                 default_work_mode_name(WORK_MODE_DEFAULT_MODE));
@@ -185,14 +187,17 @@ int main(int argc, char* argv[]) {
       fpga_mem_close(&fpga_mem);
       return 1;
     }
-    if (work_mode_start(&work_mode) != 0) {
+    int start_ret = WORK_MODE_DEFAULT_MODE == WORK_MODE_CONTINUOUS
+        ? work_mode_start_dynamic(&work_mode)
+        : work_mode_start(&work_mode);
+    if (start_ret != 0) {
       log_error("work mode thread start failed");
       pa_pu_close();
       fpga_mem_close(&fpga_mem);
       return 1;
     }
   } else {
-    log_info("work mode auto start disabled, use START_WORK to enter Static Idle");
+    log_info("work mode auto start disabled, use START_WORK for Static Idle or START_CONTINUOUS for Dynamic");
   }
 
   command_context_t ctx = {
@@ -229,6 +234,7 @@ int main(int argc, char* argv[]) {
       log_info("stop signal received");
     }
 
+    calibration_task_shutdown();
     work_mode_stop(&work_mode);
     pa_pu_close();
     fpga_mem_close(&fpga_mem);
@@ -242,6 +248,7 @@ int main(int argc, char* argv[]) {
   rs422_device = select_rs422_device(rs422_device);
   if (rs422_open(&rs422, rs422_device, rs422_baud) != 0) {
     log_error("no rs422 device opened, use -d /dev/ttySx to specify the 422 uart");
+    calibration_task_shutdown();
     work_mode_stop(&work_mode);
     pa_pu_close();
     fpga_mem_close(&fpga_mem);
@@ -271,6 +278,7 @@ int main(int argc, char* argv[]) {
   }
 
   rs422_close(&rs422);
+  calibration_task_shutdown();
   work_mode_stop(&work_mode);
   pa_pu_close();
   fpga_mem_close(&fpga_mem);

@@ -165,6 +165,14 @@ static const pa_pu_reg_desc_t k_pa_pu_reg_descs[] = {
   {"dync_state", PA_PU_DYNC_STATE_REG},
   {"dync_debug_in", PA_PU_DYNC_DEBUG_IN_REG},
   {"dync_debug_out", PA_PU_DYNC_DEBUG_OUT_REG},
+  {"img_upload_str", PA_PU_IMG_UPLOAD_STR_REG},
+  {"img_upload_str_addr", PA_PU_IMG_UPLOAD_STR_ADDR_REG},
+  {"img_upload_pkg_num", PA_PU_IMG_UPLOAD_PKG_NUM_REG},
+  {"img_upload_row_num", PA_PU_IMG_UPLOAD_ROW_NUM_REG},
+  {"img_upload_col_num", PA_PU_IMG_UPLOAD_COL_NUM_REG},
+  {"img_upload_state", PA_PU_IMG_UPLOAD_STATE_REG},
+  {"img_upload_end", PA_PU_IMG_UPLOAD_END_REG},
+  {"img_upload_dfx", PA_PU_IMG_UPLOAD_DFX_REG},
 };
 
 static size_t pa_pu_reg_desc_count(void) {
@@ -368,40 +376,6 @@ static void pa_pu_write_traced(const char* scope, const char* name, uint16_t reg
   }
 }
 
-static void pa_pu_read_irq_probe_registers(void) {
-  /*
-   * 仅用于无 /dev/pa_irq 时的 INT_VECTOR 轮询调试。
-   * 每次读取 read-clear 的 0x00 前，额外读 0x08~0x50 这 10 个只读/状态寄存器，
-   * 方便 FPGA 侧用 ILA 对齐 AXI-lite 读访问节奏；这些寄存器不会消费中断。
-   */
-  static const uint16_t probe_regs[] = {
-    PA_PU_PA_VERSION_REG,
-    PA_PU_PA_BUILD_INFORMATION_REG,
-    PA_PU_ADAPTED_MAIN_BOARD_VERSION_REG,
-    PA_PU_ADAPTED_GIC_BOARD_VERSION_REG,
-    PA_PU_ADAPTED_ROIC_BOARD_VERSION_REG,
-    PA_PU_ADAPTED_RESERVED_BOARD_0_VERSION_REG,
-    PA_PU_ADAPTED_RESERVED_BOARD_1_VERSION_REG,
-    PA_PU_ADAPTED_RESERVED_BOARD_2_VERSION_REG,
-    PA_PU_COM_VERSION_REG,
-    PA_PU_RST_INIT_STATE_REG,
-  };
-  static volatile uint32_t sink;
-
-  for (size_t i = 0; i < sizeof(probe_regs) / sizeof(probe_regs[0]); ++i) {
-    if (g_trace) {
-      fprintf(stderr, "[TRACE] pa_pu irq_probe_read_begin offset=0x%04x\n", probe_regs[i]);
-      fflush(stderr);
-    }
-    uint32_t value = pa_pu_read(probe_regs[i]);
-    sink ^= value;
-    if (g_trace) {
-      fprintf(stderr, "[TRACE] pa_pu irq_probe_read_done offset=0x%04x value=0x%08x\n", probe_regs[i], value);
-      fflush(stderr);
-    }
-  }
-}
-
 void pa_pu_read_status(pa_pu_status_t* status) {
   if (status == NULL) {
     return;
@@ -434,6 +408,9 @@ void pa_pu_read_status(pa_pu_status_t* status) {
   status->dync_state = pa_pu_read(PA_PU_DYNC_STATE_REG);
   status->dync_end = pa_pu_read(PA_PU_DYNC_END_REG);
   status->dync_debug_out = pa_pu_read(PA_PU_DYNC_DEBUG_OUT_REG);
+  status->img_upload_state = pa_pu_read(PA_PU_IMG_UPLOAD_STATE_REG);
+  status->img_upload_end = pa_pu_read(PA_PU_IMG_UPLOAD_END_REG);
+  status->img_upload_dfx = pa_pu_read(PA_PU_IMG_UPLOAD_DFX_REG);
 }
 
 void pa_pu_dump_all_registers(const char* reason) {
@@ -502,8 +479,6 @@ size_t pa_pu_dump_safe_registers(const char* reason, size_t* skipped_out) {
 }
 
 uint32_t pa_pu_read_int_vector(void) {
-  // 调试测试使用 后续删除
-  // pa_pu_read_irq_probe_registers();
   return pa_pu_read(PA_PU_INT_VECTOR_REG);
 }
 
@@ -544,9 +519,11 @@ static void pa_pu_drain_irq_driver(void) {
     pa_irq_event_t event;
     ssize_t n = read(g_irq_fd, &event, sizeof(event));
     if (n == (ssize_t)sizeof(event)) {
+#if PA_PU_IRQ_EVENT_LOG_ENABLE
       log_warn("drain stale pa irq int_vector=0x%08x count=%llu",
                event.int_vector,
                (unsigned long long)event.count);
+#endif
       continue;
     }
     if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -577,15 +554,22 @@ void pa_pu_prepare_irq_wait(void) {
    * 被误判成本轮 start 命令完成。
    */
   uint32_t stale = pa_pu_read_int_vector();
+#if PA_PU_IRQ_EVENT_LOG_ENABLE
   if (stale != 0) {
     log_warn("clear stale INT_VECTOR before start: 0x%08x", stale);
   }
+#else
+  (void)stale;
+#endif
 }
 
 static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* int_vector_out) {
   const uint64_t start_ms = monotonic_ms();
   uint32_t last_vector = 0;
   uint32_t seen_vector = 0;
+#if PA_PU_IRQ_EVENT_LOG_ENABLE
+  uint32_t reported_mismatch = 0;
+#endif
 
   pa_pu_trace("wait_irq_driver_enter", mask, timeout_ms);
   while (g_irq_fd != -1) {
@@ -651,9 +635,12 @@ static int pa_pu_wait_irq_driver(uint32_t mask, unsigned timeout_ms, uint32_t* i
           }
           return 1;
         }
-        if (last_vector != 0) {
+#if PA_PU_IRQ_EVENT_LOG_ENABLE
+        if (last_vector != 0 && last_vector != reported_mismatch) {
           log_warn("pa irq int_vector=0x%08x does not match mask=0x%08x", last_vector, mask);
+          reported_mismatch = last_vector;
         }
+#endif
         continue;
       }
       if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -696,6 +683,9 @@ int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vect
   const uint64_t start_ms = monotonic_ms();
   uint32_t last_vector = 0;
   uint32_t seen_vector = 0;
+#if PA_PU_IRQ_EVENT_LOG_ENABLE
+  uint32_t reported_mismatch = 0;
+#endif
 
   for (;;) {
     /*
@@ -709,11 +699,14 @@ int pa_pu_wait_int_vector(uint32_t mask, unsigned timeout_ms, uint32_t* int_vect
     if (last_vector != 0 || g_trace) {
       pa_pu_trace("wait_int_vector_poll_value", mask, last_vector);
     }
-    if (last_vector != 0 && (last_vector & mask) == 0) {
+#if PA_PU_IRQ_EVENT_LOG_ENABLE
+    if (last_vector != 0 && (last_vector & mask) == 0 && last_vector != reported_mismatch) {
       log_warn("poll INT_VECTOR=0x%08x does not match mask=0x%08x", last_vector, mask);
+      reported_mismatch = last_vector;
     } else if (last_vector != 0 && mask != PA_PU_IRQ_GIC_END) {
       log_info("poll INT_VECTOR=0x%08x", last_vector);
     }
+#endif
     if ((last_vector & mask) != 0) {
       if (int_vector_out != NULL) {
         *int_vector_out = seen_vector;
@@ -764,12 +757,14 @@ int pa_pu_wait_int_vector_all(uint32_t mask, unsigned timeout_ms, uint32_t* int_
     pa_pu_trace("wait_all_after_wait_one", mask & ~accumulated_vector, current_vector);
     if (current_vector != 0) {
       accumulated_vector |= current_vector;
+#if PA_PU_IRQ_EVENT_LOG_ENABLE
       if ((current_vector & mask) == 0 || (accumulated_vector & mask) != mask) {
         log_warn("accumulated INT_VECTOR=0x%08x wait_mask=0x%08x current=0x%08x",
                  accumulated_vector,
                  mask,
                  current_vector);
       }
+#endif
     }
 
     if ((accumulated_vector & mask) == mask) {
@@ -1019,6 +1014,25 @@ void pa_pu_start_dync(void) {
 
 void pa_pu_stop_dync(void) {
   pa_pu_write(PA_PU_DYNC_STOP_REG, 1);
+}
+
+void pa_pu_configure_img_upload(const pa_pu_img_upload_config_t* config) {
+  if (config == NULL) {
+    return;
+  }
+
+  /*
+   * 图片上传模块只需要 DDR 首地址和本次上传尺寸。
+   * STR 单独写，便于 CONFIG_IMG_UPLOAD 后先读回寄存器再触发。
+   */
+  pa_pu_write_traced("config_img_upload", "img_upload_str_addr", PA_PU_IMG_UPLOAD_STR_ADDR_REG, config->image_addr);
+  pa_pu_write_traced("config_img_upload", "img_upload_pkg_num", PA_PU_IMG_UPLOAD_PKG_NUM_REG, config->pkg_num);
+  pa_pu_write_traced("config_img_upload", "img_upload_row_num", PA_PU_IMG_UPLOAD_ROW_NUM_REG, config->row_num);
+  pa_pu_write_traced("config_img_upload", "img_upload_col_num", PA_PU_IMG_UPLOAD_COL_NUM_REG, config->col_num);
+}
+
+void pa_pu_start_img_upload(void) {
+  pa_pu_write(PA_PU_IMG_UPLOAD_STR_REG, 1);
 }
 
 void pa_pu_configure_image_write(uint32_t image_addr) {

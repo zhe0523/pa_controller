@@ -1,0 +1,18 @@
+  localparam IMG_UPLOAD_STR_ADDR      = 16'hC_00; # start
+  localparam IMG_UPLOAD_STR_ADDR_ADDR = 16'hC_08; # addr
+  localparam IMG_UPLOAD_PKG_NUM_ADDR  = 16'hC_10; # IMG_UPLOAD_PKG_NUM_ADDR = IMG_UPLOAD_ROW_NUM_ADDR * IMG_UPLOAD_COL_NUM_ADDR * 2 / 1024
+  localparam IMG_UPLOAD_ROW_NUM_ADDR  = 16'hC_18;
+  localparam IMG_UPLOAD_COL_NUM_ADDR  = 16'hC_20;
+  localparam IMG_UPLOAD_STATE_ADDR    = 16'hD_A0; # high busy
+  localparam IMG_UPLOAD_END_ADDR      = 16'hD_A8; # high active
+  localparam IMG_UPLOAD_DFX_ADDR      = 16'hD_C0; # debug
+
+  interrupt vector
+  bit 31~7: reserved
+  bit 6 : img upload interrupt.
+  bit 5 : dynamic interrupt.
+  bit 4 : image correct interrupt.
+  bit 3 : image write interrupt.
+  bit 2 : roic interrupt
+  bit 1 : gic interrupt
+  bit 0 : pa reset init done interrupt

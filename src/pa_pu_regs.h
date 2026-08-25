@@ -219,20 +219,38 @@ enum {
   PA_PU_DYNC_STEP_9_CFG_H_REG = 0x0ab8,
   PA_PU_DYNC_STEP_9_CFG_L_REG = 0x0ac0,
   /*
-   * 注意：pa_pu_com_definition_add.xlsx 与 dynamic.txt 对 state/end 地址描述相反。
-   * 这里按 dynamic.txt/RTL localparam 风格记录：END=0x0ba0，STATE=0x0ba8。
+   * 已跟fpga核实，按照下面配置来。
    */
-  PA_PU_DYNC_END_REG = 0x0ba0,
-  PA_PU_DYNC_STATE_REG = 0x0ba8,
+  PA_PU_DYNC_STATE_REG = 0x0ba0,
+  PA_PU_DYNC_END_REG = 0x0ba8,
   /* 0x0bc0, pu->pa, 32bit：动态模块调试输入寄存器。 */
   PA_PU_DYNC_DEBUG_IN_REG = 0x0bc0,
   /* 0x0bc8, pa->pu, 32bit：动态模块调试输出寄存器。 */
   PA_PU_DYNC_DEBUG_OUT_REG = 0x0bc8,
+
+  /* img_upload：从指定 DDR 地址读取 offset/gain 模板并通过独立上传链路发送。 */
+  /* 0x0c00, pu->pa, 1bit：写 1 启动一次图片上传，高有效，RTL 自动清零。 */
+  PA_PU_IMG_UPLOAD_STR_REG = 0x0c00,
+  /* 0x0c08, pu->pa, 32bit：待上传图片在 DDR 中的起始物理地址。 */
+  PA_PU_IMG_UPLOAD_STR_ADDR_REG = 0x0c08,
+  /* 0x0c10, pu->pa, 16/32bit：上传分包数量，按 row * col * 2 / 1024 计算。 */
+  PA_PU_IMG_UPLOAD_PKG_NUM_REG = 0x0c10,
+  /* 0x0c18, pu->pa, 16/32bit：上传图片行数。 */
+  PA_PU_IMG_UPLOAD_ROW_NUM_REG = 0x0c18,
+  /* 0x0c20, pu->pa, 16/32bit：上传图片列数。 */
+  PA_PU_IMG_UPLOAD_COL_NUM_REG = 0x0c20,
+  /* 0x0da0, pa->pu, 1bit：图片上传模块状态，高电平表示 busy。 */
+  PA_PU_IMG_UPLOAD_STATE_REG = 0x0da0,
+  /* 0x0da8, pa->pu, 1bit：图片上传完成标志，高有效。 */
+  PA_PU_IMG_UPLOAD_END_REG = 0x0da8,
+  /* 0x0dc0, pa->pu, 32bit：图片上传调试/错误状态。 */
+  PA_PU_IMG_UPLOAD_DFX_REG = 0x0dc0,
 };
 
 /*
  * int_vector bit 定义，按 pa_pu_com_definition.xlsx 协议表执行：
- * bit31~6 reserved
+ * bit31~7 reserved
+ * bit6 image upload interrupt
  * bit5 dynamic interrupt
  * bit4 image correct interrupt
  * bit3 image write interrupt
@@ -256,6 +274,8 @@ enum {
   PA_PU_IRQ_IMG_CORR_END = 1u << 4,
   /* bit5：动态模块完成中断。 */
   PA_PU_IRQ_DYNC_END = 1u << 5,
+  /* bit6：图片上传模块完成中断。 */
+  PA_PU_IRQ_IMG_UPLOAD_END = 1u << 6,
 };
 
 enum {
@@ -273,12 +293,23 @@ enum {
 };
 
 enum {
+  /* 新版 GIC/ROIC 协议使用连续编码 0~7；其它值由 FPGA 按 1x1 处理。 */
   /* 不合并像素，1x1 输出。 */
   PA_PU_BINNING_1X1 = 0u,
   /* 2x2 binning。 */
   PA_PU_BINNING_2X2 = 1u,
+  /* 3x3 binning。 */
+  PA_PU_BINNING_3X3 = 2u,
   /* 4x4 binning。 */
   PA_PU_BINNING_4X4 = 3u,
+  /* 5x5 binning。 */
+  PA_PU_BINNING_5X5 = 4u,
+  /* 6x6 binning。 */
+  PA_PU_BINNING_6X6 = 5u,
+  /* 7x7 binning。 */
+  PA_PU_BINNING_7X7 = 6u,
+  /* 8x8 binning。 */
+  PA_PU_BINNING_8X8 = 7u,
 };
 
 /* IMG_CORR 写地址按当前协议表直接写入；保留 WR_* 名称，避免上层调用点反复改动。 */

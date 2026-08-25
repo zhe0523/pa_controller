@@ -63,6 +63,37 @@ typedef struct {
   uint32_t last_int_vector;
 } cal_dynamic_offset_result_t;
 
+/* 模板制作统一后台任务，避免采集/计算期间阻塞串口命令线程。 */
+typedef enum {
+  CAL_TASK_NONE = 0,
+  CAL_TASK_MAKE_OFFSET,
+  CAL_TASK_MAKE_GAIN,
+  CAL_TASK_DYNAMIC_OFFSET,
+  CAL_TASK_GAIN_CAPTURE,
+  CAL_TASK_GAIN_BUILD,
+} cal_task_kind_t;
+
+typedef enum {
+  CAL_TASK_IDLE = 0,
+  CAL_TASK_RUNNING,
+  CAL_TASK_STOPPING,
+  CAL_TASK_SUCCEEDED,
+  CAL_TASK_FAILED,
+  CAL_TASK_CANCELED,
+} cal_task_state_t;
+
+typedef struct {
+  uint32_t task_id;
+  cal_task_kind_t kind;
+  cal_task_state_t state;
+  bool stop_requested;
+  int last_error;
+  uint32_t progress_current;
+  uint32_t progress_total;
+  uint32_t gain_level;
+  cal_dynamic_offset_result_t dynamic_offset;
+} cal_task_status_t;
+
 /*
  * 动态模式 offset 模板制作。
  *
@@ -76,3 +107,20 @@ int calibration_dynamic_offset_make(fpga_mem_t* mem,
                                     uint32_t frames,
                                     uint32_t valid_frames,
                                     cal_dynamic_offset_result_t* result);
+
+/* start 成功只表示后台任务已经创建，不表示模板已经制作完成。 */
+int calibration_task_start_make_offset(fpga_mem_t* mem);
+int calibration_task_start_make_gain(fpga_mem_t* mem);
+int calibration_task_start_dynamic_offset(fpga_mem_t* mem,
+                                          const pa_pu_dync_config_t* dync_config,
+                                          bool write_dync_config,
+                                          uint32_t frames,
+                                          uint32_t valid_frames);
+int calibration_task_start_gain_capture(fpga_mem_t* mem, uint32_t level);
+int calibration_task_start_gain_build(fpga_mem_t* mem);
+bool calibration_task_request_stop(void);
+bool calibration_task_is_active(void);
+void calibration_task_get_status(cal_task_status_t* status);
+void calibration_task_shutdown(void);
+const char* calibration_task_kind_name(cal_task_kind_t kind);
+const char* calibration_task_state_name(cal_task_state_t state);

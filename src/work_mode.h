@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "dynamic_mode.h"
 #include "fpga_mem.h"
 #include "pa_pu.h"
 
@@ -33,6 +34,11 @@ typedef enum {
   WORK_STATE_BRIGHT_CAPTURE,
   WORK_STATE_DARK_WINDOW,
   WORK_STATE_DARK_CAPTURE,
+  WORK_STATE_DYNAMIC_STARTING,
+  WORK_STATE_DYNAMIC_RUNNING,
+  WORK_STATE_DYNAMIC_STOPPING,
+  /* Dynamic 有限 cycle 正常完成，与人工 STOPPED 区分。 */
+  WORK_STATE_DYNAMIC_COMPLETED,
   WORK_STATE_ERROR,
 } work_state_t;
 
@@ -47,6 +53,10 @@ typedef enum {
   WORK_PHASE_BRIGHT_CAPTURE,
   WORK_PHASE_DARK_WINDOW,
   WORK_PHASE_DARK_CAPTURE,
+  WORK_PHASE_DYNAMIC_CONFIGURE,
+  WORK_PHASE_DYNAMIC_START_WAIT,
+  WORK_PHASE_DYNAMIC_RUNNING,
+  WORK_PHASE_DYNAMIC_STOP_WAIT,
 } work_phase_t;
 
 /* Static Idle 模式配置：一次上位机采图请求会依次产生 offset 模板帧和实际输出帧。 */
@@ -94,10 +104,14 @@ typedef struct {
   uint32_t capture_id;
   /* uio2 环形 DDR 池的下一帧偏移；尾部不足一帧时回到 0。 */
   uint32_t ddr_next_offset;
-  /* uio2 DDR 池单帧需要的对齐步进。 */
+  /* uio2 DDR 池单帧需要的对齐步进。45MB */
   size_t ddr_frame_stride;
   /* 当前环形池实际启用的帧数；0 不合法。 */
   size_t ddr_frame_count;
+  /* Dynamic 只报告 FPGA 自主运行状态；逐帧数据由 GIC dout 链直接输出。 */
+  uint32_t dynamic_dync_state;
+  uint32_t dynamic_dync_end;
+  uint32_t dynamic_dync_debug_out;
 } work_mode_status_t;
 
 /*
@@ -118,6 +132,8 @@ typedef struct work_mode_context {
   fpga_mem_t* fpga_mem;
   static_idle_config_t config;
   work_mode_status_t status;
+  /* Dynamic 使用独立工作线程，但由本上下文统一负责模式互斥和退出回收。 */
+  dynamic_mode_context_t dynamic;
 } work_mode_context_t;
 
 /* 生成 Static Idle 默认配置，默认值来自 app_config.h/Makefile。 */
@@ -136,8 +152,16 @@ void work_mode_get_static_idle_config(work_mode_context_t* wm, static_idle_confi
 void work_mode_set_trace(work_mode_context_t* wm, bool enabled);
 /* 发起一次同步 Static Idle 采图请求，等待 offset 模板帧和实际输出帧完成后返回。 */
 int work_mode_start_static_idle_capture(work_mode_context_t* wm, work_mode_status_t* result);
+/* 启动 FPGA 自主 Continuous/Dynamic；启动前会停止 Static Idle。 */
+int work_mode_start_dynamic(work_mode_context_t* wm);
+/* 更新正式 Continuous 参数；FPGA Dynamic 运行中返回 -2。 */
+int work_mode_update_dynamic_config(work_mode_context_t* wm, const pa_pu_dync_config_t* config);
+/* 停止 Dynamic；返回后工作线程已回收或状态进入 ERROR。 */
+int work_mode_stop_dynamic(work_mode_context_t* wm, work_mode_status_t* result);
 /* 读取工作线程状态快照。 */
 void work_mode_get_status(work_mode_context_t* wm, work_mode_status_t* status);
+/* 读取正式 Continuous 当前保存的 Dynamic 配置。 */
+void work_mode_get_dynamic_config(work_mode_context_t* wm, pa_pu_dync_config_t* config);
 /* 判断当前是否允许 WRITE_REG 直接写寄存器；采图窗口和采图阶段禁止写。 */
 bool work_mode_allows_write_reg(work_mode_context_t* wm);
 /* 判断当前是否允许调试型硬件动作命令，避免和正式采图时序交叉。 */

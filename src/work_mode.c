@@ -58,6 +58,10 @@ const char* work_mode_state_name(work_state_t state) {
     case WORK_STATE_BRIGHT_CAPTURE: return "BRIGHT_CAPTURE";
     case WORK_STATE_DARK_WINDOW: return "DARK_WINDOW";
     case WORK_STATE_DARK_CAPTURE: return "DARK_CAPTURE";
+    case WORK_STATE_DYNAMIC_STARTING: return "DYNAMIC_STARTING";
+    case WORK_STATE_DYNAMIC_RUNNING: return "DYNAMIC_RUNNING";
+    case WORK_STATE_DYNAMIC_STOPPING: return "DYNAMIC_STOPPING";
+    case WORK_STATE_DYNAMIC_COMPLETED: return "DYNAMIC_COMPLETED";
     case WORK_STATE_ERROR: return "ERROR";
     default: return "UNKNOWN";
   }
@@ -71,8 +75,52 @@ const char* work_mode_phase_name(work_phase_t phase) {
     case WORK_PHASE_BRIGHT_CAPTURE: return "bright_capture";
     case WORK_PHASE_DARK_WINDOW: return "dark_window";
     case WORK_PHASE_DARK_CAPTURE: return "dark_capture";
+    case WORK_PHASE_DYNAMIC_CONFIGURE: return "dynamic_configure";
+    case WORK_PHASE_DYNAMIC_START_WAIT: return "dynamic_start_wait";
+    case WORK_PHASE_DYNAMIC_RUNNING: return "dynamic_running";
+    case WORK_PHASE_DYNAMIC_STOP_WAIT: return "dynamic_stop_wait";
     default: return "unknown";
   }
+}
+
+static work_state_t dynamic_state_to_work_state(dynamic_state_t state) {
+  switch (state) {
+    case DYNAMIC_STATE_STOPPED: return WORK_STATE_STOPPED;
+    case DYNAMIC_STATE_STARTING: return WORK_STATE_DYNAMIC_STARTING;
+    case DYNAMIC_STATE_RUNNING: return WORK_STATE_DYNAMIC_RUNNING;
+    case DYNAMIC_STATE_STOPPING: return WORK_STATE_DYNAMIC_STOPPING;
+    case DYNAMIC_STATE_COMPLETED: return WORK_STATE_DYNAMIC_COMPLETED;
+    case DYNAMIC_STATE_ERROR: return WORK_STATE_ERROR;
+    default: return WORK_STATE_ERROR;
+  }
+}
+
+static work_phase_t dynamic_phase_to_work_phase(dynamic_phase_t phase) {
+  switch (phase) {
+    case DYNAMIC_PHASE_NONE: return WORK_PHASE_NONE;
+    case DYNAMIC_PHASE_CONFIGURE: return WORK_PHASE_DYNAMIC_CONFIGURE;
+    case DYNAMIC_PHASE_START_WAIT: return WORK_PHASE_DYNAMIC_START_WAIT;
+    case DYNAMIC_PHASE_RUNNING: return WORK_PHASE_DYNAMIC_RUNNING;
+    case DYNAMIC_PHASE_STOP_WAIT: return WORK_PHASE_DYNAMIC_STOP_WAIT;
+    default: return WORK_PHASE_NONE;
+  }
+}
+
+static void overlay_dynamic_status(work_mode_status_t* status,
+                                   const dynamic_mode_status_t* dynamic_status) {
+  if (status == NULL || dynamic_status == NULL) {
+    return;
+  }
+  status->mode = WORK_MODE_CONTINUOUS;
+  status->state = dynamic_state_to_work_state(dynamic_status->state);
+  status->stop_requested = dynamic_status->stop_requested;
+  status->last_error = dynamic_status->last_error;
+  status->last_phase = dynamic_phase_to_work_phase(dynamic_status->phase);
+  status->last_int_vector = 0u;
+  status->last_wait_mask = 0u;
+  status->dynamic_dync_state = dynamic_status->last_dync_state;
+  status->dynamic_dync_end = dynamic_status->last_dync_end;
+  status->dynamic_dync_debug_out = dynamic_status->last_dync_debug_out;
 }
 
 static void work_trace(work_mode_context_t* wm,
@@ -168,22 +216,15 @@ static void record_error_locked(work_mode_context_t* wm,
 static bool alloc_frame_locked(work_mode_context_t* wm, const char* phase, uint32_t* addr_out) {
   /*
    * uio2 作为实际输出图像池，按整帧步进做环形分配。
-   * STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU=1 时，第 0 帧保留给 bright 临时帧，
-   * 实际输出图从第 1 帧开始回环，避免 bright scratch 和 output 复用同一地址。
    * 边界行为：如果尾部剩余空间不足一帧，下一帧从池起始地址重新开始；
    * 单帧永远不跨越 uio2 尾部。
    */
-  const size_t first_output_offset =
-      STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU ? wm->status.ddr_frame_stride : 0u;
   size_t offset = wm->status.ddr_next_offset;
   size_t pool_limit = wm->status.ddr_frame_stride * wm->status.ddr_frame_count;
   bool wrapped = false;
 
-  if (offset < first_output_offset) {
-    offset = first_output_offset;
-  }
   if (offset + wm->status.ddr_frame_stride > pool_limit) {
-    offset = first_output_offset;
+    offset = 0u;
     wrapped = true;
   }
 
@@ -358,49 +399,14 @@ static int run_capture_phase(work_mode_context_t* wm,
   return ret > 0 ? 0 : -1;
 }
 
-static int copy_bright_to_offset_template(work_mode_context_t* wm, uint32_t bright_addr) {
-  /*
-   * 调试模式：避免 FPGA 直接写 uio0/offset，先让 FPGA 写 uio2 基地址。
-   * bright 完成后由 ARM 复制到 uio0，用来判断卡死是否和 FPGA 写 offset 区有关。
-   */
-  if (wm->fpga_mem->image_pool == NULL ||
-      wm->fpga_mem->offset_template == NULL ||
-      bright_addr != wm->fpga_mem->image_pool_phys_base ||
-      wm->fpga_mem->image_pool_map_size < ACTIVE_IMAGE_BYTES ||
-      wm->fpga_mem->offset_map_size < ACTIVE_IMAGE_BYTES) {
-    log_error("static bright copy invalid bright_addr=0x%08x image_pool=0x%08x image_size=0x%lx offset=0x%08x offset_size=0x%lx",
-              bright_addr,
-              wm->fpga_mem->image_pool_phys_base,
-              (unsigned long)wm->fpga_mem->image_pool_map_size,
-              wm->fpga_mem->offset_phys_base,
-              (unsigned long)wm->fpga_mem->offset_map_size);
-    return -1;
-  }
-
-  memcpy(wm->fpga_mem->offset_template, wm->fpga_mem->image_pool, ACTIVE_IMAGE_BYTES);
-  log_info("static bright copied to offset template src=0x%08x dst=0x%08x bytes=0x%lx",
-           bright_addr,
-           wm->fpga_mem->offset_phys_base,
-           (unsigned long)ACTIVE_IMAGE_BYTES);
-  return 0;
-}
-
 static int run_static_capture(work_mode_context_t* wm, const static_idle_config_t* config) {
   uint32_t bright_addr = 0;
   uint32_t dark_addr = 0;
 
   pthread_mutex_lock(&wm->mutex);
   wm->status.capture_id++;
-  /*
-   * 第一帧未矫正 light 作为 offset 模板。
-   * 默认 FPGA 直接写 uio0/offset；调试模式可改为先写 uio2，再由 ARM 复制到 uio0。
-   * 第二帧才是实际输出图，从 uio2 环形图像池分配地址。
-   */
-#if STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU
-  bright_addr = wm->fpga_mem->image_pool_phys_base;
-#else
+  /* 第一帧未校正 light 由 FPGA 直接写 uio0/offset，第二帧写 uio2 输出池。 */
   bright_addr = wm->fpga_mem->offset_phys_base;
-#endif
   bool output_ok = alloc_frame_locked(wm, "output", &dark_addr);
   if (!output_ok) {
     record_error_locked(wm, ENOSPC, WORK_PHASE_EXPOSURE_WINDOW, 0, 0);
@@ -443,15 +449,6 @@ static int run_static_capture(work_mode_context_t* wm, const static_idle_config_
                         &config->bright_gic, &config->bright_corr, bright_addr) != 0) {
     return -1;
   }
-#if STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU
-  if (copy_bright_to_offset_template(wm, bright_addr) != 0) {
-    pthread_mutex_lock(&wm->mutex);
-    record_error_locked(wm, EIO, WORK_PHASE_BRIGHT_CAPTURE, STATIC_CAPTURE_WAIT_MASK, wm->status.last_int_vector);
-    pthread_mutex_unlock(&wm->mutex);
-    pa_pu_dump_all_registers("copy_offset_failed");
-    return -1;
-  }
-#endif
   pthread_mutex_lock(&wm->mutex);
   set_state_locked(wm, WORK_STATE_DARK_WINDOW, WORK_PHASE_DARK_WINDOW);
   pthread_mutex_unlock(&wm->mutex);
@@ -603,40 +600,44 @@ int work_mode_init(work_mode_context_t* wm, fpga_mem_t* fpga_mem) {
   wm->status.ddr_frame_stride = align_up_size(ACTIVE_IMAGE_BYTES, DDR_IMAGE_FRAME_ALIGN);
   size_t max_frame_count = wm->status.ddr_frame_stride == 0 ? 0 : fpga_mem->image_pool_map_size / wm->status.ddr_frame_stride;
   wm->status.ddr_frame_count = DDR_IMAGE_POOL_FRAME_COUNT == 0 ? max_frame_count : (size_t)DDR_IMAGE_POOL_FRAME_COUNT;
-  if (STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU) {
-    wm->status.ddr_next_offset = (uint32_t)wm->status.ddr_frame_stride;
-  }
-
   if (wm->status.ddr_frame_stride == 0 ||
       wm->status.ddr_frame_stride > UINT32_MAX ||
       wm->status.ddr_frame_stride > fpga_mem->image_pool_map_size ||
       wm->status.ddr_frame_count == 0 ||
       wm->status.ddr_frame_count > max_frame_count ||
-      (STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU && wm->status.ddr_frame_count < 2u) ||
       fpga_mem->image_pool_phys_base == 0) {
-    log_error("static idle image pool invalid pool_base=0x%08x pool_size=0x%lx frame_stride=0x%lx frame_count=%lu max_frame_count=%lu via_cpu=%u",
+    log_error("static idle image pool invalid pool_base=0x%08x pool_size=0x%lx frame_stride=0x%lx frame_count=%lu max_frame_count=%lu",
               fpga_mem->image_pool_phys_base,
               (unsigned long)fpga_mem->image_pool_map_size,
               (unsigned long)wm->status.ddr_frame_stride,
               (unsigned long)wm->status.ddr_frame_count,
-              (unsigned long)max_frame_count,
-              STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU ? 1u : 0u);
+              (unsigned long)max_frame_count);
     return -1;
   }
 
-  log_info("work mode init image_pool_base=0x%08x image_pool_size=0x%lx frame_stride=0x%lx frame_count=%lu max_frame_count=%lu via_cpu=%u ring=1",
+  if (dynamic_mode_init(&wm->dynamic, fpga_mem) != 0) {
+    log_error("dynamic mode init failed");
+    pthread_cond_destroy(&wm->cond);
+    pthread_mutex_destroy(&wm->mutex);
+    wm->initialized = false;
+    return -1;
+  }
+
+  log_info("work mode init image_pool_base=0x%08x image_pool_size=0x%lx frame_stride=0x%lx frame_count=%lu max_frame_count=%lu ring=1",
            fpga_mem->image_pool_phys_base,
            (unsigned long)fpga_mem->image_pool_map_size,
            (unsigned long)wm->status.ddr_frame_stride,
            (unsigned long)wm->status.ddr_frame_count,
-           (unsigned long)max_frame_count,
-           STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU ? 1u : 0u);
+           (unsigned long)max_frame_count);
   return 0;
 }
 
 int work_mode_start(work_mode_context_t* wm) {
   if (wm == NULL || !wm->initialized) {
     return -1;
+  }
+  if (dynamic_mode_is_active(&wm->dynamic)) {
+    return -2;
   }
   pthread_mutex_lock(&wm->mutex);
   if (wm->thread_running) {
@@ -645,6 +646,7 @@ int work_mode_start(work_mode_context_t* wm) {
   }
   wm->stop_requested = false;
   wm->thread_running = true;
+  wm->status.mode = WORK_MODE_IDLE;
   pthread_mutex_unlock(&wm->mutex);
 
   if (pthread_create(&wm->thread, NULL, work_thread_main, wm) != 0) {
@@ -675,6 +677,9 @@ void work_mode_stop(work_mode_context_t* wm) {
     return;
   }
 
+  /* 进程退出和 STOP_WORK 都必须同时回收 Dynamic 与 Static Idle。 */
+  (void)dynamic_mode_stop(&wm->dynamic);
+
   pthread_mutex_lock(&wm->mutex);
   wm->stop_requested = true;
   pthread_cond_broadcast(&wm->cond);
@@ -689,6 +694,9 @@ void work_mode_stop(work_mode_context_t* wm) {
 int work_mode_update_static_idle_config(work_mode_context_t* wm, const static_idle_config_t* config) {
   if (wm == NULL || config == NULL) {
     return -1;
+  }
+  if (dynamic_mode_is_active(&wm->dynamic)) {
+    return -2;
   }
 
   pthread_mutex_lock(&wm->mutex);
@@ -718,6 +726,12 @@ void work_mode_get_static_idle_config(work_mode_context_t* wm, static_idle_confi
 int work_mode_start_static_idle_capture(work_mode_context_t* wm, work_mode_status_t* result) {
   if (wm == NULL) {
     return -1;
+  }
+  if (dynamic_mode_is_active(&wm->dynamic)) {
+    if (result != NULL) {
+      work_mode_get_status(wm, result);
+    }
+    return -2;
   }
 
   pthread_mutex_lock(&wm->mutex);
@@ -766,27 +780,110 @@ void work_mode_get_status(work_mode_context_t* wm, work_mode_status_t* status) {
   *status = wm->status;
   status->pending_capture = wm->pending_capture;
   status->stop_requested = wm->stop_requested;
+  work_mode_t mode = wm->status.mode;
   pthread_mutex_unlock(&wm->mutex);
+
+  if (mode == WORK_MODE_CONTINUOUS || dynamic_mode_is_active(&wm->dynamic)) {
+    dynamic_mode_status_t dynamic_status;
+    memset(&dynamic_status, 0, sizeof(dynamic_status));
+    dynamic_mode_get_status(&wm->dynamic, &dynamic_status);
+    overlay_dynamic_status(status, &dynamic_status);
+  }
+}
+
+void work_mode_get_dynamic_config(work_mode_context_t* wm, pa_pu_dync_config_t* config) {
+  if (wm == NULL || config == NULL || !wm->initialized) {
+    return;
+  }
+  dynamic_mode_config_t dynamic_config;
+  memset(&dynamic_config, 0, sizeof(dynamic_config));
+  dynamic_mode_get_config(&wm->dynamic, &dynamic_config);
+  *config = dynamic_config.dync;
 }
 
 bool work_mode_allows_write_reg(work_mode_context_t* wm) {
   if (wm == NULL) {
     return true;
   }
-  pthread_mutex_lock(&wm->mutex);
+  if (dynamic_mode_is_active(&wm->dynamic)) {
+    return false;
+  }
+  work_mode_status_t status;
+  work_mode_get_status(wm, &status);
   /* 调试写寄存器只允许在空闲等待或工作线程停止时进行，避免破坏正式采图链路。 */
-  bool allowed = wm->status.state == WORK_STATE_IDLE_WAIT || wm->status.state == WORK_STATE_STOPPED;
-  pthread_mutex_unlock(&wm->mutex);
-  return allowed;
+  return status.state == WORK_STATE_IDLE_WAIT ||
+         status.state == WORK_STATE_STOPPED ||
+         status.state == WORK_STATE_DYNAMIC_COMPLETED;
 }
 
 bool work_mode_allows_hardware_action(work_mode_context_t* wm) {
   if (wm == NULL) {
     return true;
   }
-  pthread_mutex_lock(&wm->mutex);
+  if (dynamic_mode_is_active(&wm->dynamic)) {
+    return false;
+  }
+  work_mode_status_t status;
+  work_mode_get_status(wm, &status);
   /* CONFIG/START 类调试命令和 WRITE_REG 共用同一套忙碌保护策略。 */
-  bool allowed = wm->status.state == WORK_STATE_IDLE_WAIT || wm->status.state == WORK_STATE_STOPPED;
+  return status.state == WORK_STATE_IDLE_WAIT ||
+         status.state == WORK_STATE_STOPPED ||
+         status.state == WORK_STATE_DYNAMIC_COMPLETED;
+}
+
+int work_mode_start_dynamic(work_mode_context_t* wm) {
+  if (wm == NULL || !wm->initialized) {
+    return -1;
+  }
+
+  /* Dynamic 与 Static Idle 共用 GIC/ROIC/IMG_CORR/DDR，启动前先回收 Static Idle。 */
+  pthread_mutex_lock(&wm->mutex);
+  bool static_running = wm->thread_running;
   pthread_mutex_unlock(&wm->mutex);
-  return allowed;
+  if (static_running) {
+    work_mode_stop(wm);
+  }
+
+  pthread_mutex_lock(&wm->mutex);
+  wm->status.mode = WORK_MODE_CONTINUOUS;
+  wm->status.state = WORK_STATE_DYNAMIC_STARTING;
+  wm->status.last_error = 0;
+  wm->status.last_phase = WORK_PHASE_NONE;
+  pthread_cond_broadcast(&wm->cond);
+  pthread_mutex_unlock(&wm->mutex);
+
+  int ret = dynamic_mode_start(&wm->dynamic);
+  if (ret != 0) {
+    pthread_mutex_lock(&wm->mutex);
+    wm->status.state = WORK_STATE_ERROR;
+    wm->status.last_error = ret == -2 ? EBUSY : EIO;
+    pthread_cond_broadcast(&wm->cond);
+    pthread_mutex_unlock(&wm->mutex);
+  }
+  return ret;
+}
+
+int work_mode_update_dynamic_config(work_mode_context_t* wm, const pa_pu_dync_config_t* config) {
+  if (wm == NULL || config == NULL || !wm->initialized) {
+    return -1;
+  }
+
+  dynamic_mode_config_t dynamic_config;
+  if (dynamic_mode_default_config(wm->fpga_mem, &dynamic_config) != 0) {
+    return -1;
+  }
+  dynamic_config.dync = *config;
+  return dynamic_mode_update_config(&wm->dynamic, &dynamic_config);
+}
+
+int work_mode_stop_dynamic(work_mode_context_t* wm, work_mode_status_t* result) {
+  if (wm == NULL || !wm->initialized) {
+    return -1;
+  }
+
+  int ret = dynamic_mode_stop(&wm->dynamic);
+  if (result != NULL) {
+    work_mode_get_status(wm, result);
+  }
+  return ret;
 }

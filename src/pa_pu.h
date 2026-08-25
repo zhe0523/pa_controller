@@ -113,6 +113,23 @@ typedef struct {
   uint32_t step_cfg_l[PA_PU_DYNC_STEP_COUNT];
 } pa_pu_dync_config_t;
 
+/*
+ * 模板图片上传参数。
+ *
+ * ARM 写入 offset/gain 模板的 DDR 首地址、图像尺寸和 1KB 分包数量，
+ * 然后通过 IMG_UPLOAD_STR 触发 FPGA 独立上传；Dynamic 正常数据不走本模块。
+ */
+typedef struct {
+  /* 待上传图片 DDR 物理地址。 */
+  uint32_t image_addr;
+  /* 上传分包数量，默认 row * col * 2 / 1024。 */
+  uint16_t pkg_num;
+  /* 上传图片行数。 */
+  uint16_t row_num;
+  /* 上传图片列数。 */
+  uint16_t col_num;
+} pa_pu_img_upload_config_t;
+
 /* STATUS 命令返回给上位机的核心 PA 状态快照。 */
 typedef struct {
   /* PA 版本号。 */
@@ -163,6 +180,12 @@ typedef struct {
   uint32_t dync_end;
   /* dynamic 调试输出。 */
   uint32_t dync_debug_out;
+  /* 图片上传模块状态，高电平表示 busy。 */
+  uint32_t img_upload_state;
+  /* 图片上传完成标志。 */
+  uint32_t img_upload_end;
+  /* 图片上传调试/错误状态。 */
+  uint32_t img_upload_dfx;
 } pa_pu_status_t;
 
 /* 打开 PA 寄存器映射：优先 UIO，失败后回退 /dev/mem + base_addr。 */
@@ -254,6 +277,12 @@ void pa_pu_start_dync(void);
 
 /* 写 DYNC_STOP，停止 dynamic 流程。 */
 void pa_pu_stop_dync(void);
+
+/* 配置图片上传模块参数，不启动上传。 */
+void pa_pu_configure_img_upload(const pa_pu_img_upload_config_t* config);
+
+/* 写 IMG_UPLOAD_STR，启动一次图片上传。 */
+void pa_pu_start_img_upload(void);
 
 /* 只配置 IMG_WR_STR_ADDR，不触发 IMG_WR_STR；image_addr 必须是 FPGA 可访问的 DDR 物理地址。 */
 void pa_pu_configure_image_write(uint32_t image_addr);

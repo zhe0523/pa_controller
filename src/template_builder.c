@@ -137,7 +137,7 @@ int template_load_files(fpga_mem_t* mem) {
   return ret;
 }
 
-int template_make_offset(fpga_mem_t* mem) {
+int template_make_offset_cancellable(fpga_mem_t* mem, template_cancel_fn cancel, void* opaque) {
   if (!fpga_mem_is_open(mem)) {
     return -1;
   }
@@ -150,9 +150,11 @@ int template_make_offset(fpga_mem_t* mem) {
     return -1;
   }
 
-  int fd = open(TEMPLATE_OFFSET_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  char temp_path[sizeof(TEMPLATE_OFFSET_FILE) + 16u];
+  snprintf(temp_path, sizeof(temp_path), "%s.tmp", TEMPLATE_OFFSET_FILE);
+  int fd = open(temp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd == -1) {
-    log_error("open %s failed: %d", TEMPLATE_OFFSET_FILE, errno);
+    log_error("open %s failed: %d", temp_path, errno);
     return -1;
   }
 
@@ -160,21 +162,35 @@ int template_make_offset(fpga_mem_t* mem) {
   uint16_t* offset = (uint16_t*)mem->offset_template;
 
   for (unsigned row = 0; row < IMAGE_HEIGHT; ++row) {
+    if (cancel != NULL && cancel(opaque)) {
+      close(fd);
+      unlink(temp_path);
+      return -2;
+    }
     const uint16_t* src_row = image + active_row_offset(row);
     copy_active_row_to_device(offset, row, src_row);
     if (write_all(fd, src_row, IMAGE_WIDTH * sizeof(uint16_t)) != 0) {
       log_error("write %s failed: %d", TEMPLATE_OFFSET_FILE, errno);
       close(fd);
+      unlink(temp_path);
       return -1;
     }
   }
 
   close(fd);
+  if (rename(temp_path, TEMPLATE_OFFSET_FILE) != 0) {
+    unlink(temp_path);
+    return -1;
+  }
   log_info("offset template created: %s", TEMPLATE_OFFSET_FILE);
   return 0;
 }
 
-int template_make_gain(fpga_mem_t* mem) {
+int template_make_offset(fpga_mem_t* mem) {
+  return template_make_offset_cancellable(mem, NULL, NULL);
+}
+
+int template_make_gain_cancellable(fpga_mem_t* mem, template_cancel_fn cancel, void* opaque) {
   if (!fpga_mem_is_open(mem)) {
     return -1;
   }
@@ -188,6 +204,9 @@ int template_make_gain(fpga_mem_t* mem) {
 
   /* 第一遍统计扣 offset 后的平均亮场值。 */
   for (unsigned row = 0; row < IMAGE_HEIGHT; ++row) {
+    if (cancel != NULL && cancel(opaque)) {
+      return -2;
+    }
     const uint16_t* image_row = image + active_row_offset(row);
     const uint16_t* offset_row = offset + active_row_offset(row);
     for (unsigned col = 0; col < IMAGE_WIDTH; ++col) {
@@ -209,9 +228,11 @@ int template_make_gain(fpga_mem_t* mem) {
     return -1;
   }
 
-  int fd = open(TEMPLATE_GAIN_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  char temp_path[sizeof(TEMPLATE_GAIN_FILE) + 16u];
+  snprintf(temp_path, sizeof(temp_path), "%s.tmp", TEMPLATE_GAIN_FILE);
+  int fd = open(temp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd == -1) {
-    log_error("open %s failed: %d", TEMPLATE_GAIN_FILE, errno);
+    log_error("open %s failed: %d", temp_path, errno);
     return -1;
   }
 
@@ -223,6 +244,11 @@ int template_make_gain(fpga_mem_t* mem) {
    * 如果 PA 端增益格式不同，只需要替换这一段换算逻辑。
    */
   for (unsigned row = 0; row < IMAGE_HEIGHT; ++row) {
+    if (cancel != NULL && cancel(opaque)) {
+      close(fd);
+      unlink(temp_path);
+      return -2;
+    }
     const uint16_t* image_row = image + active_row_offset(row);
     const uint16_t* offset_row = offset + active_row_offset(row);
     for (unsigned col = 0; col < IMAGE_WIDTH; ++col) {
@@ -235,12 +261,21 @@ int template_make_gain(fpga_mem_t* mem) {
     if (write_all(fd, row_buf, sizeof(row_buf)) != 0) {
       log_error("write %s failed: %d", TEMPLATE_GAIN_FILE, errno);
       close(fd);
+      unlink(temp_path);
       return -1;
     }
   }
 
   close(fd);
+  if (rename(temp_path, TEMPLATE_GAIN_FILE) != 0) {
+    unlink(temp_path);
+    return -1;
+  }
   log_info("gain template created: %s mean=%u", TEMPLATE_GAIN_FILE, mean);
   return 0;
+}
+
+int template_make_gain(fpga_mem_t* mem) {
+  return template_make_gain_cancellable(mem, NULL, NULL);
 }
 

@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,6 +15,7 @@
 #include "app_config.h"
 #include "log.h"
 #include "pa_pu.h"
+#include "template_builder.h"
 
 enum {
   CAL_GAIN_CAPTURE_WAIT_MASK = PA_PU_IRQ_IMG_CORR_END | PA_PU_IRQ_IMG_WR_END | PA_PU_IRQ_GIC_END,
@@ -39,6 +41,53 @@ typedef struct {
 } cal_gain_context_t;
 
 static cal_gain_context_t g_cal_gain;
+static pthread_mutex_t g_cal_gain_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct {
+  pthread_mutex_t mutex;
+  pthread_t thread;
+  bool thread_joinable;
+  bool active;
+  cal_task_status_t status;
+  fpga_mem_t* mem;
+  pa_pu_dync_config_t dync_config;
+  bool write_dync_config;
+  uint32_t frames;
+  uint32_t valid_frames;
+  uint32_t gain_level;
+} cal_task_context_t;
+
+static cal_task_context_t g_cal_task = {
+  .mutex = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static bool cal_task_stop_requested(void) {
+  pthread_mutex_lock(&g_cal_task.mutex);
+  bool requested = g_cal_task.status.stop_requested;
+  pthread_mutex_unlock(&g_cal_task.mutex);
+  return requested;
+}
+
+static bool cal_task_cancel_callback(void* opaque) {
+  (void)opaque;
+  pthread_mutex_lock(&g_cal_task.mutex);
+  if (g_cal_task.active &&
+      g_cal_task.status.progress_current < g_cal_task.status.progress_total) {
+    g_cal_task.status.progress_current++;
+  }
+  bool requested = g_cal_task.status.stop_requested;
+  pthread_mutex_unlock(&g_cal_task.mutex);
+  return requested;
+}
+
+static void cal_task_set_progress(uint32_t current, uint32_t total) {
+  pthread_mutex_lock(&g_cal_task.mutex);
+  if (g_cal_task.active) {
+    g_cal_task.status.progress_current = current;
+    g_cal_task.status.progress_total = total;
+  }
+  pthread_mutex_unlock(&g_cal_task.mutex);
+}
 
 static uint64_t calib_monotonic_ms(void) {
   struct timespec ts;
@@ -192,8 +241,15 @@ static int capture_one_raw_frame(fpga_mem_t* mem) {
   pa_pu_configure_gic(&gic);
   pa_pu_configure_image_write(mem->image_pool_phys_base);
   pa_pu_configure_correction(&corr);
+  /* 和停止请求串行化，避免 STOP_GIC 先写、随后工作线程又补发 START。 */
+  pthread_mutex_lock(&g_cal_task.mutex);
+  if (g_cal_task.status.stop_requested) {
+    pthread_mutex_unlock(&g_cal_task.mutex);
+    return -2;
+  }
   pa_pu_prepare_irq_wait();
   pa_pu_start_capture_triplet();
+  pthread_mutex_unlock(&g_cal_task.mutex);
   int ret = pa_pu_wait_int_vector_all(CAL_GAIN_CAPTURE_WAIT_MASK, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
   if (ret <= 0) {
     log_error("cal gain raw capture failed ret=%d int_vector=0x%08x wait_mask=0x%08x",
@@ -220,6 +276,11 @@ static int write_mean_file(const cal_gain_level_t* level, const uint32_t* sums, 
   }
 
   for (unsigned r = 0; r < IMAGE_HEIGHT; ++r) {
+    if (cal_task_stop_requested()) {
+      free(row);
+      close(fd);
+      return -2;
+    }
     const uint32_t* sum_row = sums + (size_t)r * IMAGE_WIDTH;
     for (unsigned c = 0; c < IMAGE_WIDTH; ++c) {
       row[c] = clamp_u16_from_u64(((uint64_t)sum_row[c] + frames / 2u) / frames);
@@ -254,6 +315,12 @@ static int compute_file_median(const char* path, uint32_t* median_out) {
   }
 
   for (unsigned r = 0; r < IMAGE_HEIGHT; ++r) {
+    if (cal_task_stop_requested()) {
+      close(fd);
+      free(histogram);
+      free(row);
+      return -2;
+    }
     if (read_all(fd, row, (size_t)IMAGE_WIDTH * sizeof(uint16_t)) != 0) {
       close(fd);
       free(histogram);
@@ -283,7 +350,7 @@ static int compute_file_median(const char* path, uint32_t* median_out) {
   return 0;
 }
 
-static void median_filter_radius5(const uint16_t* src, uint16_t* dst) {
+static int median_filter_radius5(const uint16_t* src, uint16_t* dst) {
   /*
    * 精确 11x11 中值滤波。
    * 每一行从左侧窗口建立 16bit 直方图，随后列方向滑动更新直方图；
@@ -292,10 +359,14 @@ static void median_filter_radius5(const uint16_t* src, uint16_t* dst) {
   uint32_t* hist = (uint32_t*)calloc(65536u, sizeof(uint32_t));
   if (hist == NULL) {
     memset(dst, 0, active_pixel_count() * sizeof(uint16_t));
-    return;
+    return -1;
   }
 
   for (unsigned r = 0; r < IMAGE_HEIGHT; ++r) {
+    if (cal_task_stop_requested()) {
+      free(hist);
+      return -2;
+    }
     memset(hist, 0, 65536u * sizeof(uint32_t));
     int row_begin = (int)r - FILTER_RADIUS;
     int row_end = (int)r + FILTER_RADIUS;
@@ -372,9 +443,10 @@ static void median_filter_radius5(const uint16_t* src, uint16_t* dst) {
   }
 
   free(hist);
+  return 0;
 }
 
-static void mean_filter_radius5(const uint16_t* src, uint16_t* dst) {
+static int mean_filter_radius5(const uint16_t* src, uint16_t* dst) {
   /*
    * 11x11 均值滤波使用列方向滑动和 + 行方向滑动和。
    * 这样只需要 IMAGE_WIDTH 个列累加值，不需要额外的大积分图。
@@ -382,12 +454,16 @@ static void mean_filter_radius5(const uint16_t* src, uint16_t* dst) {
   uint32_t* col_sum = (uint32_t*)calloc(IMAGE_WIDTH, sizeof(uint32_t));
   if (col_sum == NULL) {
     memset(dst, 0, active_pixel_count() * sizeof(uint16_t));
-    return;
+    return -1;
   }
 
   int current_top = 0;
   int current_bottom = -1;
   for (unsigned r = 0; r < IMAGE_HEIGHT; ++r) {
+    if (cal_task_stop_requested()) {
+      free(col_sum);
+      return -2;
+    }
     int target_top = (int)r - FILTER_RADIUS;
     int target_bottom = (int)r + FILTER_RADIUS;
     if (target_top < 0) {
@@ -442,6 +518,7 @@ static void mean_filter_radius5(const uint16_t* src, uint16_t* dst) {
   }
 
   free(col_sum);
+  return 0;
 }
 
 static int load_mean_image(const char* path, uint16_t* image) {
@@ -468,6 +545,12 @@ static int build_bad_pixel_map(uint8_t* bad_map, uint32_t* bad_count) {
 
   memset(bad_map, 0, pixels);
   for (uint32_t level_index = 0; level_index < g_cal_gain.level_count; ++level_index) {
+    if (cal_task_stop_requested()) {
+      free(mean_image);
+      free(median_image);
+      free(filtered_image);
+      return -2;
+    }
     const cal_gain_level_t* level = &g_cal_gain.levels[level_index];
     if (load_mean_image(level->mean_path, mean_image) != 0) {
       free(mean_image);
@@ -477,8 +560,16 @@ static int build_bad_pixel_map(uint8_t* bad_map, uint32_t* bad_count) {
     }
 
     log_info("cal gain defect filter begin level=%u threshold=%.3f", level->level, g_cal_gain.defect_threshold);
-    median_filter_radius5(mean_image, median_image);
-    mean_filter_radius5(median_image, filtered_image);
+    int filter_ret = median_filter_radius5(mean_image, median_image);
+    if (filter_ret == 0) {
+      filter_ret = mean_filter_radius5(median_image, filtered_image);
+    }
+    if (filter_ret != 0) {
+      free(mean_image);
+      free(median_image);
+      free(filtered_image);
+      return filter_ret;
+    }
 
     for (size_t i = 0; i < pixels; ++i) {
       uint16_t original = mean_image[i];
@@ -528,6 +619,8 @@ static int build_gain_template(const uint8_t* bad_map) {
   uint16_t* rows[CAL_GAIN_MAX_LEVELS];
   uint16_t* out_row = NULL;
   int out_fd = -1;
+  char temp_path[sizeof(TEMPLATE_GAIN_FILE) + 16u];
+  snprintf(temp_path, sizeof(temp_path), "%s.tmp", TEMPLATE_GAIN_FILE);
 
   for (uint32_t i = 0; i < CAL_GAIN_MAX_LEVELS; ++i) {
     mean_fds[i] = -1;
@@ -551,12 +644,15 @@ static int build_gain_template(const uint8_t* bad_map) {
     goto fail;
   }
 
-  out_fd = open(TEMPLATE_GAIN_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  out_fd = open(temp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (out_fd == -1) {
     goto fail;
   }
 
   for (unsigned r = 0; r < IMAGE_HEIGHT; ++r) {
+    if (cal_task_stop_requested()) {
+      goto canceled;
+    }
     for (uint32_t i = 0; i < g_cal_gain.level_count; ++i) {
       if (read_all(mean_fds[i], rows[i], (size_t)IMAGE_WIDTH * sizeof(uint16_t)) != 0) {
         goto fail;
@@ -596,6 +692,10 @@ static int build_gain_template(const uint8_t* bad_map) {
   }
 
   close(out_fd);
+  out_fd = -1;
+  if (rename(temp_path, TEMPLATE_GAIN_FILE) != 0) {
+    goto fail;
+  }
   for (uint32_t i = 0; i < g_cal_gain.level_count; ++i) {
     close(mean_fds[i]);
     free(rows[i]);
@@ -603,10 +703,25 @@ static int build_gain_template(const uint8_t* bad_map) {
   free(out_row);
   return 0;
 
+canceled:
+  if (out_fd != -1) {
+    close(out_fd);
+  }
+  unlink(temp_path);
+  for (uint32_t i = 0; i < g_cal_gain.level_count; ++i) {
+    if (mean_fds[i] != -1) {
+      close(mean_fds[i]);
+    }
+    free(rows[i]);
+  }
+  free(out_row);
+  return -2;
+
 fail:
   if (out_fd != -1) {
     close(out_fd);
   }
+  unlink(temp_path);
   for (uint32_t i = 0; i < g_cal_gain.level_count; ++i) {
     if (mean_fds[i] != -1) {
       close(mean_fds[i]);
@@ -632,6 +747,11 @@ static int load_gain_file_to_mem(fpga_mem_t* mem) {
   /* gain 区只保存一份模板；多份重复写入已经取消，避免和 UIO 窗口配置产生歧义。 */
   uint16_t* gain = (uint16_t*)mem->gain_template;
   for (unsigned r = 0; r < IMAGE_HEIGHT; ++r) {
+    if (cal_task_stop_requested()) {
+      free(row);
+      close(fd);
+      return -2;
+    }
     if (read_all(fd, row, (size_t)IMAGE_WIDTH * sizeof(uint16_t)) != 0) {
       free(row);
       close(fd);
@@ -655,10 +775,13 @@ static int wait_dynamic_done(uint32_t frame_index,
 
   /*
    * dynamic 协议约定：dync_state 为高表示动态流程仍在运行，只有状态回到低后，
-   * dynamic 完成中断 bit 才可靠。这里沿用 START_DYNC_WAIT 的等待语义。
+   * dynamic 完成中断 bit 才可靠。该等待只运行在模板后台线程，不占用命令线程。
    */
   log_info("dynamic offset wait state begin frame=%u/%u", frame_index, frame_count);
   for (;;) {
+    if (cal_task_stop_requested()) {
+      return -2;
+    }
     state = pa_pu_read(PA_PU_DYNC_STATE_REG);
     /*
      * dync_state 在寄存器表里是 1bit 状态。部分未使用高位可能不是 0，
@@ -683,6 +806,9 @@ static int wait_dynamic_done(uint32_t frame_index,
            state & 0x1u);
 
   uint32_t int_vector = 0;
+  if (cal_task_stop_requested()) {
+    return -2;
+  }
   log_info("dynamic offset wait irq begin frame=%u/%u expect=0x%08x", frame_index, frame_count, PA_PU_IRQ_DYNC_END);
   int ret = pa_pu_wait_int_vector(PA_PU_IRQ_DYNC_END, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
   if (ret <= 0) {
@@ -802,14 +928,33 @@ int calibration_dynamic_offset_make(fpga_mem_t* mem,
     uint32_t img_addr = 0;
     uint32_t int_vector = 0;
 
+    if (cal_task_stop_requested()) {
+      free(sums);
+      free(row);
+      return -2;
+    }
+    cal_task_set_progress(frame, frames);
     log_info("dynamic offset frame start frame=%u/%u used=%u", frame + 1u, frames, frame >= first_valid_frame ? 1u : 0u);
+    /* 和停止请求串行化，确保停止脉冲不会落在本帧 START 之前。 */
+    pthread_mutex_lock(&g_cal_task.mutex);
+    if (g_cal_task.status.stop_requested) {
+      pthread_mutex_unlock(&g_cal_task.mutex);
+      free(sums);
+      free(row);
+      return -2;
+    }
     pa_pu_prepare_irq_wait();
     log_info("dynamic offset frame irq prepared frame=%u/%u", frame + 1u, frames);
     pa_pu_start_dync();
+    pthread_mutex_unlock(&g_cal_task.mutex);
     log_info("dynamic offset frame dync started frame=%u/%u", frame + 1u, frames);
-    if (wait_dynamic_done(frame + 1u, frames, &int_vector, &img_addr) != 0) {
+    int wait_ret = wait_dynamic_done(frame + 1u, frames, &int_vector, &img_addr);
+    if (wait_ret != 0) {
       free(sums);
       free(row);
+      if (wait_ret == -2) {
+        return -2;
+      }
       pa_pu_dump_all_registers("make_dynamic_offset");
       return -1;
     }
@@ -828,6 +973,11 @@ int calibration_dynamic_offset_make(fpga_mem_t* mem,
     const bool use_frame = frame >= first_valid_frame;
     if (use_frame) {
       for (unsigned r = 0; r < IMAGE_HEIGHT; ++r) {
+        if (cal_task_stop_requested()) {
+          free(sums);
+          free(row);
+          return -2;
+        }
         const uint16_t* src_row = image + active_row_offset(r);
         uint32_t* sum_row = sums + (size_t)r * IMAGE_WIDTH;
         for (unsigned c = 0; c < IMAGE_WIDTH; ++c) {
@@ -838,6 +988,7 @@ int calibration_dynamic_offset_make(fpga_mem_t* mem,
 
     last_img_addr = img_addr;
     last_int_vector = int_vector;
+    cal_task_set_progress(frame + 1u, frames);
     log_info("dynamic offset capture frame=%u/%u valid=%u/%u used=%u img_addr=0x%08x int_vector=0x%08x",
              frame + 1u,
              frames,
@@ -854,7 +1005,9 @@ int calibration_dynamic_offset_make(fpga_mem_t* mem,
     return -1;
   }
 
-  int fd = open(TEMPLATE_OFFSET_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  char temp_path[sizeof(TEMPLATE_OFFSET_FILE) + 16u];
+  snprintf(temp_path, sizeof(temp_path), "%s.tmp", TEMPLATE_OFFSET_FILE);
+  int fd = open(temp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd == -1) {
     log_error("open %s failed: %d", TEMPLATE_OFFSET_FILE, errno);
     free(sums);
@@ -864,6 +1017,13 @@ int calibration_dynamic_offset_make(fpga_mem_t* mem,
 
   uint16_t* offset_template = (uint16_t*)mem->offset_template;
   for (unsigned r = 0; r < IMAGE_HEIGHT; ++r) {
+    if (cal_task_stop_requested()) {
+      close(fd);
+      unlink(temp_path);
+      free(sums);
+      free(row);
+      return -2;
+    }
     const uint32_t* sum_row = sums + (size_t)r * IMAGE_WIDTH;
     for (unsigned c = 0; c < IMAGE_WIDTH; ++c) {
       row[c] = clamp_u16_from_u64(((uint64_t)sum_row[c] + valid_frames / 2u) / valid_frames);
@@ -873,6 +1033,7 @@ int calibration_dynamic_offset_make(fpga_mem_t* mem,
     if (write_all(fd, row, (size_t)IMAGE_WIDTH * sizeof(uint16_t)) != 0) {
       log_error("write %s failed: %d", TEMPLATE_OFFSET_FILE, errno);
       close(fd);
+      unlink(temp_path);
       free(sums);
       free(row);
       return -1;
@@ -880,6 +1041,12 @@ int calibration_dynamic_offset_make(fpga_mem_t* mem,
   }
 
   close(fd);
+  if (rename(temp_path, TEMPLATE_OFFSET_FILE) != 0) {
+    unlink(temp_path);
+    free(sums);
+    free(row);
+    return -1;
+  }
   free(sums);
   free(row);
 
@@ -916,6 +1083,7 @@ int calibration_gain_begin(const uint32_t* levels,
     return -1;
   }
 
+  pthread_mutex_lock(&g_cal_gain_mutex);
   memset(&g_cal_gain, 0, sizeof(g_cal_gain));
   g_cal_gain.active = true;
   g_cal_gain.level_count = level_count;
@@ -929,6 +1097,7 @@ int calibration_gain_begin(const uint32_t* levels,
              CAL_GAIN_DIR,
              levels[i]);
   }
+  pthread_mutex_unlock(&g_cal_gain_mutex);
 
   log_info("cal gain begin levels=%u frames=%u threshold=%.3f", level_count, frames_per_level, defect_threshold);
   return 0;
@@ -953,11 +1122,21 @@ int calibration_gain_capture_level(fpga_mem_t* mem, uint32_t level_value) {
 
   const uint16_t* image = (const uint16_t*)mem->image_pool;
   for (uint32_t frame = 0; frame < g_cal_gain.frames_per_level; ++frame) {
-    if (capture_one_raw_frame(mem) != 0) {
+    if (cal_task_stop_requested()) {
       free(sums);
-      return -1;
+      return -2;
+    }
+    cal_task_set_progress(frame, g_cal_gain.frames_per_level);
+    int capture_ret = capture_one_raw_frame(mem);
+    if (capture_ret != 0) {
+      free(sums);
+      return capture_ret;
     }
     for (unsigned r = 0; r < IMAGE_HEIGHT; ++r) {
+      if (cal_task_stop_requested()) {
+        free(sums);
+        return -2;
+      }
       const uint16_t* src_row = image + active_row_offset(r);
       uint32_t* sum_row = sums + (size_t)r * IMAGE_WIDTH;
       for (unsigned c = 0; c < IMAGE_WIDTH; ++c) {
@@ -965,6 +1144,7 @@ int calibration_gain_capture_level(fpga_mem_t* mem, uint32_t level_value) {
       }
     }
     log_info("cal gain capture level=%u frame=%u/%u", level_value, frame + 1u, g_cal_gain.frames_per_level);
+    cal_task_set_progress(frame + 1u, g_cal_gain.frames_per_level);
   }
 
   int ret = write_mean_file(level, sums, g_cal_gain.frames_per_level);
@@ -973,10 +1153,15 @@ int calibration_gain_capture_level(fpga_mem_t* mem, uint32_t level_value) {
     return -1;
   }
 
-  if (compute_file_median(level->mean_path, &level->median) != 0) {
-    return -1;
+  uint32_t median = 0;
+  ret = compute_file_median(level->mean_path, &median);
+  if (ret != 0) {
+    return ret;
   }
+  pthread_mutex_lock(&g_cal_gain_mutex);
+  level->median = median;
   level->ready = true;
+  pthread_mutex_unlock(&g_cal_gain_mutex);
   log_info("cal gain level ready level=%u median=%u path=%s", level_value, level->median, level->mean_path);
   return 0;
 }
@@ -990,6 +1175,9 @@ int calibration_gain_build(fpga_mem_t* mem) {
     return -1;
   }
   for (uint32_t i = 0; i < g_cal_gain.level_count; ++i) {
+    if (cal_task_stop_requested()) {
+      return -2;
+    }
     if (!g_cal_gain.levels[i].ready) {
       log_error("cal gain build missing level=%u", g_cal_gain.levels[i].level);
       return -1;
@@ -1001,34 +1189,42 @@ int calibration_gain_build(fpga_mem_t* mem) {
     return -1;
   }
   uint32_t bad_count = 0;
-  if (build_bad_pixel_map(bad_map, &bad_count) != 0) {
+  int ret = build_bad_pixel_map(bad_map, &bad_count);
+  if (ret != 0) {
     free(bad_map);
-    return -1;
+    return ret;
   }
 
-  if (build_gain_template(bad_map) != 0) {
+  ret = build_gain_template(bad_map);
+  if (ret != 0) {
     free(bad_map);
-    return -1;
+    return ret;
   }
   free(bad_map);
 
-  if (load_gain_file_to_mem(mem) != 0) {
-    return -1;
+  ret = load_gain_file_to_mem(mem);
+  if (ret != 0) {
+    return ret;
   }
 
+  pthread_mutex_lock(&g_cal_gain_mutex);
   g_cal_gain.bad_pixel_count = bad_count;
+  pthread_mutex_unlock(&g_cal_gain_mutex);
   log_info("cal gain build done gain=%s bad_pixels=%u", TEMPLATE_GAIN_FILE, bad_count);
   return 0;
 }
 
 void calibration_gain_cancel(void) {
+  pthread_mutex_lock(&g_cal_gain_mutex);
   memset(&g_cal_gain, 0, sizeof(g_cal_gain));
+  pthread_mutex_unlock(&g_cal_gain_mutex);
 }
 
 void calibration_gain_get_status(cal_gain_status_t* status) {
   if (status == NULL) {
     return;
   }
+  pthread_mutex_lock(&g_cal_gain_mutex);
   memset(status, 0, sizeof(*status));
   status->active = g_cal_gain.active ? 1 : 0;
   status->level_count = g_cal_gain.level_count;
@@ -1043,5 +1239,289 @@ void calibration_gain_get_status(cal_gain_status_t* status) {
     if (g_cal_gain.levels[i].ready) {
       status->levels_ready++;
     }
+  }
+  pthread_mutex_unlock(&g_cal_gain_mutex);
+}
+
+const char* calibration_task_kind_name(cal_task_kind_t kind) {
+  switch (kind) {
+    case CAL_TASK_MAKE_OFFSET: return "MAKE_OFFSET";
+    case CAL_TASK_MAKE_GAIN: return "MAKE_GAIN";
+    case CAL_TASK_DYNAMIC_OFFSET: return "MAKE_DYNC_OFFSET";
+    case CAL_TASK_GAIN_CAPTURE: return "CAL_GAIN_CAPTURE";
+    case CAL_TASK_GAIN_BUILD: return "CAL_GAIN_BUILD";
+    case CAL_TASK_NONE:
+    default: return "NONE";
+  }
+}
+
+const char* calibration_task_state_name(cal_task_state_t state) {
+  switch (state) {
+    case CAL_TASK_RUNNING: return "RUNNING";
+    case CAL_TASK_STOPPING: return "STOPPING";
+    case CAL_TASK_SUCCEEDED: return "SUCCEEDED";
+    case CAL_TASK_FAILED: return "FAILED";
+    case CAL_TASK_CANCELED: return "CANCELED";
+    case CAL_TASK_IDLE:
+    default: return "IDLE";
+  }
+}
+
+static void configure_default_correction(fpga_mem_t* mem) {
+  pa_pu_corr_config_t corr = {
+    .pkg_num = CORR_DEFAULT_PKG_NUM,
+    .row_num = CORR_DEFAULT_ROW_NUM,
+    .col_num = CORR_DEFAULT_COL_NUM,
+    .offset_enable = CORR_DEFAULT_OFFSET_EN != 0,
+    .offset_template_addr = mem->offset_phys_base,
+    .offset_adder_value = CORR_DEFAULT_OFFSET_ADDER_VALUE,
+    .offset_corr_mode = CORR_DEFAULT_OFFSET_CORR_MODE,
+    .gain_enable = CORR_DEFAULT_GAIN_EN != 0,
+    .gain_template_addr = mem->gain_phys_base,
+    .gain_clipping_value = CORR_DEFAULT_GAIN_CLIPPING_VALUE,
+    .defect_enable = CORR_DEFAULT_DEFECT_EN != 0,
+  };
+  pa_pu_configure_correction(&corr);
+}
+
+static void* calibration_task_thread_main(void* opaque) {
+  (void)opaque;
+  cal_task_status_t finished;
+  pthread_mutex_lock(&g_cal_task.mutex);
+  cal_task_kind_t kind = g_cal_task.status.kind;
+  fpga_mem_t* mem = g_cal_task.mem;
+  pa_pu_dync_config_t dync_config = g_cal_task.dync_config;
+  bool write_dync_config = g_cal_task.write_dync_config;
+  uint32_t frames = g_cal_task.frames;
+  uint32_t valid_frames = g_cal_task.valid_frames;
+  uint32_t gain_level = g_cal_task.gain_level;
+  pthread_mutex_unlock(&g_cal_task.mutex);
+
+  int ret = -1;
+  cal_dynamic_offset_result_t dynamic_result;
+  memset(&dynamic_result, 0, sizeof(dynamic_result));
+
+  switch (kind) {
+    case CAL_TASK_MAKE_OFFSET:
+      ret = template_make_offset_cancellable(mem, cal_task_cancel_callback, NULL);
+      break;
+    case CAL_TASK_MAKE_GAIN:
+      ret = template_make_gain_cancellable(mem, cal_task_cancel_callback, NULL);
+      break;
+    case CAL_TASK_DYNAMIC_OFFSET:
+      ret = calibration_dynamic_offset_make(mem,
+                                            &dync_config,
+                                            write_dync_config,
+                                            frames,
+                                            valid_frames,
+                                            &dynamic_result);
+      break;
+    case CAL_TASK_GAIN_CAPTURE:
+      ret = calibration_gain_capture_level(mem, gain_level);
+      break;
+    case CAL_TASK_GAIN_BUILD:
+      ret = calibration_gain_build(mem);
+      break;
+    case CAL_TASK_NONE:
+    default:
+      ret = -1;
+      break;
+  }
+
+  bool canceled = cal_task_stop_requested() || ret == -2;
+  if (ret == 0 && !canceled) {
+    /* 仅在完整成功后重新下发校正配置，取消/失败时不启用半成品模板。 */
+    configure_default_correction(mem);
+  } else if (kind == CAL_TASK_MAKE_OFFSET ||
+             kind == CAL_TASK_MAKE_GAIN ||
+             kind == CAL_TASK_DYNAMIC_OFFSET ||
+             kind == CAL_TASK_GAIN_BUILD) {
+    /* 文件使用临时文件原子替换；失败时从旧文件恢复可能已部分改写的模板 DDR。 */
+    if (template_load_files(mem) != 0) {
+      log_warn("calibration task could not fully restore previous template files");
+    }
+  }
+
+  pthread_mutex_lock(&g_cal_task.mutex);
+  g_cal_task.status.dynamic_offset = dynamic_result;
+  g_cal_task.status.last_error = canceled ? 0 : ret;
+  g_cal_task.status.state = canceled ? CAL_TASK_CANCELED : (ret == 0 ? CAL_TASK_SUCCEEDED : CAL_TASK_FAILED);
+  g_cal_task.active = false;
+  finished = g_cal_task.status;
+  pthread_mutex_unlock(&g_cal_task.mutex);
+
+  log_info("calibration task finished id=%u kind=%s state=%s error=%d progress=%u/%u",
+           finished.task_id,
+           calibration_task_kind_name(kind),
+           calibration_task_state_name(finished.state),
+           finished.last_error,
+           finished.progress_current,
+           finished.progress_total);
+  return NULL;
+}
+
+static void calibration_task_reap_finished(void) {
+  pthread_t thread;
+  bool join = false;
+
+  pthread_mutex_lock(&g_cal_task.mutex);
+  if (g_cal_task.thread_joinable && !g_cal_task.active) {
+    thread = g_cal_task.thread;
+    g_cal_task.thread_joinable = false;
+    join = true;
+  }
+  pthread_mutex_unlock(&g_cal_task.mutex);
+
+  if (join) {
+    pthread_join(thread, NULL);
+  }
+}
+
+static int calibration_task_start_common(fpga_mem_t* mem,
+                                         cal_task_kind_t kind,
+                                         const pa_pu_dync_config_t* dync_config,
+                                         bool write_dync_config,
+                                         uint32_t frames,
+                                         uint32_t valid_frames,
+                                         uint32_t gain_level,
+                                         uint32_t progress_total) {
+  if (!fpga_mem_is_open(mem)) {
+    return -1;
+  }
+  calibration_task_reap_finished();
+
+  pthread_mutex_lock(&g_cal_task.mutex);
+  if (g_cal_task.active) {
+    pthread_mutex_unlock(&g_cal_task.mutex);
+    return -2;
+  }
+
+  uint32_t next_id = g_cal_task.status.task_id + 1u;
+  memset(&g_cal_task.status, 0, sizeof(g_cal_task.status));
+  g_cal_task.status.task_id = next_id == 0u ? 1u : next_id;
+  g_cal_task.status.kind = kind;
+  g_cal_task.status.state = CAL_TASK_RUNNING;
+  g_cal_task.status.progress_total = progress_total;
+  g_cal_task.status.gain_level = gain_level;
+  g_cal_task.mem = mem;
+  g_cal_task.write_dync_config = write_dync_config;
+  g_cal_task.frames = frames;
+  g_cal_task.valid_frames = valid_frames;
+  g_cal_task.gain_level = gain_level;
+  if (dync_config != NULL) {
+    g_cal_task.dync_config = *dync_config;
+  } else {
+    memset(&g_cal_task.dync_config, 0, sizeof(g_cal_task.dync_config));
+  }
+  g_cal_task.active = true;
+
+  if (pthread_create(&g_cal_task.thread, NULL, calibration_task_thread_main, NULL) != 0) {
+    g_cal_task.active = false;
+    g_cal_task.status.state = CAL_TASK_FAILED;
+    g_cal_task.status.last_error = errno != 0 ? errno : -1;
+    pthread_mutex_unlock(&g_cal_task.mutex);
+    return -1;
+  }
+  g_cal_task.thread_joinable = true;
+  pthread_mutex_unlock(&g_cal_task.mutex);
+  return 0;
+}
+
+int calibration_task_start_make_offset(fpga_mem_t* mem) {
+  return calibration_task_start_common(mem, CAL_TASK_MAKE_OFFSET, NULL, false, 0, 0, 0, IMAGE_HEIGHT);
+}
+
+int calibration_task_start_make_gain(fpga_mem_t* mem) {
+  return calibration_task_start_common(mem, CAL_TASK_MAKE_GAIN, NULL, false, 0, 0, 0, IMAGE_HEIGHT * 2u);
+}
+
+int calibration_task_start_dynamic_offset(fpga_mem_t* mem,
+                                          const pa_pu_dync_config_t* dync_config,
+                                          bool write_dync_config,
+                                          uint32_t frames,
+                                          uint32_t valid_frames) {
+  if (frames == 0u || valid_frames == 0u || valid_frames > frames ||
+      frames > CAL_DYNAMIC_OFFSET_MAX_FRAMES || (write_dync_config && dync_config == NULL)) {
+    return -1;
+  }
+  return calibration_task_start_common(mem,
+                                       CAL_TASK_DYNAMIC_OFFSET,
+                                       dync_config,
+                                       write_dync_config,
+                                       frames,
+                                       valid_frames,
+                                       0,
+                                       frames);
+}
+
+int calibration_task_start_gain_capture(fpga_mem_t* mem, uint32_t level) {
+  cal_gain_level_t* item = find_level(level);
+  if (!g_cal_gain.active || item == NULL) {
+    return -1;
+  }
+  return calibration_task_start_common(mem,
+                                       CAL_TASK_GAIN_CAPTURE,
+                                       NULL,
+                                       false,
+                                       0,
+                                       0,
+                                       level,
+                                       g_cal_gain.frames_per_level);
+}
+
+int calibration_task_start_gain_build(fpga_mem_t* mem) {
+  if (!g_cal_gain.active) {
+    return -1;
+  }
+  return calibration_task_start_common(mem, CAL_TASK_GAIN_BUILD, NULL, false, 0, 0, 0, IMAGE_HEIGHT);
+}
+
+bool calibration_task_request_stop(void) {
+  pthread_mutex_lock(&g_cal_task.mutex);
+  if (!g_cal_task.active) {
+    pthread_mutex_unlock(&g_cal_task.mutex);
+    return false;
+  }
+  g_cal_task.status.stop_requested = true;
+  g_cal_task.status.state = CAL_TASK_STOPPING;
+  cal_task_kind_t kind = g_cal_task.status.kind;
+  pthread_mutex_unlock(&g_cal_task.mutex);
+
+  /* 先让硬件状态机退出，后台线程随后会在轮询/行处理检查点释放内存和文件。 */
+  if (kind == CAL_TASK_DYNAMIC_OFFSET) {
+    pa_pu_stop_dync();
+  } else if (kind == CAL_TASK_GAIN_CAPTURE) {
+    pa_pu_stop_gic();
+  }
+  return true;
+}
+
+bool calibration_task_is_active(void) {
+  pthread_mutex_lock(&g_cal_task.mutex);
+  bool active = g_cal_task.active;
+  pthread_mutex_unlock(&g_cal_task.mutex);
+  return active;
+}
+
+void calibration_task_get_status(cal_task_status_t* status) {
+  if (status == NULL) {
+    return;
+  }
+  pthread_mutex_lock(&g_cal_task.mutex);
+  *status = g_cal_task.status;
+  pthread_mutex_unlock(&g_cal_task.mutex);
+}
+
+void calibration_task_shutdown(void) {
+  (void)calibration_task_request_stop();
+
+  pthread_mutex_lock(&g_cal_task.mutex);
+  bool join = g_cal_task.thread_joinable;
+  pthread_t thread = g_cal_task.thread;
+  g_cal_task.thread_joinable = false;
+  pthread_mutex_unlock(&g_cal_task.mutex);
+
+  if (join) {
+    pthread_join(thread, NULL);
   }
 }

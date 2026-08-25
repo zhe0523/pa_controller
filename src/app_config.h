@@ -96,14 +96,6 @@
 #define DDR_IMAGE_POOL_FRAME_COUNT 9u
 #endif
 
-#ifndef STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU
-/*
- * Static Idle 第一帧 light 模板写入策略。
- * 0：FPGA 直接写 uio0/offset；1：FPGA 先写 uio2，再由 ARM 复制到 uio0。
- */
-#define STATIC_IDLE_BRIGHT_TO_OFFSET_VIA_CPU 0u
-#endif
-
 #ifndef FPGA_MEM_USE_DEVMEM_FALLBACK
 /* UIO 映射失败时是否回退 /dev/mem；默认关闭，避免误碰裸物理地址。 */
 #define FPGA_MEM_USE_DEVMEM_FALLBACK 0u
@@ -168,6 +160,127 @@
 #define CORR_DEFAULT_DEFECT_EN 0u
 #endif
 
+#ifndef IMG_UPLOAD_DEFAULT_ADDR
+/* 无 UIO 上下文时的模板上传备用地址；正常运行默认使用 uio0 offset 模板地址。 */
+#define IMG_UPLOAD_DEFAULT_ADDR 0u
+#endif
+
+#ifndef IMG_UPLOAD_DEFAULT_ROW_NUM
+/* 图片上传默认行数，写入 IMG_UPLOAD_ROW_NUM。 */
+#define IMG_UPLOAD_DEFAULT_ROW_NUM IMAGE_HEIGHT
+#endif
+
+#ifndef IMG_UPLOAD_DEFAULT_COL_NUM
+/* 图片上传默认列数，写入 IMG_UPLOAD_COL_NUM。 */
+#define IMG_UPLOAD_DEFAULT_COL_NUM IMAGE_WIDTH
+#endif
+
+#ifndef IMG_UPLOAD_DEFAULT_PKG_NUM
+/*
+ * 图片上传默认分包数量，写入 IMG_UPLOAD_PKG_NUM。
+ * 默认按 16bit 图像字节数除以 1KB 计算。
+ */
+#define IMG_UPLOAD_DEFAULT_PKG_NUM ((IMG_UPLOAD_DEFAULT_ROW_NUM * IMG_UPLOAD_DEFAULT_COL_NUM * 2u) / 1024u)
+#endif
+
+#ifndef DYNAMIC_CYCLE_NUM
+/* FPGA Dynamic 默认执行 10 个 cycle。 */
+#define DYNAMIC_CYCLE_NUM 10u
+#endif
+
+#ifndef DYNAMIC_IMG_START_ADDR
+/* Dynamic 写图环形区默认起始物理地址。 */
+#define DYNAMIC_IMG_START_ADDR 0x26A00000u
+#endif
+
+#ifndef DYNAMIC_IMG_END_ADDR
+/* Dynamic 写图环形区默认结束物理地址。 */
+#define DYNAMIC_IMG_END_ADDR 0x3FFFFFFFu
+#endif
+
+#ifndef DYNAMIC_STEP_0_CFG_H
+/* Dynamic step0 high：enable=1，req_code=0（idle）。 */
+#define DYNAMIC_STEP_0_CFG_H 0x80000000u
+#endif
+
+#ifndef DYNAMIC_STEP_0_CFG_L
+/* Dynamic step0 idle 时间，单位 ms。 */
+#define DYNAMIC_STEP_0_CFG_L 50u
+#endif
+
+#ifndef DYNAMIC_STEP_1_CFG_H
+/* Dynamic step1 high：enable=1，req_code=4（采一张图）。 */
+#define DYNAMIC_STEP_1_CFG_H 0x80000004u
+#endif
+#ifndef DYNAMIC_STEP_1_CFG_L
+/* Dynamic step1 定时参数，单位 ms。 */
+#define DYNAMIC_STEP_1_CFG_L 50u
+#endif
+/* Step 2~9 未配置时默认关闭；high bit31=0 表示该步骤不参与 Dynamic 流程。 */
+#ifndef DYNAMIC_STEP_2_CFG_H
+#define DYNAMIC_STEP_2_CFG_H 0u
+#endif
+#ifndef DYNAMIC_STEP_2_CFG_L
+#define DYNAMIC_STEP_2_CFG_L 0u
+#endif
+#ifndef DYNAMIC_STEP_3_CFG_H
+#define DYNAMIC_STEP_3_CFG_H 0u
+#endif
+#ifndef DYNAMIC_STEP_3_CFG_L
+#define DYNAMIC_STEP_3_CFG_L 0u
+#endif
+#ifndef DYNAMIC_STEP_4_CFG_H
+#define DYNAMIC_STEP_4_CFG_H 0u
+#endif
+#ifndef DYNAMIC_STEP_4_CFG_L
+#define DYNAMIC_STEP_4_CFG_L 0u
+#endif
+#ifndef DYNAMIC_STEP_5_CFG_H
+#define DYNAMIC_STEP_5_CFG_H 0u
+#endif
+#ifndef DYNAMIC_STEP_5_CFG_L
+#define DYNAMIC_STEP_5_CFG_L 0u
+#endif
+#ifndef DYNAMIC_STEP_6_CFG_H
+#define DYNAMIC_STEP_6_CFG_H 0u
+#endif
+#ifndef DYNAMIC_STEP_6_CFG_L
+#define DYNAMIC_STEP_6_CFG_L 0u
+#endif
+#ifndef DYNAMIC_STEP_7_CFG_H
+#define DYNAMIC_STEP_7_CFG_H 0u
+#endif
+#ifndef DYNAMIC_STEP_7_CFG_L
+#define DYNAMIC_STEP_7_CFG_L 0u
+#endif
+#ifndef DYNAMIC_STEP_8_CFG_H
+#define DYNAMIC_STEP_8_CFG_H 0u
+#endif
+#ifndef DYNAMIC_STEP_8_CFG_L
+#define DYNAMIC_STEP_8_CFG_L 0u
+#endif
+#ifndef DYNAMIC_STEP_9_CFG_H
+#define DYNAMIC_STEP_9_CFG_H 0u
+#endif
+#ifndef DYNAMIC_STEP_9_CFG_L
+#define DYNAMIC_STEP_9_CFG_L 0u
+#endif
+
+#ifndef DYNAMIC_START_TIMEOUT_MS
+/* 写 DYNC_STR 后等待 DYNC_STATE busy 置位的最长时间。 */
+#define DYNAMIC_START_TIMEOUT_MS 1000u
+#endif
+
+#ifndef DYNAMIC_STATE_POLL_INTERVAL_MS
+/* Continuous 生命周期线程轮询非 read-clear Dynamic 状态寄存器的间隔。 */
+#define DYNAMIC_STATE_POLL_INTERVAL_MS 10u
+#endif
+
+#ifndef DYNAMIC_STOP_TIMEOUT_MS
+/* 收到停止请求并写 DYNC_STOP 后，等待 dynamic state 回到 idle 的最长时间。 */
+#define DYNAMIC_STOP_TIMEOUT_MS 2000u
+#endif
+
 #ifndef PA_PU_IRQ_TIMEOUT_MS
 /* start 类命令等待 INT_VECTOR 对应完成 bit 的默认超时时间，单位 ms。 */
 #define PA_PU_IRQ_TIMEOUT_MS 1000u
@@ -186,6 +299,15 @@
 #ifndef PA_PU_IRQ_POLL_BUSY_SPINS
 /* 忙等轮询每轮空转次数，仅用于调试规避 Linux sleep 唤醒卡死问题。 */
 #define PA_PU_IRQ_POLL_BUSY_SPINS 20000u
+#endif
+
+#ifndef PA_PU_IRQ_EVENT_LOG_ENABLE
+/*
+ * 每次收到 INT_VECTOR/F2P 中断时是否打印事件日志。
+ * 0：默认关闭，避免连续采集逐帧刷屏；1：用于现场确认中断和设备运行状态。
+ * 该开关只控制诊断日志，不改变中断读取、完成判断、超时或错误处理。
+ */
+#define PA_PU_IRQ_EVENT_LOG_ENABLE 0u
 #endif
 
 #ifndef PA_IRQ_DEVICE
@@ -226,6 +348,15 @@
 #ifndef CAL_GAIN_DIR
 /* gain/defect 多灰阶校准的均值图中间文件目录。 */
 #define CAL_GAIN_DIR "/usr/local/calib"
+#endif
+
+#ifndef GAIN_TASK_BACKGROUND_ENABLE
+/* Gain 模板任务默认前台同步执行；Makefile 可设为 1 切换到后台任务。 */
+#define GAIN_TASK_BACKGROUND_ENABLE 0
+#endif
+
+#if GAIN_TASK_BACKGROUND_ENABLE != 0 && GAIN_TASK_BACKGROUND_ENABLE != 1
+#error "GAIN_TASK_BACKGROUND_ENABLE must be 0 or 1"
 #endif
 
 #ifndef GIC_DEFAULT_REQ_CODE
