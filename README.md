@@ -88,6 +88,13 @@ start 类命令会写启动寄存器后等待完成 bit。程序启动时会优�
 make PA_PU_IRQ_TIMEOUT_MS=500 PA_PU_IRQ_POLL_INTERVAL_US=1000 PA_IRQ_DEVICE=/dev/pa_irq
 ```
 
+配置寄存器默认写后立即读回校验 2 次，`*_STR`、`*_STOP` 和 `*_en` 这类触发/使能信号只写不校验。
+需要临时关闭读回时：
+
+```sh
+make PA_PU_WRITE_VERIFY_ATTEMPTS=0
+```
+
 PA 寄存器默认通过 `/dev/mem + PA_PU_BASE_ADDR` 访问，当前确认的默认基地址为 `0x40000000`。
 `/dev/uio0` 已经用于暗场 DDR，因此暂时不把 PA/PU 寄存器包装为 UIO。
 如果后续设备树给 PA 寄存器单独暴露 UIO，可以再覆盖：

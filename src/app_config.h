@@ -315,6 +315,21 @@
 #define PA_IRQ_DEVICE "/dev/pa_irq"
 #endif
 
+#ifndef PA_PU_WRITE_VERIFY_ATTEMPTS
+/*
+ * 配置寄存器写后立即读回校验次数。
+ * 0：只写不读，适合总线读回会影响现场的阶段；
+ * 1：写一次后读回一次；
+ * N：读回不一致时最多重写/重读 N 次。
+ * STR/STOP 等触发型信号不走该校验，始终只写。
+ */
+#define PA_PU_WRITE_VERIFY_ATTEMPTS 2u
+#endif
+
+#if PA_PU_WRITE_VERIFY_ATTEMPTS > 10
+#error "PA_PU_WRITE_VERIFY_ATTEMPTS must be 0..10"
+#endif
+
 #ifndef STATIC_IDLE_CLEAN_INTERVAL_MS
 /* Static Idle 空闲自清空间隔，单位 ms。 */
 #define STATIC_IDLE_CLEAN_INTERVAL_MS 50u
