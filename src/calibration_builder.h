@@ -95,11 +95,11 @@ typedef struct {
 } cal_task_status_t;
 
 /*
- * 动态模式 offset 模板制作。
+ * 多帧 offset 模板制作。
  *
- * 调用者可选择先下发 dynamic 配置，然后按 frames 次重复启动 dynamic。
- * 前面的 frames - valid_frames 帧只用于曝光/链路稳定，最后 valid_frames 帧
- * 才参与逐像素均值。均值结果会同时写入 TEMPLATE_OFFSET_FILE 和 FPGA offset 模板 DDR。
+ * 函数名和任务枚举保留旧协议命名以兼容上位机；实际实现按静态方式逐帧采集，
+ * 每帧完整结束并完成均值处理后才触发下一帧。前面的 frames - valid_frames 帧
+ * 只用于曝光/链路稳定，最后 valid_frames 帧参与逐像素均值。
  */
 int calibration_dynamic_offset_make(fpga_mem_t* mem,
                                     const pa_pu_dync_config_t* dync_config,

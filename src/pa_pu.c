@@ -510,6 +510,21 @@ uint32_t pa_pu_read_int_vector(void) {
   return pa_pu_read(PA_PU_INT_VECTOR_REG);
 }
 
+size_t pa_pu_read_register_snapshot(uint16_t* offsets,
+                                    uint32_t* values,
+                                    size_t capacity) {
+  if (offsets == NULL || values == NULL || capacity == 0u) return 0u;
+  size_t count = 0u;
+  for (size_t i = 0u; i < pa_pu_reg_desc_count() && count < capacity; ++i) {
+    const pa_pu_reg_desc_t* desc = &k_pa_pu_reg_descs[i];
+    if (pa_pu_reg_is_read_clear(desc->reg)) continue;
+    offsets[count] = desc->reg;
+    values[count] = pa_pu_read(desc->reg);
+    ++count;
+  }
+  return count;
+}
+
 static uint64_t monotonic_ms(void) {
   struct timespec ts;
   if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {

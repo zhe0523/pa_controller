@@ -8,10 +8,12 @@
 #include "app_config.h"
 #include "calibration_builder.h"
 #include "command_handler.h"
+#include "config_store.h"
 #include "fpga_mem.h"
 #include "image_frame.h"
 #include "log.h"
 #include "pa_pu.h"
+#include "pa_protocol.h"
 #include "rs422.h"
 #include "template_builder.h"
 #include "work_mode.h"
@@ -25,8 +27,9 @@ static void on_signal(int signo) {
 }
 
 static void print_usage(const char* program) {
-  fprintf(stderr, "Usage: %s [--stdio] [-d rs422_device] [-b baud]\n", program);
+  fprintf(stderr, "Usage: %s [--stdio|--binary] [-d rs422_device] [-b baud]\n", program);
   fprintf(stderr, "  --stdio: read commands from stdin and write responses to stdout\n");
+  fprintf(stderr, "  --binary: use formal binary protocol on RS422\n");
   fprintf(stderr, "  default device: %s\n", RS422_DEVICE);
   fprintf(stderr, "  default baud:   %d\n", RS422_BAUD);
 }
@@ -96,6 +99,39 @@ static const char* default_work_mode_name(uint32_t mode) {
   }
 }
 
+typedef struct {
+  command_context_t* command_context;
+  rs422_t* port;
+} binary_loop_context_t;
+
+static int handle_binary_frame(const pa_protocol_frame_view_t* request, void* user) {
+  binary_loop_context_t* loop = (binary_loop_context_t*)user;
+  if (loop == NULL || loop->command_context == NULL || loop->port == NULL) {
+    return -1;
+  }
+
+  uint8_t response[PA_PROTOCOL_MAX_FRAME];
+  size_t response_length = 0u;
+  int result = command_handle_binary(loop->command_context,
+                                     request,
+                                     response,
+                                     sizeof(response),
+                                     &response_length);
+  if (result != 0 || response_length == 0u) {
+    log_error("binary command failed cmd=0x%04x seq=%u result=%d",
+              request->cmd, request->seq, result);
+    return -1;
+  }
+  if (rs422_write_bytes(loop->port, response, response_length) != 0) {
+    log_error("binary response write failed cmd=0x%04x seq=%u",
+              request->cmd, request->seq);
+    return -1;
+  }
+  log_info("binary request cmd=0x%04x seq=%u response=%u bytes",
+           request->cmd, request->seq, (unsigned)response_length);
+  return 0;
+}
+
 int main(int argc, char* argv[]) {
   /* 支持 Ctrl+C / kill 优雅退出，避免 mmap 和串口 fd 泄漏。 */
   install_signal_handlers();
@@ -103,11 +139,14 @@ int main(int argc, char* argv[]) {
   const char* rs422_device = RS422_DEVICE;
   int rs422_baud = RS422_BAUD;
   bool use_stdio = false;
+  bool use_binary = false;
 
   /* 解析运行参数：--stdio 用于开发板无独立 422 口时模拟上位机命令。 */
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--stdio") == 0) {
       use_stdio = true;
+    } else if (strcmp(argv[i], "--binary") == 0) {
+      use_binary = true;
     } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
       rs422_device = argv[++i];
     } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
@@ -144,26 +183,37 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  if (use_stdio && use_binary) {
+    fprintf(stderr, "--stdio and --binary cannot be used together\n");
+    return 1;
+  }
+
+  pa_runtime_config_t runtime_config;
+  int config_result = config_store_load_or_create(APP_CONFIG_FILE, &fpga_mem, &runtime_config);
+  if (config_result < 0) {
+    log_error("runtime config unavailable path=%s", APP_CONFIG_FILE);
+    pa_pu_close();
+    fpga_mem_close(&fpga_mem);
+    return 1;
+  }
+  char config_summary[256];
+  if (config_store_summary(&runtime_config, config_summary, sizeof(config_summary)) == 0) {
+    log_info("runtime config path=%s source=%s %s", APP_CONFIG_FILE,
+             config_result == 1 ? "defaults-created" : "file", config_summary);
+  }
+
+  /* 开机先把配置文件描述的基础寄存器状态下发一次。 */
+  pa_pu_configure_gic(&runtime_config.gic);
+  pa_pu_configure_roic(&runtime_config.roic);
+  pa_pu_configure_correction(&runtime_config.corr);
+
   /*
    * 启动时尝试加载磁盘上的 offset/gain 模板。
    * 文件不存在不阻断启动，上位机可通过 MAKE_OFFSET / MAKE_GAIN 现场生成。
    */
-  if (template_load_files(&fpga_mem) == 0) {
-    pa_pu_corr_config_t config = {
-      .pkg_num = CORR_DEFAULT_PKG_NUM,
-      .row_num = CORR_DEFAULT_ROW_NUM,
-      .col_num = CORR_DEFAULT_COL_NUM,
-      .offset_enable = CORR_DEFAULT_OFFSET_EN != 0,
-      .offset_template_addr = fpga_mem.offset_phys_base,
-      .offset_adder_value = CORR_DEFAULT_OFFSET_ADDER_VALUE,
-      .offset_corr_mode = CORR_DEFAULT_OFFSET_CORR_MODE,
-      .gain_enable = CORR_DEFAULT_GAIN_EN != 0,
-      .gain_template_addr = fpga_mem.gain_phys_base,
-      .gain_clipping_value = CORR_DEFAULT_GAIN_CLIPPING_VALUE,
-      .defect_enable = CORR_DEFAULT_DEFECT_EN != 0,
-    };
-    pa_pu_configure_correction(&config);
-  } else {
+  if (template_load_files_from_paths(&fpga_mem,
+                                     runtime_config.offset_file,
+                                     runtime_config.gain_file) != 0) {
     log_warn("template files not fully loaded");
   }
 
@@ -173,6 +223,26 @@ int main(int argc, char* argv[]) {
    */
   work_mode_context_t work_mode;
   if (work_mode_init(&work_mode, &fpga_mem) != 0) {
+    pa_pu_close();
+    fpga_mem_close(&fpga_mem);
+    return 1;
+  }
+  dynamic_mode_config_t runtime_dynamic_config;
+  if (dynamic_mode_default_config(&fpga_mem, &runtime_dynamic_config) != 0) {
+    log_error("failed to build dynamic runtime config");
+    work_mode_stop(&work_mode);
+    pa_pu_close();
+    fpga_mem_close(&fpga_mem);
+    return 1;
+  }
+  runtime_dynamic_config.dync = runtime_config.dync;
+  runtime_dynamic_config.start_timeout_ms = runtime_config.dynamic_start_timeout_ms;
+  runtime_dynamic_config.state_poll_interval_ms = runtime_config.dynamic_state_poll_interval_ms;
+  runtime_dynamic_config.stop_timeout_ms = runtime_config.dynamic_stop_timeout_ms;
+  if (work_mode_update_static_idle_config(&work_mode, &runtime_config.static_idle) != 0 ||
+      work_mode_update_dynamic_settings(&work_mode, &runtime_dynamic_config) != 0) {
+    log_error("runtime work mode config rejected");
+    work_mode_stop(&work_mode);
     pa_pu_close();
     fpga_mem_close(&fpga_mem);
     return 1;
@@ -203,6 +273,8 @@ int main(int argc, char* argv[]) {
   command_context_t ctx = {
     .fpga_mem = &fpga_mem,
     .work_mode = &work_mode,
+    .runtime_config = &runtime_config,
+    .config_file = APP_CONFIG_FILE,
     .should_quit = false,
   };
 
@@ -255,7 +327,34 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  while (!g_stop && !ctx.should_quit) {
+  if (use_binary) {
+    log_info("binary rs422 protocol mode enabled");
+    pa_protocol_parser_t parser;
+    pa_protocol_parser_init(&parser);
+    binary_loop_context_t loop = {
+      .command_context = &ctx,
+      .port = &rs422,
+    };
+    uint8_t input[512];
+    while (!g_stop && !ctx.should_quit) {
+      int n = rs422_read_bytes(&rs422, input, sizeof(input));
+      if (n < 0) {
+        log_error("binary rs422 read failed: %d", errno);
+        break;
+      }
+      if (n == 0) {
+        continue;
+      }
+      if (pa_protocol_parser_feed(&parser,
+                                  input,
+                                  (size_t)n,
+                                  handle_binary_frame,
+                                  &loop) != PA_PROTOCOL_OK) {
+        log_error("binary protocol parser stopped");
+        break;
+      }
+    }
+  } else while (!g_stop && !ctx.should_quit) {
     int n = rs422_read_line(&rs422, command, sizeof(command));
     if (n < 0) {
       log_error("rs422 read failed: %d", errno);

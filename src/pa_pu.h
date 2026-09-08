@@ -97,7 +97,8 @@ enum {
 /*
  * dynamic_ctrl 动态流程配置。
  *
- * step_cfg_h bit31 表示该 step 使能，bit[7:0] 为 req_code；
+ * step_cfg_h 的 bit 定义见 PA_PU_DYNC_STEP_* 宏：
+ * bit31 表示该 step 使能，bit[7:0] 为 PA_PU_DYNC_REQ_*；
  * step_cfg_l 当前按协议表表示该 step 的等待时间，单位 ms。
  */
 typedef struct {
@@ -214,6 +215,11 @@ void pa_pu_read_status(pa_pu_status_t* status);
 
 /* 调试用：打印 PA/PU 寄存器值；会跳过 INT_VECTOR 等 read-clear 寄存器。 */
 void pa_pu_dump_all_registers(const char* reason);
+/* 返回可安全读取的寄存器偏移和值，跳过 INT_VECTOR 等 read-clear 寄存器。 */
+size_t pa_pu_read_register_snapshot(uint16_t* offsets,
+                                    uint32_t* values,
+                                    size_t capacity);
+
 
 /*
  * 调试命令用：打印寄存器快照，但跳过 read-clear 寄存器。

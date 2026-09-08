@@ -175,7 +175,36 @@ make run-board BOARD_HOST=192.168.3.54 BOARD_USER=root BOARD_DIR=/root BOARD_RUN
 
 当前先使用 ASCII 行协议，命令以 `\r\n` 或 `\n` 结束，便于串口助手联调。
 命令名大小写不敏感，参数通常使用 `key=value`，十进制和 `0x` 十六进制都支持。
-正式上位机二进制协议确定后，主要替换 `src/command_handler.c` 的解析层即可。
+正式业务命令通过 `src/command_handler.c` 的二进制入口接入。当前 ARM 工程已经加入独立的二进制帧基础层：`include/pa_protocol.h`、`src/pa_protocol.c`，并支持 `--binary` RS422 运行模式。二进制模式当前已实现 `HELLO(0x0001)`、`PING(0x0002)`、`STATUS(0x0003)`、`VERSION(0x0004)`、`GET_CONFIG_GROUP(0x0103)`、`SET_CONFIG_GROUP(0x0104)`、`START_STATIC_CAPTURE(0x0200)`、`START_DYNAMIC(0x0210)`、`STOP_DYNAMIC(0x0211)`、`QUERY_DYNAMIC(0x0212)`、`CAL_OFFSET_*(0x0300~0x0303)`、`CAL_GAIN_*(0x0304~0x0307)`、`CAL_STATUS(0x0308)` 和 `IMG_UPLOAD_*(0x0500~0x0502)`。配置组 payload 为 `u16 group_id` 加连续的 `{u16 item_id, u16 len=4, u32 value}` 小端 TLV；下位机收到 SET 后会校验、应用并保存 `config.ini`。ASCII 模板和调试命令继续作为研发入口保留。
+
+协议基础层的固定联调帧如下，表示 `REQ cmd=0x0001 seq=1` 的空 payload 请求：
+
+```text
+AA 55 01 10 01 00 01 00 01 00 00 00 00 00 00 00 78 62
+```
+
+静态采图命令会自动确保 Static Idle 工作线程启动；动态启停和查询复用当前 `config.ini` 中的 cycle、地址范围和 step 表。Offset/Gain 制作使用后台任务，命令线程通过 `CAL_STATUS` 返回进度；模板查看先配置 `IMG_UPLOAD_CONFIG`，再由 `IMG_UPLOAD_START` 触发 FPGA 上传。ASCII 入口继续作为研发调试入口保留。
+
+RS422 二进制联调示例：
+
+```sh
+./pa_controller --binary -d /dev/ttyS1 -b 115200
+```
+
+上位机使用 `pa_host --binary` 启动。二进制帧为小端字段，帧头 `AA 55`，协议版本为 1，
+固定头长度 16 字节，末尾为 CRC16-CCITT-FALSE。空 payload 的 PING 请求固定帧为：
+
+```text
+AA 55 01 10 01 00 02 00 01 00 00 00 00 00 00 00 B7 D3
+```
+
+`--stdio` 仍然只用于 ASCII 命令研发测试，不能用于验证正式二进制通信链路。
+
+协议帧编解码、固定 PING 向量、拆包、粘包和 CRC 错误可在 Ubuntu 主机直接测试，不需要目标板：
+
+```sh
+make test-protocol
+```
 
 注意：`INT_VECTOR` 是 read-clear，读一次会清除已经置位的中断。因此 `STATUS`、
 `GET_WORK_STATE` 和 `DUMP_REGS` 默认不读 `INT_VECTOR`；只有明确等待中断的 start 类命令、
@@ -194,6 +223,50 @@ Static Idle 是当前静态业务流程入口。默认启动后不自动运行�
 ```sh
 make WORK_MODE_AUTO_START=1 WORK_MODE_DEFAULT_MODE=0
 ```
+
+### 运行时配置文件
+
+程序启动时会读取 `APP_CONFIG_FILE` 指定的 INI 文件，当前 Makefile 默认位置为
+`./config.ini`，方便研发阶段直接查看和修改。文件不存在时，程序会按当前 Makefile
+和 `src/app_config.h` 中的编译默认值自动生成；文件存在时，启动参数以文件为准。
+构建时可以修改位置：
+
+```bash
+make APP_CONFIG_FILE=/etc/pa_controller/config.ini
+```
+
+配置文件主要包含 `[gic]`、`[roic]`、`[corr]`、`[static_idle]`、`[dynamic]`
+和 `[template]`。启动时 ARM 会先校验并下发 GIC、ROIC、CORR 基础配置，再初始化
+静态/动态工作流。RS422/stdio 当前提供短配置命令：
+
+`STATUS` 除了返回 PA/FPGA 非清零状态寄存器，还会返回 ARM 工作模式、配置文件摘要、
+模板任务进度和 DDR 图像池状态；不会读取会清零的 `INT_VECTOR`。
+
+```text
+GET_CONFIG_SUMMARY
+GET_CONFIG_ITEM static.exposure_window_ms
+SET_CONFIG_ITEM static.exposure_window_ms=50
+SET_CONFIG_ITEM corr.gain_en=1
+RESET_CONFIG
+GET_CONFIG_GROUP gic
+GET_CONFIG_GROUP dynamic
+SET_CONFIG_GROUP gic req_code=0 dout_en=1 line_time_ns=25600 start_row=0 end_row=7679 binning=0
+SET_CONFIG_GROUP dynamic cycle=0 step0_h=0x80000004 step0_l=50
+QUERY_DYNAMIC
+RESET_CONFIG_GROUP corr
+```
+
+`SET_CONFIG_ITEM` 成功后会立即校验、应用并保存配置文件；采图、动态运行或模板任务
+占用硬件时返回 `BUSY`。复杂的 GIC、ROIC、Dynamic step 表先通过配置文件维护，
+不要求正式上位机在一条 RS422 命令中携带大量 `key=value` 参数。
+
+配置组命令用于研发和设备维护：`GET_CONFIG_GROUP` 返回指定组的完整当前值，支持
+`gic`、`roic`、`corr`、`static`、`dynamic`；`SET_CONFIG_GROUP` 在一条短命令中提交
+同一组的多个字段，成功后一次性应用并保存；`RESET_CONFIG_GROUP` 将指定组恢复为
+编译默认值并立即应用、保存，支持上述组以及 `template`。Dynamic 的 `step0_h/l`
+到 `step9_h/l` 仍直接保存在配置文件中，便于不同产品复用相同工作流而只替换参数。
+每次 `SET_CONFIG_GROUP dynamic` 都会重新提交完整 step 表；未写出的 `stepN_h/l`
+自动清零并关闭，不会沿用旧配置。
 
 Static Idle 后台线程运行后，会按 `idle_clean_interval_ms` 周期执行一次 GIC 自清空：
 
@@ -326,14 +399,17 @@ stepN_l         第 N 个 step low 配置字，当前按 ms 参数使用
 当前 req_code 定义：
 
 ```text
-0 -> idle
-1 -> serial clear
-2 -> parallel clear
-3 -> xao clear
-4 -> capture one image
-5 -> wait sync in signals
-6 -> wait sync out
+0 -> idle                  PA_PU_DYNC_REQ_IDLE
+1 -> serial clear          PA_PU_DYNC_REQ_SERIAL_CLEAR
+2 -> parallel clear        PA_PU_DYNC_REQ_PARALLEL_CLEAR
+3 -> xao clear             PA_PU_DYNC_REQ_XAO_CLEAR
+4 -> capture one image     PA_PU_DYNC_REQ_CAPTURE_ONE_IMAGE
+5 -> wait sync in signals  PA_PU_DYNC_REQ_WAIT_SYNC_IN
+6 -> wait sync out         PA_PU_DYNC_REQ_WAIT_SYNC_OUT
 ```
+
+代码中使用 `PA_PU_DYNC_STEP_CFG_H(enable, req_code)` 拼 `stepN_h`：
+`bit31` 为 enable，`bit[7:0]` 为 req_code，`bit[30:8]` 保留为 0。
 
 启动、查询、停止正式 Dynamic：
 
@@ -727,7 +803,8 @@ OK START_CORR_GIC int_vector=0x00000012
 ### Dynamic 底层调试
 
 底层调试命令不创建正式 Dynamic 工作线程，只用于直接验证 `DYNC_STR/DYNC_STOP`。
-正式动态流程请使用 `CONFIG_DYNC -> START_CONTINUOUS -> GET_WORK_STATE -> STOP_TRANSFER`。
+正式动态流程请使用 `START_DYNAMIC -> QUERY_DYNAMIC/GET_WORK_STATE -> STOP_DYNAMIC`。
+兼容旧研发入口 `CONFIG_DYNC`、`START_CONTINUOUS`、`STOP_TRANSFER` 仍然保留。
 
 配置：
 
@@ -740,7 +817,6 @@ CONFIG_DYNC cycle=1 img_start=0x26A00000 img_end=0x3FFFFFFF step0_h=0x80000004 s
 
 ```text
 START_DYNC
-START_DYNAMIC
 START_DYNC cycle=1 img_start=0x26A00000 img_end=0x3FFFFFFF step0_en=1 step0_req=4 step0_time=50
 ```
 
@@ -754,8 +830,15 @@ OK START_DYNC wait=0 dync_state=0x00000001 dync_end=0x00000000 dync_debug_out=0x
 
 ```text
 STOP_DYNC
-STOP_DYNAMIC
 ```
+
+正式动态状态查询：
+
+```text
+QUERY_DYNAMIC
+```
+
+该命令只读取 Dynamic 状态寄存器和最终图像地址，不读取会清零的 `INT_VECTOR`。
 
 成功示例：
 
@@ -764,6 +847,9 @@ OK STOP_DYNC dync_state=0x00000000 dync_end=0x00000001 dync_debug_out=0x00000000
 ```
 
 `START_DYNC_WAIT` / `START_DYNAMIC_WAIT` 当前已删除，避免命令线程长时间阻塞后无法再处理停止命令。
+
+`STOP_DYNAMIC` 属于正式 Dynamic 工作流命令，会通过工作模式状态机停止 Dynamic；
+底层调试停止请使用 `STOP_DYNC`。
 
 ### 图片上传调试
 
@@ -926,6 +1012,11 @@ src/auto_offset_plan.*  自动暗场模板更新的配置、状态和质量门�
 src/rs422.c/h           422 串口配置和行收发
 src/command_handler.c   临时调试命令分发
 fpga/IMG_UPLOAD.txt     图片上传模块寄存器补充定义
+doc/PA_Controller_业务逻辑与工作流设计.md  正式业务流程、配置文件和命令收敛设计
+doc/PA_Controller_正式通信协议草案.md      后续二进制通信协议草案
+doc/PA_SDK_对外交付设计.md                客户 SDK 交付包、API 分层和使用流程设计
+include/pa_sdk.h                            客户 SDK 第一版 C ABI 接口草案
+include/pa_protocol.h                       ARM/上位机/SDK 共用的二进制帧定义
 ```
 
 ## 注意

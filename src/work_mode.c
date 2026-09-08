@@ -502,6 +502,7 @@ static bool wait_until_or_request_locked(work_mode_context_t* wm, uint64_t deadl
 static void* work_thread_main(void* arg) {
   work_mode_context_t* wm = (work_mode_context_t*)arg;
   uint64_t next_clean_ms = 0;
+  bool exit_due_to_error = false;
 
   /* Static Idle 启动时先按默认参数配置一次 ROIC，后续仍允许调试命令重新配置。 */
   pa_pu_configure_roic_defaults();
@@ -550,25 +551,44 @@ static void* work_thread_main(void* arg) {
         wm->status.last_error = 0;
         wm->status.last_phase = WORK_PHASE_NONE;
       } else {
-        wm->status.state = WORK_STATE_IDLE_WAIT;
+        wm->status.state = WORK_STATE_ERROR;
+        wm->stop_requested = true;
+        exit_due_to_error = true;
       }
       pthread_cond_broadcast(&wm->cond);
       pthread_mutex_unlock(&wm->mutex);
+      if (exit_due_to_error) {
+        log_error("work mode enters ERROR after static capture failure, hardware background actions stopped");
+        break;
+      }
       next_clean_ms = monotonic_ms_local() + config.idle_clean_interval_ms;
       continue;
     }
 
-    (void)run_idle_clean(wm, &config);
+    if (run_idle_clean(wm, &config) != 0) {
+      pthread_mutex_lock(&wm->mutex);
+      wm->status.state = WORK_STATE_ERROR;
+      wm->stop_requested = true;
+      exit_due_to_error = true;
+      pthread_cond_broadcast(&wm->cond);
+      pthread_mutex_unlock(&wm->mutex);
+      log_error("work mode enters ERROR after idle clean failure, hardware background actions stopped");
+      break;
+    }
     next_clean_ms = monotonic_ms_local() + config.idle_clean_interval_ms;
   }
 
   pthread_mutex_lock(&wm->mutex);
   wm->thread_running = false;
-  wm->status.state = WORK_STATE_STOPPED;
+  if (exit_due_to_error) {
+    wm->status.state = WORK_STATE_ERROR;
+  } else {
+    wm->status.state = WORK_STATE_STOPPED;
+  }
   wm->status.stop_requested = true;
   pthread_cond_broadcast(&wm->cond);
   pthread_mutex_unlock(&wm->mutex);
-  log_info("work mode thread stopped");
+  log_info("work mode thread stopped state=%s", exit_due_to_error ? "ERROR" : "STOPPED");
   return NULL;
 }
 
@@ -647,6 +667,11 @@ int work_mode_start(work_mode_context_t* wm) {
   wm->stop_requested = false;
   wm->thread_running = true;
   wm->status.mode = WORK_MODE_IDLE;
+  wm->status.state = WORK_STATE_STOPPED;
+  wm->status.last_error = 0;
+  wm->status.last_phase = WORK_PHASE_NONE;
+  wm->status.last_wait_mask = 0;
+  wm->status.last_int_vector = 0;
   pthread_mutex_unlock(&wm->mutex);
 
   if (pthread_create(&wm->thread, NULL, work_thread_main, wm) != 0) {
@@ -874,6 +899,14 @@ int work_mode_update_dynamic_config(work_mode_context_t* wm, const pa_pu_dync_co
   }
   dynamic_config.dync = *config;
   return dynamic_mode_update_config(&wm->dynamic, &dynamic_config);
+}
+
+int work_mode_update_dynamic_settings(work_mode_context_t* wm, const dynamic_mode_config_t* config) {
+  if (wm == NULL || config == NULL || !wm->initialized) {
+    return -1;
+  }
+  /* 配置文件中的 timeout/poll 参数必须随 Dynamic 一起下发，不能被默认值覆盖。 */
+  return dynamic_mode_update_config(&wm->dynamic, config);
 }
 
 int work_mode_stop_dynamic(work_mode_context_t* wm, work_mode_status_t* result) {

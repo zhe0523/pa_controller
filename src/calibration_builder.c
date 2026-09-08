@@ -101,6 +101,27 @@ static size_t active_pixel_count(void) {
   return (size_t)IMAGE_WIDTH * IMAGE_HEIGHT;
 }
 
+static int wait_raw_capture_modules_idle(unsigned timeout_ms) {
+  const uint64_t start_ms = calib_monotonic_ms();
+  for (;;) {
+    pa_pu_status_t status;
+    pa_pu_read_status(&status);
+    if (status.img_wr_state == 0u && status.img_corr_state == 0u && status.gic_state == 0u) {
+      return 0;
+    }
+    if (calib_monotonic_ms() - start_ms >= timeout_ms) {
+      log_error("cal raw static wait idle timeout wr_state=0x%08x corr_state=0x%08x gic_state=0x%08x",
+                status.img_wr_state,
+                status.img_corr_state,
+                status.gic_state);
+      return -1;
+    }
+    if (usleep(PA_PU_IRQ_POLL_INTERVAL_US) != 0 && errno == EINTR) {
+      return -1;
+    }
+  }
+}
+
 static size_t active_row_offset(unsigned row) {
   return ((size_t)(row + ROW_OFFSET) * DEVICE_WIDTH + COL_OFFSET);
 }
@@ -208,7 +229,14 @@ static cal_gain_level_t* find_level(uint32_t level) {
   return NULL;
 }
 
-static int capture_one_raw_frame(fpga_mem_t* mem) {
+static size_t image_pool_frame_stride(void) {
+  return (ACTIVE_IMAGE_BYTES + DDR_IMAGE_FRAME_ALIGN - 1u) & ~(size_t)(DDR_IMAGE_FRAME_ALIGN - 1u);
+}
+
+static int capture_one_raw_frame(fpga_mem_t* mem,
+                                 uint32_t image_addr,
+                                 uint32_t* int_vector_out,
+                                 uint32_t* final_image_addr_out) {
   pa_pu_gic_config_t gic = {
     .req_code = PA_PU_GIC_REQ_SERIAL_SCAN,
     .dout_enable = true,
@@ -235,11 +263,16 @@ static int capture_one_raw_frame(fpga_mem_t* mem) {
   uint32_t int_vector = 0;
 
   /*
-   * gain 校准采原始灰阶帧，校正全关，只验证 GIC/IMG_WR/IMG_CORR 三模块完成。
-   * 图像固定写入 uio2 起始地址，采完立即由 ARM 读取有效区域参与均值累加。
+   * 模板校准采原始帧，校正全关，只验证 GIC/IMG_WR/IMG_CORR 三模块完成。
+   * 图像写入调用方指定的 uio2 帧槽，采完立即由 ARM 读取有效区域参与均值累加。
    */
+  if (wait_raw_capture_modules_idle(1000u) != 0) {
+    return -1;
+  }
+  /* 校准任务可能在 auto_start=0 时直接启动，不能依赖 Static Idle 线程预先配置 ROIC。 */
+  pa_pu_configure_roic_defaults();
   pa_pu_configure_gic(&gic);
-  pa_pu_configure_image_write(mem->image_pool_phys_base);
+  pa_pu_configure_image_write(image_addr);
   pa_pu_configure_correction(&corr);
   /* 和停止请求串行化，避免 STOP_GIC 先写、随后工作线程又补发 START。 */
   pthread_mutex_lock(&g_cal_task.mutex);
@@ -252,12 +285,18 @@ static int capture_one_raw_frame(fpga_mem_t* mem) {
   pthread_mutex_unlock(&g_cal_task.mutex);
   int ret = pa_pu_wait_int_vector_all(CAL_GAIN_CAPTURE_WAIT_MASK, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
   if (ret <= 0) {
-    log_error("cal gain raw capture failed ret=%d int_vector=0x%08x wait_mask=0x%08x",
+    log_error("cal raw static capture failed ret=%d int_vector=0x%08x wait_mask=0x%08x",
               ret,
               int_vector,
               CAL_GAIN_CAPTURE_WAIT_MASK);
-    pa_pu_dump_all_registers("cal_gain_capture");
+    pa_pu_dump_all_registers("cal_raw_static_capture");
     return -1;
+  }
+  if (int_vector_out != NULL) {
+    *int_vector_out = int_vector;
+  }
+  if (final_image_addr_out != NULL) {
+    *final_image_addr_out = pa_pu_read(PA_PU_IMG_WR_FINAL_IMG_ADDR_REG);
   }
   return 0;
 }
@@ -689,6 +728,10 @@ static int build_gain_template(const uint8_t* bad_map) {
     if ((r % 512u) == 0) {
       log_info("cal gain build progress row=%u/%u", r, IMAGE_HEIGHT);
     }
+    cal_task_set_progress((uint32_t)(IMAGE_HEIGHT / 4u) +
+                              (uint32_t)(((uint64_t)(r + 1u) * IMAGE_HEIGHT * 3u) /
+                                         (4u * IMAGE_HEIGHT)),
+                          IMAGE_HEIGHT);
   }
 
   close(out_fd);
@@ -766,166 +809,69 @@ static int load_gain_file_to_mem(fpga_mem_t* mem) {
   return 0;
 }
 
-static int wait_dynamic_done(uint32_t frame_index,
-                             uint32_t frame_count,
-                             uint32_t* int_vector_out,
-                             uint32_t* final_img_addr_out) {
-  uint32_t state = 0;
-  uint64_t last_log_ms = calib_monotonic_ms();
-
-  /*
-   * dynamic 协议约定：dync_state 为高表示动态流程仍在运行，只有状态回到低后，
-   * dynamic 完成中断 bit 才可靠。该等待只运行在模板后台线程，不占用命令线程。
-   */
-  log_info("dynamic offset wait state begin frame=%u/%u", frame_index, frame_count);
-  for (;;) {
-    if (cal_task_stop_requested()) {
-      return -2;
-    }
-    state = pa_pu_read(PA_PU_DYNC_STATE_REG);
-    /*
-     * dync_state 在寄存器表里是 1bit 状态。部分未使用高位可能不是 0，
-     * 这里只看 bit0，避免把高位调试值/默认值误判为 dynamic 仍在运行。
-     */
-    if ((state & 0x1u) == 0) {
-      break;
-    }
-    uint64_t now_ms = calib_monotonic_ms();
-    if (now_ms - last_log_ms >= 1000u) {
-      log_info("dynamic offset wait state frame=%u/%u dync_state=0x%08x", frame_index, frame_count, state);
-      last_log_ms = now_ms;
-    }
-    if (usleep(PA_PU_IRQ_POLL_INTERVAL_US) != 0 && errno == EINTR) {
-      return -1;
-    }
-  }
-  log_info("dynamic offset wait state done frame=%u/%u dync_state=0x%08x state_bit=%u",
-           frame_index,
-           frame_count,
-           state,
-           state & 0x1u);
-
-  uint32_t int_vector = 0;
-  if (cal_task_stop_requested()) {
-    return -2;
-  }
-  log_info("dynamic offset wait irq begin frame=%u/%u expect=0x%08x", frame_index, frame_count, PA_PU_IRQ_DYNC_END);
-  int ret = pa_pu_wait_int_vector(PA_PU_IRQ_DYNC_END, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
-  if (ret <= 0) {
-    log_error("dynamic offset wait irq failed frame=%u/%u ret=%d int_vector=0x%08x expect=0x%08x",
-              frame_index,
-              frame_count,
-              ret,
-              int_vector,
-              PA_PU_IRQ_DYNC_END);
-    return -1;
-  }
-  log_info("dynamic offset wait irq done frame=%u/%u int_vector=0x%08x", frame_index, frame_count, int_vector);
-
-  if (int_vector_out != NULL) {
-    *int_vector_out = int_vector;
-  }
-  if (final_img_addr_out != NULL) {
-    *final_img_addr_out = pa_pu_read(PA_PU_IMG_WR_FINAL_IMG_ADDR_REG);
-    log_info("dynamic offset final image addr frame=%u/%u img_addr=0x%08x",
-             frame_index,
-             frame_count,
-             *final_img_addr_out);
-  }
-  return 0;
-}
-
-static const uint16_t* image_ptr_from_phys(const fpga_mem_t* mem, uint32_t image_addr) {
-  uint64_t base = mem->image_pool_phys_base;
-  uint64_t addr = image_addr;
-
-  /*
-   * FPGA 返回的是 DDR 物理地址。ARM 读取图像前必须确认地址落在 uio2 图像池窗口，
-   * 再换算为 mmap 后的用户态虚拟地址。
-   */
-  if (addr < base) {
-    log_error("dynamic offset image addr before uio2 range addr=0x%08x base=0x%08x",
-              image_addr,
-              mem->image_pool_phys_base);
-    return NULL;
-  }
-
-  uint64_t offset = addr - base;
-  if (offset > (uint64_t)mem->image_pool_map_size ||
-      (uint64_t)DEVICE_IMAGE_BYTES > (uint64_t)mem->image_pool_map_size - offset) {
-    log_error("dynamic offset image addr out of uio2 range addr=0x%08x base=0x%08x size=0x%lx need=0x%lx",
-              image_addr,
-              mem->image_pool_phys_base,
-              (unsigned long)mem->image_pool_map_size,
-              (unsigned long)DEVICE_IMAGE_BYTES);
-    return NULL;
-  }
-
-  return (const uint16_t*)(mem->image_pool + (size_t)offset);
-}
-
 int calibration_dynamic_offset_make(fpga_mem_t* mem,
                                     const pa_pu_dync_config_t* dync_config,
                                     bool write_dync_config,
                                     uint32_t frames,
                                     uint32_t valid_frames,
                                     cal_dynamic_offset_result_t* result) {
+  /* 保留旧接口参数以兼容现有协议；多帧暗场已经改为逐张静态采集。 */
+  (void)dync_config;
+  (void)write_dync_config;
   if (!fpga_mem_is_open(mem) ||
       frames == 0u ||
       valid_frames == 0u ||
       valid_frames > frames ||
       frames > CAL_DYNAMIC_OFFSET_MAX_FRAMES ||
+      mem->image_pool_map_size < DEVICE_IMAGE_BYTES ||
       mem->offset_map_size < DEVICE_IMAGE_BYTES) {
-    log_error("dynamic offset invalid args frames=%u valid_frames=%u offset_size=0x%lx",
+    log_error("multi-frame offset invalid args frames=%u valid_frames=%u image_size=0x%lx offset_size=0x%lx",
               frames,
               valid_frames,
+              mem != NULL ? (unsigned long)mem->image_pool_map_size : 0ul,
               mem != NULL ? (unsigned long)mem->offset_map_size : 0ul);
     return -1;
   }
 
-  if (write_dync_config && dync_config == NULL) {
-    return -1;
-  }
-
-  log_info("dynamic offset make begin frames=%u valid_frames=%u first_valid_frame=%u image_pool=0x%08x size=0x%lx offset_addr=0x%08x",
+  log_info("multi-frame static offset make begin frames=%u valid_frames=%u first_valid_frame=%u image_addr=0x%08x offset_addr=0x%08x",
            frames,
            valid_frames,
            frames - valid_frames + 1u,
            mem->image_pool_phys_base,
-           (unsigned long)mem->image_pool_map_size,
            mem->offset_phys_base);
 
   const size_t pixels = active_pixel_count();
   uint32_t* sums = (uint32_t*)calloc(pixels, sizeof(uint32_t));
   uint16_t* row = (uint16_t*)malloc((size_t)IMAGE_WIDTH * sizeof(uint16_t));
   if (sums == NULL || row == NULL) {
-    log_error("dynamic offset buffer alloc failed sums=0x%lx row=0x%lx",
+    log_error("multi-frame offset buffer alloc failed sums=0x%lx row=0x%lx",
               (unsigned long)(pixels * sizeof(uint32_t)),
               (unsigned long)((size_t)IMAGE_WIDTH * sizeof(uint16_t)));
     free(sums);
     free(row);
     return -1;
   }
-  log_info("dynamic offset buffers ready pixels=%lu sums_bytes=0x%lx row_bytes=0x%lx",
+  log_info("multi-frame offset buffers ready pixels=%lu sums_bytes=0x%lx row_bytes=0x%lx",
            (unsigned long)pixels,
            (unsigned long)(pixels * sizeof(uint32_t)),
            (unsigned long)((size_t)IMAGE_WIDTH * sizeof(uint16_t)));
 
-  if (write_dync_config) {
-    log_info("dynamic offset write dynamic config cycle=%u img_start=0x%08x img_end=0x%08x",
-             dync_config->cycle_num,
-             dync_config->image_start_addr,
-             dync_config->image_end_addr);
-    pa_pu_configure_dync(dync_config);
-  } else {
-    log_info("dynamic offset reuse current dynamic config");
+  const size_t image_stride = image_pool_frame_stride();
+  const size_t image_frame_count = image_stride == 0u ? 0u : mem->image_pool_map_size / image_stride;
+  if (image_frame_count == 0u) {
+    free(sums);
+    free(row);
+    return -1;
   }
-
-  uint32_t last_img_addr = 0;
+  uint32_t last_img_addr = mem->image_pool_phys_base;
   uint32_t last_int_vector = 0;
   const uint32_t first_valid_frame = frames - valid_frames;
+  /*
+   * 每次只触发一张未校正静态帧，等待 GIC/IMG_WR/IMG_CORR 全部完成后再读取和计算。
+   * 当前帧处理完才允许启动下一帧，从根本上避免 Dynamic 连续出图期间中断合并和 DDR 覆盖。
+   */
+
   for (uint32_t frame = 0; frame < frames; ++frame) {
-    uint32_t img_addr = 0;
     uint32_t int_vector = 0;
 
     if (cal_task_stop_requested()) {
@@ -934,37 +880,33 @@ int calibration_dynamic_offset_make(fpga_mem_t* mem,
       return -2;
     }
     cal_task_set_progress(frame, frames);
-    log_info("dynamic offset frame start frame=%u/%u used=%u", frame + 1u, frames, frame >= first_valid_frame ? 1u : 0u);
-    /* 和停止请求串行化，确保停止脉冲不会落在本帧 START 之前。 */
-    pthread_mutex_lock(&g_cal_task.mutex);
-    if (g_cal_task.status.stop_requested) {
-      pthread_mutex_unlock(&g_cal_task.mutex);
+    size_t image_offset = (frame % image_frame_count) * image_stride;
+    uint32_t image_addr = mem->image_pool_phys_base + (uint32_t)image_offset;
+    log_info("multi-frame offset static capture start frame=%u/%u used=%u image_addr=0x%08x",
+             frame + 1u,
+             frames,
+             frame >= first_valid_frame ? 1u : 0u,
+             image_addr);
+    uint32_t final_image_addr = image_addr;
+    int capture_ret = capture_one_raw_frame(mem, image_addr, &int_vector, &final_image_addr);
+    if (capture_ret != 0) {
       free(sums);
       free(row);
-      return -2;
-    }
-    pa_pu_prepare_irq_wait();
-    log_info("dynamic offset frame irq prepared frame=%u/%u", frame + 1u, frames);
-    pa_pu_start_dync();
-    pthread_mutex_unlock(&g_cal_task.mutex);
-    log_info("dynamic offset frame dync started frame=%u/%u", frame + 1u, frames);
-    int wait_ret = wait_dynamic_done(frame + 1u, frames, &int_vector, &img_addr);
-    if (wait_ret != 0) {
-      free(sums);
-      free(row);
-      if (wait_ret == -2) {
-        return -2;
-      }
-      pa_pu_dump_all_registers("make_dynamic_offset");
-      return -1;
+      return capture_ret == -2 ? -2 : -1;
     }
 
-    const uint16_t* image = image_ptr_from_phys(mem, img_addr);
-    if (image == NULL) {
-      free(sums);
-      free(row);
-      return -1;
+    if (final_image_addr >= mem->image_pool_phys_base &&
+        (uint64_t)(final_image_addr - mem->image_pool_phys_base) + DEVICE_IMAGE_BYTES <=
+            (uint64_t)mem->image_pool_map_size) {
+      image_addr = final_image_addr;
+      image_offset = (size_t)(final_image_addr - mem->image_pool_phys_base);
+    } else {
+      log_warn("multi-frame offset final image addr outside pool configured=0x%08x final=0x%08x",
+               image_addr,
+               final_image_addr);
     }
+    const uint16_t* image = (const uint16_t*)(mem->image_pool + image_offset);
+    last_img_addr = image_addr;
 
     /*
      * 动态 offset 制作通常需要丢掉前几帧，让曝光、读出链路和 DDR 写入状态先稳定。
@@ -986,17 +928,17 @@ int calibration_dynamic_offset_make(fpga_mem_t* mem,
       }
     }
 
-    last_img_addr = img_addr;
     last_int_vector = int_vector;
     cal_task_set_progress(frame + 1u, frames);
-    log_info("dynamic offset capture frame=%u/%u valid=%u/%u used=%u img_addr=0x%08x int_vector=0x%08x",
+    log_info("multi-frame offset static capture done frame=%u/%u valid=%u/%u used=%u img_addr=0x%08x int_vector=0x%08x",
              frame + 1u,
              frames,
              use_frame ? (frame - first_valid_frame + 1u) : 0u,
              valid_frames,
              use_frame ? 1u : 0u,
-             img_addr,
+             last_img_addr,
              int_vector);
+
   }
 
   if (ensure_parent_dir(TEMPLATE_OFFSET_FILE) != 0) {
@@ -1058,7 +1000,7 @@ int calibration_dynamic_offset_make(fpga_mem_t* mem,
     result->last_int_vector = last_int_vector;
   }
 
-  log_info("dynamic offset template created frames=%u valid_frames=%u offset_addr=0x%08x file=%s last_img_addr=0x%08x",
+  log_info("multi-frame static offset template created frames=%u valid_frames=%u offset_addr=0x%08x file=%s image_addr=0x%08x",
            frames,
            valid_frames,
            mem->offset_phys_base,
@@ -1120,18 +1062,26 @@ int calibration_gain_capture_level(fpga_mem_t* mem, uint32_t level_value) {
     return -1;
   }
 
-  const uint16_t* image = (const uint16_t*)mem->image_pool;
+  const size_t image_stride = image_pool_frame_stride();
+  const size_t image_frame_count = image_stride == 0u ? 0u : mem->image_pool_map_size / image_stride;
+  if (image_frame_count == 0u) {
+    free(sums);
+    return -1;
+  }
   for (uint32_t frame = 0; frame < g_cal_gain.frames_per_level; ++frame) {
     if (cal_task_stop_requested()) {
       free(sums);
       return -2;
     }
     cal_task_set_progress(frame, g_cal_gain.frames_per_level);
-    int capture_ret = capture_one_raw_frame(mem);
+    size_t image_offset = (frame % image_frame_count) * image_stride;
+    uint32_t image_addr = mem->image_pool_phys_base + (uint32_t)image_offset;
+    int capture_ret = capture_one_raw_frame(mem, image_addr, NULL, NULL);
     if (capture_ret != 0) {
       free(sums);
       return capture_ret;
     }
+    const uint16_t* image = (const uint16_t*)(mem->image_pool + image_offset);
     for (unsigned r = 0; r < IMAGE_HEIGHT; ++r) {
       if (cal_task_stop_requested()) {
         free(sums);
@@ -1170,6 +1120,7 @@ int calibration_gain_build(fpga_mem_t* mem) {
   if (!g_cal_gain.active || !fpga_mem_is_open(mem)) {
     return -1;
   }
+  cal_task_set_progress(1u, IMAGE_HEIGHT);
   if (g_cal_gain.level_count < 2u) {
     log_error("cal gain build requires at least 2 levels for linear fit, current=%u", g_cal_gain.level_count);
     return -1;
@@ -1194,6 +1145,7 @@ int calibration_gain_build(fpga_mem_t* mem) {
     free(bad_map);
     return ret;
   }
+  cal_task_set_progress(IMAGE_HEIGHT / 4u, IMAGE_HEIGHT);
 
   ret = build_gain_template(bad_map);
   if (ret != 0) {
@@ -1206,6 +1158,7 @@ int calibration_gain_build(fpga_mem_t* mem) {
   if (ret != 0) {
     return ret;
   }
+  cal_task_set_progress(IMAGE_HEIGHT, IMAGE_HEIGHT);
 
   pthread_mutex_lock(&g_cal_gain_mutex);
   g_cal_gain.bad_pixel_count = bad_count;
@@ -1332,6 +1285,12 @@ static void* calibration_task_thread_main(void* opaque) {
   if (ret == 0 && !canceled) {
     /* 仅在完整成功后重新下发校正配置，取消/失败时不启用半成品模板。 */
     configure_default_correction(mem);
+    if (kind == CAL_TASK_GAIN_BUILD) {
+      /* Gain 模板成功加载即结束本轮会话，允许随后开始 Offset 或新一轮 Gain 校准。 */
+      pthread_mutex_lock(&g_cal_gain_mutex);
+      g_cal_gain.active = false;
+      pthread_mutex_unlock(&g_cal_gain_mutex);
+    }
   } else if (kind == CAL_TASK_MAKE_OFFSET ||
              kind == CAL_TASK_MAKE_GAIN ||
              kind == CAL_TASK_DYNAMIC_OFFSET ||
@@ -1488,9 +1447,8 @@ bool calibration_task_request_stop(void) {
   pthread_mutex_unlock(&g_cal_task.mutex);
 
   /* 先让硬件状态机退出，后台线程随后会在轮询/行处理检查点释放内存和文件。 */
-  if (kind == CAL_TASK_DYNAMIC_OFFSET) {
-    pa_pu_stop_dync();
-  } else if (kind == CAL_TASK_GAIN_CAPTURE) {
+  if (kind == CAL_TASK_DYNAMIC_OFFSET || kind == CAL_TASK_GAIN_CAPTURE) {
+    /* 暗场多帧和增益原始帧都采用静态 GIC/IMG_WR 采集。 */
     pa_pu_stop_gic();
   }
   return true;

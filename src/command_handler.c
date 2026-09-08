@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -221,6 +222,129 @@ static pa_pu_gic_config_t default_gic_config(void);
 static pa_pu_corr_config_t default_corr_config(const fpga_mem_t* fpga_mem);
 static pa_pu_img_upload_config_t default_img_upload_config(const fpga_mem_t* fpga_mem);
 static bool parse_float_value(const char* text, float* value);
+
+static int apply_runtime_config(command_context_t* ctx) {
+  if (ctx == NULL || ctx->runtime_config == NULL) return -1;
+  if (!work_mode_allows_hardware_action(ctx->work_mode)) return -2;
+  pa_runtime_config_t* config = ctx->runtime_config;
+  pa_pu_configure_gic(&config->gic);
+  pa_pu_configure_roic(&config->roic);
+  pa_pu_configure_correction(&config->corr);
+  config->static_idle.bright_corr = config->corr;
+  config->static_idle.bright_corr.offset_enable = false;
+  config->static_idle.bright_corr.gain_enable = false;
+  config->static_idle.bright_corr.defect_enable = false;
+  config->static_idle.dark_corr = config->corr;
+  config->static_idle.clean_gic = config->gic;
+  config->static_idle.clean_gic.dout_enable = false;
+  config->static_idle.bright_gic = config->gic;
+  config->static_idle.bright_gic.dout_enable = true;
+  config->static_idle.dark_gic = config->static_idle.bright_gic;
+  dynamic_mode_config_t dynamic_config;
+  if (dynamic_mode_default_config(ctx->fpga_mem, &dynamic_config) != 0) return -1;
+  dynamic_config.dync = config->dync;
+  dynamic_config.start_timeout_ms = config->dynamic_start_timeout_ms;
+  dynamic_config.state_poll_interval_ms = config->dynamic_state_poll_interval_ms;
+  dynamic_config.stop_timeout_ms = config->dynamic_stop_timeout_ms;
+  if (work_mode_update_static_idle_config(ctx->work_mode, &config->static_idle) != 0 ||
+      work_mode_update_dynamic_settings(ctx->work_mode, &dynamic_config) != 0) return -1;
+  return 0;
+}
+
+static int reset_runtime_config_group(command_context_t* ctx, const char* group) {
+  if (ctx == NULL || ctx->runtime_config == NULL || group == NULL) return -1;
+  pa_runtime_config_t defaults;
+  if (config_store_defaults(ctx->fpga_mem, &defaults) != 0) return -1;
+  if (strcasecmp(group, "gic") == 0) ctx->runtime_config->gic = defaults.gic;
+  else if (strcasecmp(group, "roic") == 0) ctx->runtime_config->roic = defaults.roic;
+  else if (strcasecmp(group, "corr") == 0) ctx->runtime_config->corr = defaults.corr;
+  else if (strcasecmp(group, "static") == 0 || strcasecmp(group, "static_idle") == 0) ctx->runtime_config->static_idle = defaults.static_idle;
+  else if (strcasecmp(group, "dynamic") == 0) {
+    ctx->runtime_config->dync = defaults.dync;
+    ctx->runtime_config->dynamic_start_timeout_ms = defaults.dynamic_start_timeout_ms;
+    ctx->runtime_config->dynamic_state_poll_interval_ms = defaults.dynamic_state_poll_interval_ms;
+    ctx->runtime_config->dynamic_stop_timeout_ms = defaults.dynamic_stop_timeout_ms;
+  } else if (strcasecmp(group, "template") == 0) {
+    snprintf(ctx->runtime_config->offset_file, sizeof(ctx->runtime_config->offset_file), "%s", defaults.offset_file);
+    snprintf(ctx->runtime_config->gain_file, sizeof(ctx->runtime_config->gain_file), "%s", defaults.gain_file);
+    snprintf(ctx->runtime_config->cal_gain_dir, sizeof(ctx->runtime_config->cal_gain_dir), "%s", defaults.cal_gain_dir);
+  } else return -1;
+  return 0;
+}
+
+/*
+ * 解析短格式配置组命令，例如：
+ *   SET_CONFIG_GROUP gic req_code=0 line_time_ns=25600
+ *   SET_CONFIG_GROUP dynamic cycle=10 step0_h=0x80000004 step0_l=50
+ *
+ * 正式二进制协议将来可以复用同一组配置项语义；当前 ASCII 入口只负责
+ * 把多个短字段合并应用一次，避免上位机逐个寄存器写入。
+ */
+static int set_runtime_config_group(command_context_t* ctx, const char* args) {
+  if (ctx == NULL || ctx->runtime_config == NULL || args == NULL ||
+      !work_mode_allows_hardware_action(ctx->work_mode)) {
+    return -2;
+  }
+
+  char buffer[1024];
+  snprintf(buffer, sizeof(buffer), "%s", args);
+  char* save = NULL;
+  char* token = strtok_r(buffer, " \t", &save);
+  if (token == NULL) {
+    return -1;
+  }
+
+  char group[32];
+  if (strncasecmp(token, "group=", 6) == 0) {
+    snprintf(group, sizeof(group), "%s", token + 6);
+    token = strtok_r(NULL, " \t", &save);
+  } else {
+    snprintf(group, sizeof(group), "%s", token);
+    token = strtok_r(NULL, " \t", &save);
+  }
+  if (group[0] == '\0' || token == NULL) {
+    return -1;
+  }
+  if (strcasecmp(group, "static_idle") == 0) {
+    snprintf(group, sizeof(group), "static");
+  }
+
+  pa_runtime_config_t backup = *ctx->runtime_config;
+  if (strcasecmp(group, "dynamic") == 0) {
+    /* Dynamic 配置组提交的是完整 step 表；未出现在命令中的 step 必须关闭。 */
+    memset(ctx->runtime_config->dync.step_cfg_h, 0,
+           sizeof(ctx->runtime_config->dync.step_cfg_h));
+    memset(ctx->runtime_config->dync.step_cfg_l, 0,
+           sizeof(ctx->runtime_config->dync.step_cfg_l));
+  }
+  unsigned changed = 0u;
+  do {
+    char* equals = strchr(token, '=');
+    if (equals == NULL || equals == token || equals[1] == '\0') {
+      *ctx->runtime_config = backup;
+      return -1;
+    }
+    *equals = '\0';
+    char item[96];
+    snprintf(item, sizeof(item), "%s.%s", group, token);
+    if (config_store_set_item(ctx->runtime_config, item, equals + 1) != 0) {
+      *ctx->runtime_config = backup;
+      return -1;
+    }
+    ++changed;
+    token = strtok_r(NULL, " \t", &save);
+  } while (token != NULL);
+
+  if (changed == 0u ||
+      (strcasecmp(group, "dynamic") == 0 && ctx->runtime_config->dync.cycle_num == 0u) ||
+      apply_runtime_config(ctx) != 0 ||
+      config_store_save(ctx->config_file, ctx->runtime_config) != 0) {
+    *ctx->runtime_config = backup;
+    (void)apply_runtime_config(ctx);
+    return -1;
+  }
+  return 0;
+}
 
 typedef struct {
   /* 固定地址裸压测配置：绕过 Static Idle 业务流程，只验证一次三模块联合采图。 */
@@ -527,13 +651,14 @@ static bool parse_dync_config_args(const char* args, dync_command_config_t* comm
         command_config->has_config_write = true;
       } else if (strcmp(step_suffix, "req") == 0 || strcmp(step_suffix, "req_code") == 0) {
         command_config->config.step_cfg_h[step_index] =
-            (command_config->config.step_cfg_h[step_index] & ~0xffu) | (value & 0xffu);
+            (command_config->config.step_cfg_h[step_index] & ~PA_PU_DYNC_STEP_REQ_MASK) |
+            (value & PA_PU_DYNC_STEP_REQ_MASK);
         command_config->has_config_write = true;
       } else if (strcmp(step_suffix, "en") == 0 || strcmp(step_suffix, "enable") == 0) {
         if (value != 0) {
-          command_config->config.step_cfg_h[step_index] |= 0x80000000u;
+          command_config->config.step_cfg_h[step_index] |= PA_PU_DYNC_STEP_ENABLE_MASK;
         } else {
-          command_config->config.step_cfg_h[step_index] &= ~0x80000000u;
+          command_config->config.step_cfg_h[step_index] &= ~PA_PU_DYNC_STEP_ENABLE_MASK;
         }
         command_config->has_config_write = true;
       } else {
@@ -603,7 +728,7 @@ static bool parse_dynamic_offset_args(const char* args, dynamic_offset_args_t* c
       config->dync.has_config_write = true;
     } else if (strcmp(token, "wait") == 0 || strcmp(token, "wait_done") == 0) {
       /*
-       * MAKE_DYNC_OFFSET 后台任务内部会等待每帧 dynamic 完成。
+       * MAKE_DYNC_OFFSET 保留该参数以兼容旧调试脚本；后台任务现按静态逐帧完成采集。
        * 接受该字段仅用于兼容早期调试参数，命令本身始终立即返回。
        */
     } else if (parse_dync_step_token(token, &step_suffix, &step_index)) {
@@ -615,13 +740,14 @@ static bool parse_dynamic_offset_args(const char* args, dynamic_offset_args_t* c
         config->dync.has_config_write = true;
       } else if (strcmp(step_suffix, "req") == 0 || strcmp(step_suffix, "req_code") == 0) {
         config->dync.config.step_cfg_h[step_index] =
-            (config->dync.config.step_cfg_h[step_index] & ~0xffu) | (value & 0xffu);
+            (config->dync.config.step_cfg_h[step_index] & ~PA_PU_DYNC_STEP_REQ_MASK) |
+            (value & PA_PU_DYNC_STEP_REQ_MASK);
         config->dync.has_config_write = true;
       } else if (strcmp(step_suffix, "en") == 0 || strcmp(step_suffix, "enable") == 0) {
         if (value != 0) {
-          config->dync.config.step_cfg_h[step_index] |= 0x80000000u;
+          config->dync.config.step_cfg_h[step_index] |= PA_PU_DYNC_STEP_ENABLE_MASK;
         } else {
-          config->dync.config.step_cfg_h[step_index] &= ~0x80000000u;
+          config->dync.config.step_cfg_h[step_index] &= ~PA_PU_DYNC_STEP_ENABLE_MASK;
         }
         config->dync.has_config_write = true;
       } else {
@@ -1498,7 +1624,7 @@ static void write_work_state_response(const work_mode_status_t* status,
                            GIC_DEFAULT_DOUT_EN != 0u ? 1u : 0u);
     for (unsigned i = 0; i < PA_PU_DYNC_STEP_COUNT &&
                          written > 0 && (size_t)written < response_size; ++i) {
-      if ((dync_config->step_cfg_h[i] & 0x80000000u) == 0u) {
+      if ((dync_config->step_cfg_h[i] & PA_PU_DYNC_STEP_ENABLE_MASK) == 0u) {
         continue;
       }
       written += snprintf(response + written,
@@ -1565,13 +1691,32 @@ static void write_work_state_response(const work_mode_status_t* status,
            cal.last_error);
 }
 
-static void write_status_response(char* response, size_t response_size) {
+static void write_status_response(const command_context_t* ctx,
+                                  char* response,
+                                  size_t response_size) {
   pa_pu_status_t status;
+  work_mode_status_t work_status;
+  cal_task_status_t cal;
+  char config_summary[256] = "unavailable";
+  memset(&work_status, 0, sizeof(work_status));
+  memset(&cal, 0, sizeof(cal));
   pa_pu_read_status(&status);
+  if (ctx != NULL && ctx->work_mode != NULL) {
+    work_mode_get_status(ctx->work_mode, &work_status);
+  }
+  calibration_task_get_status(&cal);
+  if (ctx != NULL && ctx->runtime_config != NULL) {
+    (void)config_store_summary(ctx->runtime_config,
+                                config_summary,
+                                sizeof(config_summary));
+  }
 
-  /* STATUS 响应保持短格式，方便串口助手查看，也方便上位机按字段解析。 */
+  /*
+   * STATUS 只读非清零寄存器，同时附带 ARM 工作状态和配置摘要。
+   * INT_VECTOR 等 read-clear 寄存器仍由具体工作流内部读取。
+   */
   snprintf(response, response_size,
-           "OK STATUS pa_version=0x%08x pa_build_information=0x%08x adapted_main_board_version=0x%08x adapted_gic_board_version=0x%08x adapted_roic_board_version=0x%08x adapted_reserved_board_0_version=0x%08x adapted_reserved_board_1_version=0x%08x adapted_reserved_board_2_version=0x%08x pa_pu_com_version=0x%08x pa_rst_init_state=0x%08x wr_state=0x%08x wr_end=0x%08x wr_final_img_addr=0x%08x corr_state=0x%08x corr_end=0x%08x gic_state=0x%08x gic_end=0x%08x gic_dfx=0x%08x roic_state=0x%08x roic_end=0x%08x roic_dfx=0x%08x dync_state=0x%08x dync_end=0x%08x dync_debug_out=0x%08x img_upload_state=0x%08x img_upload_end=0x%08x img_upload_dfx=0x%08x\r\n",
+           "OK STATUS pa_version=0x%08x pa_build_information=0x%08x adapted_main_board_version=0x%08x adapted_gic_board_version=0x%08x adapted_roic_board_version=0x%08x adapted_reserved_board_0_version=0x%08x adapted_reserved_board_1_version=0x%08x adapted_reserved_board_2_version=0x%08x pa_pu_com_version=0x%08x pa_rst_init_state=0x%08x wr_state=0x%08x wr_end=0x%08x wr_final_img_addr=0x%08x corr_state=0x%08x corr_end=0x%08x gic_state=0x%08x gic_end=0x%08x gic_dfx=0x%08x roic_state=0x%08x roic_end=0x%08x roic_dfx=0x%08x dync_state=0x%08x dync_end=0x%08x dync_debug_out=0x%08x img_upload_state=0x%08x img_upload_end=0x%08x img_upload_dfx=0x%08x work_mode=%s work_state=%s work_phase=%s work_error=%d config_file=%s config_summary=%s template_task=%s template_state=%s template_progress=%u/%u template_error=%d ddr_next_offset=0x%08x ddr_frame_stride=0x%lx ddr_frame_count=%lu\r\n",
            status.pa_version,
            status.pa_build_information,
            status.adapted_main_board_version,
@@ -1598,7 +1743,21 @@ static void write_status_response(char* response, size_t response_size) {
            status.dync_debug_out,
            status.img_upload_state,
            status.img_upload_end,
-           status.img_upload_dfx);
+           status.img_upload_dfx,
+           work_mode_name(work_status.mode),
+           work_mode_state_name(work_status.state),
+           work_mode_phase_name(work_status.last_phase),
+           work_status.last_error,
+           ctx != NULL && ctx->config_file != NULL ? ctx->config_file : "",
+           config_summary,
+           calibration_task_kind_name(cal.kind),
+           calibration_task_state_name(cal.state),
+           cal.progress_current,
+           cal.progress_total,
+           cal.last_error,
+           work_status.ddr_next_offset,
+           (unsigned long)work_status.ddr_frame_stride,
+           (unsigned long)work_status.ddr_frame_count);
 }
 
 static void format_fpga_version(uint32_t value, char* text, size_t text_size) {
@@ -1975,7 +2134,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
 
   if (cmd_is(command, "STATUS")) {
     /* 读取 PA/FPGA 当前非清除类状态，用于上位机刷新状态栏或调试。 */
-    write_status_response(response, response_size);
+    write_status_response(ctx, response, response_size);
     return 0;
   }
 
@@ -2024,6 +2183,154 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     work_mode_get_status(ctx->work_mode, &status);
     work_mode_get_dynamic_config(ctx->work_mode, &dync_config);
     write_work_state_response(&status, &dync_config, response, response_size);
+    return 0;
+  }
+
+  if (cmd_is(command, "QUERY_DYNAMIC") || cmd_is(command, "GET_DYNAMIC_STATUS")) {
+    work_mode_status_t status;
+    pa_pu_dync_config_t dync_config;
+    memset(&dync_config, 0, sizeof(dync_config));
+    work_mode_get_status(ctx->work_mode, &status);
+    work_mode_get_dynamic_config(ctx->work_mode, &dync_config);
+    snprintf(response,
+             response_size,
+             "OK DYNAMIC_STATUS state=%s phase=%s stop=%u error=%d cycle=%u img_start=0x%08x img_end=0x%08x dync_state=0x%08x dync_end=0x%08x dync_debug=0x%08x final_img_addr=0x%08x\r\n",
+             work_mode_state_name(status.state),
+             work_mode_phase_name(status.last_phase),
+             status.stop_requested ? 1u : 0u,
+             status.last_error,
+             dync_config.cycle_num,
+             dync_config.image_start_addr,
+             dync_config.image_end_addr,
+             status.dynamic_dync_state,
+             status.dynamic_dync_end,
+             status.dynamic_dync_debug_out,
+             pa_pu_read(PA_PU_IMG_WR_FINAL_IMG_ADDR_REG));
+    return 0;
+  }
+
+  if (cmd_is(command, "GET_CONFIG_SUMMARY") || cmd_is(command, "GET_CONFIG")) {
+    char summary[256];
+    if (ctx->runtime_config == NULL || config_store_summary(ctx->runtime_config, summary, sizeof(summary)) != 0) {
+      snprintf(response, response_size, "ERR GET_CONFIG_SUMMARY\r\n");
+    } else {
+      snprintf(response, response_size, "OK CONFIG_SUMMARY file=%s %s\r\n", ctx->config_file, summary);
+    }
+    return 0;
+  }
+
+  if (cmd_has_name(command, "GET_CONFIG_GROUP")) {
+    const char* group = cmd_args(command);
+    if (ctx->runtime_config == NULL || *group == '\0') {
+      snprintf(response, response_size, "ERR GET_CONFIG_GROUP ARG\r\n");
+    } else if (strcasecmp(group, "gic") == 0) {
+      const pa_pu_gic_config_t* g = &ctx->runtime_config->gic;
+      snprintf(response, response_size, "OK CONFIG_GROUP group=gic req_code=%u dout_en=%u line_time_ns=%u oe_rise_ns=%u oe_fall_ns=%u start_row=%u end_row=%u binning=%u\r\n", g->req_code, g->dout_enable, g->line_time_ns, g->oe_raising_edge_ns, g->oe_falling_edge_ns, g->start_row, g->end_row, g->binning_mode);
+    } else if (strcasecmp(group, "roic") == 0) {
+      const pa_pu_roic_config_t* r = &ctx->runtime_config->roic;
+      snprintf(response, response_size, "OK CONFIG_GROUP group=roic start_col=%u end_col=%u binning=%u reg_00=0x%04x reg_02=0x%04x reg_05=0x%04x reg_06=0x%04x reg_07=0x%04x reg_09=0x%04x reg_0a=0x%04x reg_0b=0x%04x reg_0c=0x%04x reg_0d=0x%04x reg_0e=0x%04x reg_0f=0x%04x reg_10=0x%04x reg_11=0x%04x reg_17=0x%04x reg_24=0x%04x reg_28=0x%04x reg_2d=0x%04x reg_3b=0x%04x\r\n", r->start_col, r->end_col, r->binning_mode, r->reg_00, r->reg_02, r->reg_05, r->reg_06, r->reg_07, r->reg_09, r->reg_0a, r->reg_0b, r->reg_0c, r->reg_0d, r->reg_0e, r->reg_0f, r->reg_10, r->reg_11, r->reg_17, r->reg_24, r->reg_28, r->reg_2d, r->reg_3b);
+    } else if (strcasecmp(group, "corr") == 0) {
+      const pa_pu_corr_config_t* c = &ctx->runtime_config->corr;
+      snprintf(response, response_size, "OK CONFIG_GROUP group=corr pkg_num=%u row_num=%u col_num=%u offset_en=%u offset_addr=0x%08x offset_adder_value=%u offset_corr_mode=%u gain_en=%u gain_addr=0x%08x gain_clipping_value=%u defect_en=%u\r\n", c->pkg_num, c->row_num, c->col_num, c->offset_enable, c->offset_template_addr, c->offset_adder_value, c->offset_corr_mode, c->gain_enable, c->gain_template_addr, c->gain_clipping_value, c->defect_enable);
+    } else if (strcasecmp(group, "static") == 0 || strcasecmp(group, "static_idle") == 0) {
+      const static_idle_config_t* s = &ctx->runtime_config->static_idle;
+      snprintf(response, response_size, "OK CONFIG_GROUP group=static_idle idle_clean_interval_ms=%u exposure_window_ms=%u dark_window_ms=%u\r\n", s->idle_clean_interval_ms, s->exposure_window_ms, s->dark_window_ms);
+    } else if (strcasecmp(group, "dynamic") == 0) {
+      const pa_pu_dync_config_t* d = &ctx->runtime_config->dync;
+      int written = snprintf(response, response_size, "OK CONFIG_GROUP group=dynamic cycle=%u image_start_addr=0x%08x image_end_addr=0x%08x", d->cycle_num, d->image_start_addr, d->image_end_addr);
+      for (unsigned i = 0; i < PA_PU_DYNC_STEP_COUNT && written > 0 && (size_t)written < response_size; ++i) written += snprintf(response + written, response_size - (size_t)written, " step%u_h=0x%08x step%u_l=%u", i, d->step_cfg_h[i], i, d->step_cfg_l[i]);
+      if (written > 0 && (size_t)written < response_size) snprintf(response + written, response_size - (size_t)written, "\r\n");
+    } else {
+      snprintf(response, response_size, "ERR GET_CONFIG_GROUP UNKNOWN\r\n");
+    }
+    return 0;
+  }
+
+  if (cmd_has_name(command, "SET_CONFIG_GROUP")) {
+    const char* args = cmd_args(command);
+    int result = set_runtime_config_group(ctx, args);
+    if (result == -2) {
+      snprintf(response, response_size, "ERR SET_CONFIG_GROUP BUSY\r\n");
+    } else if (result != 0) {
+      snprintf(response, response_size, "ERR SET_CONFIG_GROUP APPLY\r\n");
+    } else {
+      char group[32] = {0};
+      if (strncasecmp(args, "group=", 6) == 0) {
+        sscanf(args + 6, "%31s", group);
+      } else {
+        sscanf(args, "%31s", group);
+      }
+      snprintf(response, response_size, "OK SET_CONFIG_GROUP group=%s\r\n", group);
+    }
+    return 0;
+  }
+
+  if (cmd_has_name(command, "GET_CONFIG_ITEM")) {
+    char value[64];
+    const char* item = cmd_args(command);
+    if (config_store_get_item(ctx->runtime_config, item, value, sizeof(value)) != 0) {
+      snprintf(response, response_size, "ERR GET_CONFIG_ITEM ARG\r\n");
+    } else {
+      snprintf(response, response_size, "OK CONFIG_ITEM item=%s value=%s\r\n", item, value);
+    }
+    return 0;
+  }
+
+  if (cmd_has_name(command, "SET_CONFIG_ITEM")) {
+    char args[256];
+    snprintf(args, sizeof(args), "%s", cmd_args(command));
+    char* equals = strchr(args, '=');
+    if (equals == NULL) equals = strchr(args, ' ');
+    if (equals == NULL) {
+      snprintf(response, response_size, "ERR SET_CONFIG_ITEM ARG\r\n");
+      return 0;
+    }
+    *equals = '\0';
+    char* value = equals + 1;
+    while (*value == ' ') ++value;
+    if (ctx->runtime_config == NULL || config_store_set_item(ctx->runtime_config, args, value) != 0) {
+      snprintf(response, response_size, "ERR SET_CONFIG_ITEM ARG\r\n");
+      return 0;
+    }
+    int apply_result = apply_runtime_config(ctx);
+    if (apply_result == -2) {
+      snprintf(response, response_size, "ERR SET_CONFIG_ITEM BUSY\r\n");
+      return 0;
+    }
+    if (apply_result != 0 || config_store_save(ctx->config_file, ctx->runtime_config) != 0) {
+      snprintf(response, response_size, "ERR SET_CONFIG_ITEM APPLY\r\n");
+      return 0;
+    }
+    snprintf(response, response_size, "OK SET_CONFIG_ITEM item=%s value=%s\r\n", args, value);
+    return 0;
+  }
+
+  if (cmd_is(command, "RESET_CONFIG")) {
+    if (ctx->runtime_config == NULL || !work_mode_allows_hardware_action(ctx->work_mode)) {
+      snprintf(response, response_size, "ERR RESET_CONFIG BUSY\r\n");
+      return 0;
+    }
+    if (config_store_defaults(ctx->fpga_mem, ctx->runtime_config) != 0 ||
+        apply_runtime_config(ctx) != 0 ||
+        config_store_save(ctx->config_file, ctx->runtime_config) != 0) {
+      snprintf(response, response_size, "ERR RESET_CONFIG\r\n");
+    } else {
+      snprintf(response, response_size, "OK RESET_CONFIG\r\n");
+    }
+    return 0;
+  }
+
+  if (cmd_has_name(command, "RESET_CONFIG_GROUP")) {
+    const char* group = cmd_args(command);
+    if (ctx->runtime_config == NULL || !work_mode_allows_hardware_action(ctx->work_mode)) {
+      snprintf(response, response_size, "ERR RESET_CONFIG_GROUP BUSY\r\n");
+    } else if (reset_runtime_config_group(ctx, group) != 0 ||
+               apply_runtime_config(ctx) != 0 ||
+               config_store_save(ctx->config_file, ctx->runtime_config) != 0) {
+      snprintf(response, response_size, "ERR RESET_CONFIG_GROUP ARG\r\n");
+    } else {
+      snprintf(response, response_size, "OK RESET_CONFIG_GROUP group=%s\r\n", group);
+    }
     return 0;
   }
 
@@ -2097,7 +2404,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     return 0;
   }
 
-  if (cmd_is(command, "START_STATIC_IDLE_CAPTURE")) {
+  if (cmd_is(command, "START_STATIC_IDLE_CAPTURE") || cmd_is(command, "START_STATIC_CAPTURE")) {
     /*
      * 发起一次静态 Idle 正式采图：
      * 等待当前空闲清空结束后，按曝光窗口 -> 亮场 -> 暗场窗口 -> 暗场执行。
@@ -2451,10 +2758,8 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     }
 
     /*
-     * 动态模式 offset 模板制作：
-     * frames 为总采集张数，valid_frames 为最后参与均值的有效张数。
-     * 每帧 dynamic 完成后读取 IMG_WR_FINAL_IMG_ADDR，ARM 从对应 uio2 地址取图；
-     * 只有最后 valid_frames 帧会参与逐像素均值。
+     * 保留 MAKE_DYNC_OFFSET 命令名以兼容既有协议；实际制作采用静态逐帧采集。
+     * 每一帧完成 GIC/IMG_WR/IMG_CORR 后才触发下一帧，避免连续 Dynamic 出图丢帧。
      */
     dynamic_offset_args_t args;
     memset(&args, 0, sizeof(args));
@@ -2465,8 +2770,8 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     }
 
     int ret = calibration_task_start_dynamic_offset(ctx->fpga_mem,
-                                                    &args.dync.config,
-                                                    args.dync.has_config_write,
+                                                    NULL,
+                                                    false,
                                                     args.frames,
                                                     args.valid_frames);
     if (ret == 0) {
@@ -2671,7 +2976,8 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
      */
     dync_command_config_t dync_config;
     default_dync_command_config(ctx->fpga_mem, &dync_config);
-    if (!parse_dync_config_args(cmd_args(command), &dync_config)) {
+    if (!parse_dync_config_args(cmd_args(command), &dync_config) ||
+        dync_config.config.cycle_num == 0u) {
       snprintf(response, response_size, "ERR CONFIG_DYNC ARG\r\n");
       return 0;
     }
@@ -2700,15 +3006,15 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     return 0;
   }
 
-  if (cmd_has_name(command, "START_DYNC") ||
-      cmd_has_name(command, "START_DYNAMIC")) {
+  if (cmd_has_name(command, "START_DYNC")) {
     if (!prepare_manual_hardware_action(ctx, "START_DYNC", response, response_size)) {
       return 0;
     }
 
     dync_command_config_t dync_config;
     default_dync_command_config(ctx->fpga_mem, &dync_config);
-    if (!parse_dync_config_args(cmd_args(command), &dync_config)) {
+    if (!parse_dync_config_args(cmd_args(command), &dync_config) ||
+        dync_config.config.cycle_num == 0u) {
       snprintf(response, response_size, "ERR START_DYNC ARG\r\n");
       return 0;
     }
@@ -2735,7 +3041,7 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     return 0;
   }
 
-  if (cmd_is(command, "STOP_DYNC") || cmd_is(command, "STOP_DYNAMIC")) {
+  if (cmd_is(command, "STOP_DYNC")) {
     if (calibration_task_request_stop()) {
       cal_task_status_t cal;
       calibration_task_get_status(&cal);
@@ -2903,8 +3209,13 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     return 0;
   }
 
-  if (cmd_is(command, "START_CONTINUOUS") || cmd_is(command, "START_DYNAMIC_WORK")) {
-    if (!prepare_manual_hardware_action(ctx, "START_CONTINUOUS", response, response_size)) {
+  if (cmd_is(command, "START_CONTINUOUS") ||
+      cmd_is(command, "START_DYNAMIC_WORK") ||
+      cmd_is(command, "START_DYNAMIC")) {
+    const char* start_name = cmd_is(command, "START_DYNAMIC")
+        ? "START_DYNAMIC"
+        : "START_CONTINUOUS";
+    if (!prepare_manual_hardware_action(ctx, start_name, response, response_size)) {
       return 0;
     }
 
@@ -2914,11 +3225,11 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
      */
     int ret = work_mode_start_dynamic(ctx->work_mode);
     if (ret == -2) {
-      snprintf(response, response_size, "ERR START_CONTINUOUS BUSY\r\n");
+      snprintf(response, response_size, "ERR %s BUSY\r\n", start_name);
       return 0;
     }
     if (ret != 0) {
-      snprintf(response, response_size, "ERR START_CONTINUOUS\r\n");
+      snprintf(response, response_size, "ERR %s\r\n", start_name);
       return 0;
     }
 
@@ -2926,7 +3237,8 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     work_mode_get_status(ctx->work_mode, &status);
     snprintf(response,
              response_size,
-             "OK START_CONTINUOUS state=%s ring_frame_stride=0x%lx ring_frame_count=%lu\r\n",
+             "OK %s state=%s ring_frame_stride=0x%lx ring_frame_count=%lu\r\n",
+             start_name,
              work_mode_state_name(status.state),
              (unsigned long)status.ddr_frame_stride,
              (unsigned long)status.ddr_frame_count);
@@ -2963,13 +3275,19 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     return 0;
   }
 
-  if (cmd_is(command, "STOP_TRANSFER") || cmd_is(command, "STOP_DYNAMIC_WORK")) {
+  if (cmd_is(command, "STOP_TRANSFER") ||
+      cmd_is(command, "STOP_DYNAMIC_WORK") ||
+      cmd_is(command, "STOP_DYNAMIC")) {
+    const char* stop_name = cmd_is(command, "STOP_DYNAMIC")
+        ? "STOP_DYNAMIC"
+        : (cmd_is(command, "STOP_DYNAMIC_WORK") ? "STOP_DYNAMIC_WORK" : "STOP_TRANSFER");
     if (calibration_task_request_stop()) {
       cal_task_status_t cal;
       calibration_task_get_status(&cal);
       snprintf(response,
                response_size,
-               "OK STOP_TRANSFER template_task=%s template_state=%s template_id=%u\r\n",
+               "OK %s template_task=%s template_state=%s template_id=%u\r\n",
+               stop_name,
                calibration_task_kind_name(cal.kind),
                calibration_task_state_name(cal.state),
                cal.task_id);
@@ -2981,7 +3299,8 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     if (ret != 0) {
       snprintf(response,
                response_size,
-               "ERR STOP_TRANSFER state=%s phase=%s error=%d dync_state=0x%08x dync_end=0x%08x dync_debug=0x%08x\r\n",
+               "ERR %s state=%s phase=%s error=%d dync_state=0x%08x dync_end=0x%08x dync_debug=0x%08x\r\n",
+               stop_name,
                work_mode_state_name(status.state),
                work_mode_phase_name(status.last_phase),
                status.last_error,
@@ -2992,7 +3311,8 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
     }
     snprintf(response,
              response_size,
-             "OK STOP_TRANSFER state=%s dync_state=0x%08x dync_end=0x%08x dync_debug=0x%08x\r\n",
+             "OK %s state=%s dync_state=0x%08x dync_end=0x%08x dync_debug=0x%08x\r\n",
+             stop_name,
              work_mode_state_name(status.state),
              status.dynamic_dync_state,
              status.dynamic_dync_end,
@@ -3032,4 +3352,945 @@ int command_handle(command_context_t* ctx, const char* command, char* response, 
   log_warn("unknown command: %s", command);
   snprintf(response, response_size, "ERR UNKNOWN\r\n");
   return 0;
+}
+
+/* -------------------- 正式二进制协议基础命令 -------------------- */
+
+enum {
+  PA_BINARY_CMD_HELLO = 0x0001,
+  PA_BINARY_CMD_PING = 0x0002,
+  PA_BINARY_CMD_STATUS = 0x0003,
+  PA_BINARY_CMD_VERSION = 0x0004,
+  PA_BINARY_CMD_START_STATIC_CAPTURE = 0x0200,
+  PA_BINARY_CMD_START_DYNAMIC = 0x0210,
+  PA_BINARY_CMD_STOP_DYNAMIC = 0x0211,
+  PA_BINARY_CMD_QUERY_DYNAMIC = 0x0212,
+  PA_BINARY_CMD_CAL_OFFSET_BEGIN = 0x0300,
+  PA_BINARY_CMD_CAL_OFFSET_CAPTURE = 0x0301,
+  PA_BINARY_CMD_CAL_OFFSET_BUILD = 0x0302,
+  PA_BINARY_CMD_CAL_OFFSET_CANCEL = 0x0303,
+  PA_BINARY_CMD_CAL_GAIN_BEGIN = 0x0304,
+  PA_BINARY_CMD_CAL_GAIN_CAPTURE = 0x0305,
+  PA_BINARY_CMD_CAL_GAIN_BUILD = 0x0306,
+  PA_BINARY_CMD_CAL_GAIN_CANCEL = 0x0307,
+  PA_BINARY_CMD_CAL_STATUS = 0x0308,
+  PA_BINARY_CMD_IMG_UPLOAD_CONFIG = 0x0500,
+  PA_BINARY_CMD_IMG_UPLOAD_START = 0x0501,
+  PA_BINARY_CMD_IMG_UPLOAD_QUERY = 0x0502,
+  PA_BINARY_CMD_GET_CONFIG_GROUP = 0x0103,
+  PA_BINARY_CMD_SET_CONFIG_GROUP = 0x0104,
+  PA_BINARY_CMD_DUMP_REGS = 0x0105,
+  PA_BINARY_CMD_WRITE_REG = 0x0106,
+  PA_BINARY_TLV_ERROR_CODE = 0x0002,
+  PA_BINARY_TLV_APP_VERSION = 0x0300,
+  PA_BINARY_TLV_BUILD_TIME = 0x0301,
+};
+
+static int binary_payload_append_tlv(uint8_t* payload,
+                                     size_t capacity,
+                                     size_t* length,
+                                     uint16_t type,
+                                     const void* value,
+                                     uint16_t value_length);
+
+static const uint8_t* binary_find_tlv(const uint8_t* payload,
+                                      size_t payload_length,
+                                      uint16_t type,
+                                      uint16_t* value_length) {
+  size_t pos = 0u;
+  while (pos < payload_length) {
+    if (payload_length - pos < 4u) return NULL;
+    uint16_t item_type = (uint16_t)payload[pos] | ((uint16_t)payload[pos + 1u] << 8u);
+    uint16_t item_length = (uint16_t)payload[pos + 2u] | ((uint16_t)payload[pos + 3u] << 8u);
+    pos += 4u;
+    if (payload_length - pos < item_length) return NULL;
+    if (item_type == type) {
+      if (value_length != NULL) *value_length = item_length;
+      return payload + pos;
+    }
+    pos += item_length;
+  }
+  return NULL;
+}
+
+static bool binary_read_u32_tlv(const uint8_t* payload,
+                                size_t payload_length,
+                                uint16_t type,
+                                uint32_t* value) {
+  uint16_t length = 0u;
+  const uint8_t* data = binary_find_tlv(payload, payload_length, type, &length);
+  if (data == NULL || value == NULL || (length != 1u && length != 2u && length != 4u)) return false;
+  uint32_t result = data[0];
+  if (length >= 2u) result |= (uint32_t)data[1] << 8u;
+  if (length == 4u) result |= (uint32_t)data[2] << 16u | (uint32_t)data[3] << 24u;
+  *value = result;
+  return true;
+}
+
+/*
+ * 正式协议的配置组映射。
+ * item_id 固定为协议字段，不把 INI 文本名称带到 RS422 上，便于后续产品复用。
+ */
+typedef struct {
+  uint16_t id;
+  const char* name;
+} binary_config_item_t;
+
+static const binary_config_item_t binary_config_groups[][32] = {
+  {
+    {0x1000u, "static.idle_clean_interval_ms"},
+    {0x1001u, "static.exposure_window_ms"},
+    {0x1002u, "static.dark_window_ms"},
+    {0u, NULL}
+  },
+  {
+    {0x0300u, "corr.offset_en"}, {0x0301u, "corr.gain_en"},
+    {0x0302u, "corr.defect_en"}, {0x0303u, "corr.offset_adder_value"},
+    {0x0304u, "corr.gain_clipping_value"}, {0x0305u, "corr.pkg_num"},
+    {0x0306u, "corr.row_num"}, {0x0307u, "corr.col_num"},
+    {0x0308u, "corr.offset_template_addr"}, {0x0309u, "corr.offset_corr_mode"},
+    {0x030au, "corr.gain_template_addr"}, {0u, NULL}
+  },
+  {
+    {0x0400u, "gic.req_code"}, {0x0401u, "gic.dout_en"},
+    {0x0402u, "gic.line_time_ns"}, {0x0403u, "gic.start_row"},
+    {0x0404u, "gic.end_row"}, {0x0405u, "gic.binning"},
+    {0x0406u, "gic.oe_rise_ns"}, {0x0407u, "gic.oe_fall_ns"}, {0u, NULL}
+  },
+  {
+    {0x0500u, "roic.start_col"}, {0x0501u, "roic.end_col"},
+    {0x0502u, "roic.binning"},
+    {0x0503u, "roic.reg_00"}, {0x0504u, "roic.reg_02"},
+    {0x0505u, "roic.reg_05"}, {0x0506u, "roic.reg_06"},
+    {0x0507u, "roic.reg_07"}, {0x0508u, "roic.reg_09"},
+    {0x0509u, "roic.reg_0a"}, {0x050au, "roic.reg_0b"},
+    {0x050bu, "roic.reg_0c"}, {0x050cu, "roic.reg_0d"},
+    {0x050du, "roic.reg_0e"}, {0x050eu, "roic.reg_0f"},
+    {0x050fu, "roic.reg_10"}, {0x0510u, "roic.reg_11"},
+    {0x0511u, "roic.reg_17"}, {0x0512u, "roic.reg_24"},
+    {0x0513u, "roic.reg_28"}, {0x0514u, "roic.reg_2d"},
+    {0x0515u, "roic.reg_3b"}, {0u, NULL}
+  },
+  {
+    {0x0600u, "dynamic.cycle"}, {0x0601u, "dynamic.image_start_addr"},
+    {0x0602u, "dynamic.image_end_addr"},
+    {0x0603u, "dynamic.start_timeout_ms"},
+    {0x0604u, "dynamic.state_poll_interval_ms"},
+    {0x0605u, "dynamic.stop_timeout_ms"},
+    {0x2100u, "dynamic.step0_h"}, {0x2101u, "dynamic.step0_l"},
+    {0x2110u, "dynamic.step1_h"}, {0x2111u, "dynamic.step1_l"},
+    {0x2120u, "dynamic.step2_h"}, {0x2121u, "dynamic.step2_l"},
+    {0x2130u, "dynamic.step3_h"}, {0x2131u, "dynamic.step3_l"},
+    {0x2140u, "dynamic.step4_h"}, {0x2141u, "dynamic.step4_l"},
+    {0x2150u, "dynamic.step5_h"}, {0x2151u, "dynamic.step5_l"},
+    {0x2160u, "dynamic.step6_h"}, {0x2161u, "dynamic.step6_l"},
+    {0x2170u, "dynamic.step7_h"}, {0x2171u, "dynamic.step7_l"},
+    {0x2180u, "dynamic.step8_h"}, {0x2181u, "dynamic.step8_l"},
+    {0x2190u, "dynamic.step9_h"}, {0x2191u, "dynamic.step9_l"},
+    {0u, NULL}
+  }
+};
+
+static const binary_config_item_t* binary_config_group(unsigned group) {
+  if (group == 0u || group > sizeof(binary_config_groups) / sizeof(binary_config_groups[0])) {
+    return NULL;
+  }
+  return binary_config_groups[group - 1u];
+}
+
+static const char* binary_config_item_name(unsigned group, uint16_t id) {
+  const binary_config_item_t* items = binary_config_group(group);
+  if (items == NULL) return NULL;
+  for (size_t i = 0u; items[i].name != NULL; ++i) {
+    if (items[i].id == id) return items[i].name;
+  }
+  return NULL;
+}
+
+static int binary_append_config_group(const pa_runtime_config_t* config,
+                                      unsigned group,
+                                      uint8_t* payload,
+                                      size_t capacity,
+                                      size_t* length) {
+  const binary_config_item_t* items = binary_config_group(group);
+  if (config == NULL || items == NULL) return -1;
+  char text[32];
+  for (size_t i = 0u; items[i].name != NULL; ++i) {
+    if (config_store_get_item(config, items[i].name, text, sizeof(text)) != 0) return -1;
+    uint32_t value = (uint32_t)strtoul(text, NULL, 0);
+    uint8_t encoded[4] = {
+      (uint8_t)(value & 0xffu), (uint8_t)((value >> 8u) & 0xffu),
+      (uint8_t)((value >> 16u) & 0xffu), (uint8_t)((value >> 24u) & 0xffu)
+    };
+    if (binary_payload_append_tlv(payload, capacity, length, items[i].id,
+                                  encoded, sizeof(encoded)) != 0) return -1;
+  }
+  return 0;
+}
+
+static int binary_apply_config_group(command_context_t* ctx,
+                                     const uint8_t* input,
+                                     size_t input_length,
+                                     unsigned group) {
+  if (ctx == NULL || ctx->runtime_config == NULL || input == NULL ||
+      binary_config_group(group) == NULL || input_length < 2u) return -1;
+  uint16_t requested_group = (uint16_t)input[0] | ((uint16_t)input[1] << 8u);
+  if (requested_group != group) return -1;
+  size_t pos = 2u;
+  while (pos < input_length) {
+    if (input_length - pos < 8u) return -1;
+    uint16_t id = (uint16_t)input[pos] | ((uint16_t)input[pos + 1u] << 8u);
+    uint16_t len = (uint16_t)input[pos + 2u] | ((uint16_t)input[pos + 3u] << 8u);
+    if (len != 4u || input_length - pos < 4u + len) return -1;
+    const char* name = binary_config_item_name(group, id);
+    if (name == NULL) return -1;
+    uint32_t value = (uint32_t)input[pos + 4u]
+                   | ((uint32_t)input[pos + 5u] << 8u)
+                   | ((uint32_t)input[pos + 6u] << 16u)
+                   | ((uint32_t)input[pos + 7u] << 24u);
+    char text[16];
+    snprintf(text, sizeof(text), "0x%08x", value);
+    if (config_store_set_item(ctx->runtime_config, name, text) != 0) return -1;
+    pos += 8u;
+  }
+  if (!work_mode_allows_hardware_action(ctx->work_mode) ||
+      apply_runtime_config(ctx) != 0 ||
+      config_store_save(ctx->config_file, ctx->runtime_config) != 0) return -1;
+  return 0;
+}
+
+static int binary_payload_append_tlv(uint8_t* payload,
+                                     size_t capacity,
+                                     size_t* length,
+                                     uint16_t type,
+                                     const void* value,
+                                     uint16_t value_length) {
+  if (payload == NULL || length == NULL || value == NULL ||
+      *length + 4u + value_length > capacity) {
+    return -1;
+  }
+  payload[*length + 0u] = (uint8_t)(type & 0xffu);
+  payload[*length + 1u] = (uint8_t)((type >> 8u) & 0xffu);
+  payload[*length + 2u] = (uint8_t)(value_length & 0xffu);
+  payload[*length + 3u] = (uint8_t)((value_length >> 8u) & 0xffu);
+  memcpy(payload + *length + 4u, value, value_length);
+  *length += 4u + value_length;
+  return 0;
+}
+
+static int binary_payload_append_u32(uint8_t* payload,
+                                     size_t capacity,
+                                     size_t* length,
+                                     uint16_t type,
+                                     uint32_t value) {
+  uint8_t encoded[4] = {
+    (uint8_t)(value & 0xffu),
+    (uint8_t)((value >> 8u) & 0xffu),
+    (uint8_t)((value >> 16u) & 0xffu),
+    (uint8_t)((value >> 24u) & 0xffu),
+  };
+  return binary_payload_append_tlv(payload, capacity, length, type, encoded, sizeof(encoded));
+}
+
+static int binary_payload_append_string(uint8_t* payload,
+                                        size_t capacity,
+                                        size_t* length,
+                                        uint16_t type,
+                                        const char* value) {
+  if (value == NULL) {
+    value = "";
+  }
+  size_t value_length = strlen(value);
+  if (value_length > UINT16_MAX) {
+    return -1;
+  }
+  return binary_payload_append_tlv(payload,
+                                   capacity,
+                                   length,
+                                   type,
+                                   value,
+                                   (uint16_t)value_length);
+}
+
+static int binary_response(command_context_t* ctx,
+                           const pa_protocol_frame_view_t* request,
+                           uint8_t message_type,
+                           const uint8_t* payload,
+                           uint16_t payload_length,
+                           uint8_t* response,
+                           size_t response_capacity,
+                           size_t* response_length) {
+  (void)ctx;
+  return pa_protocol_encode(message_type,
+                             0u,
+                             request->cmd,
+                             request->seq,
+                             payload,
+                             payload_length,
+                             response,
+                             response_capacity,
+                             response_length);
+}
+
+static int binary_error_response(command_context_t* ctx,
+                                 const pa_protocol_frame_view_t* request,
+                                 uint16_t error_code,
+                                 uint8_t* response,
+                                 size_t response_capacity,
+                                 size_t* response_length) {
+  uint8_t payload[8];
+  size_t payload_length = 0u;
+  if (binary_payload_append_u32(payload,
+                                sizeof(payload),
+                                &payload_length,
+                                PA_BINARY_TLV_ERROR_CODE,
+                                error_code) != 0) {
+    return -1;
+  }
+  return binary_response(ctx,
+                          request,
+                          PA_PROTOCOL_MSG_ERR,
+                          payload,
+                          (uint16_t)payload_length,
+                          response,
+                          response_capacity,
+                          response_length);
+}
+
+static int binary_append_work_status(const work_mode_status_t* status,
+                                     uint8_t* payload,
+                                     size_t capacity,
+                                     size_t* length) {
+  if (status == NULL) {
+    return -1;
+  }
+  const struct {
+    uint16_t type;
+    uint32_t value;
+  } fields[] = {
+    {0x0009u, status->capture_id},
+    {0x1012u, status->capture_id},
+    {0x1013u, status->last_bright_addr},
+    {0x1014u, status->last_dark_addr},
+    {0x1015u, status->last_int_vector},
+    {0x2003u, status->dynamic_dync_state},
+    {0x2004u, pa_pu_read(PA_PU_IMG_WR_FINAL_IMG_ADDR_REG)},
+    {0x2005u, (uint32_t)status->ddr_frame_count},
+    {0x2006u, status->last_int_vector},
+    {0x2007u, status->dynamic_dync_end},
+    {0x2008u, status->dynamic_dync_debug_out},
+  };
+  for (size_t i = 0u; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+    if (binary_payload_append_u32(payload, capacity, length,
+                                  fields[i].type, fields[i].value) != 0) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+static int binary_append_calibration_status(uint8_t* payload,
+                                            size_t capacity,
+                                            size_t* length) {
+  cal_task_status_t task;
+  cal_gain_status_t gain;
+  calibration_task_get_status(&task);
+  calibration_gain_get_status(&gain);
+  const struct {
+    uint16_t type;
+    uint32_t value;
+  } fields[] = {
+    {0x3200u, task.task_id},
+    {0x3201u, (uint32_t)task.kind},
+    {0x3202u, (uint32_t)task.state},
+    {0x3203u, (uint32_t)task.last_error},
+    {0x3204u, task.progress_current},
+    {0x3205u, task.progress_total},
+    {0x3206u, task.gain_level},
+    {0x3207u, task.stop_requested ? 1u : 0u},
+    {0x3210u, gain.active ? 1u : 0u},
+    {0x3211u, gain.level_count},
+    {0x3212u, gain.levels_ready},
+    {0x3213u, gain.frames_per_level},
+    {0x3215u, gain.bad_pixel_count},
+  };
+  for (size_t i = 0u; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+    if (binary_payload_append_u32(payload, capacity, length,
+                                  fields[i].type, fields[i].value) != 0) return -1;
+  }
+  uint32_t threshold_bits = 0u;
+  memcpy(&threshold_bits, &gain.defect_threshold, sizeof(threshold_bits));
+  if (binary_payload_append_u32(payload, capacity, length, 0x3214u, threshold_bits) != 0) return -1;
+  for (uint32_t i = 0u; i < gain.level_count && i < CAL_GAIN_MAX_LEVELS; ++i) {
+    if (binary_payload_append_u32(payload, capacity, length,
+                                  (uint16_t)(0x3300u + i), gain.levels[i].level) != 0 ||
+        binary_payload_append_u32(payload, capacity, length,
+                                  (uint16_t)(0x3340u + i), gain.levels[i].ready ? 1u : 0u) != 0 ||
+        binary_payload_append_u32(payload, capacity, length,
+                                  (uint16_t)(0x3380u + i), gain.levels[i].median) != 0) return -1;
+  }
+  return 0;
+}
+
+static bool binary_prepare_hardware_action(command_context_t* ctx, const char* name) {
+  char response[256];
+  response[0] = '\0';
+  return prepare_manual_hardware_action(ctx, name, response, sizeof(response));
+}
+
+int command_handle_binary(command_context_t* ctx,
+                          const pa_protocol_frame_view_t* request,
+                          uint8_t* response,
+                          size_t response_capacity,
+                          size_t* response_length) {
+  if (ctx == NULL || request == NULL || response == NULL || response_length == NULL) {
+    return -1;
+  }
+  *response_length = 0u;
+  if (request->msg_type != PA_PROTOCOL_MSG_REQ) {
+    return binary_error_response(ctx, request, 0x0002u, response, response_capacity, response_length);
+  }
+
+  uint8_t payload[PA_PROTOCOL_MAX_PAYLOAD];
+  size_t payload_length = 0u;
+  pa_pu_status_t pa_status;
+  memset(&pa_status, 0, sizeof(pa_status));
+
+  switch (request->cmd) {
+    case PA_BINARY_CMD_GET_CONFIG_GROUP: {
+      if (request->payload_len != 2u) {
+        return binary_error_response(ctx, request, 0x0002u, response, response_capacity, response_length);
+      }
+      unsigned group = (unsigned)request->payload[0] | ((unsigned)request->payload[1] << 8u);
+      if (binary_config_group(group) == NULL || ctx->runtime_config == NULL) {
+        return binary_error_response(ctx, request, 0x0001u, response, response_capacity, response_length);
+      }
+      if (binary_append_config_group(ctx->runtime_config, group, payload, sizeof(payload), &payload_length) != 0) {
+        return binary_error_response(ctx, request, 0x000Eu, response, response_capacity, response_length);
+      }
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_SET_CONFIG_GROUP: {
+      if (request->payload_len < 2u) {
+        return binary_error_response(ctx, request, 0x0002u, response, response_capacity, response_length);
+      }
+      unsigned group = (unsigned)request->payload[0] | ((unsigned)request->payload[1] << 8u);
+      if (binary_config_group(group) == NULL ||
+          binary_apply_config_group(ctx, request->payload, request->payload_len, group) != 0) {
+        return binary_error_response(ctx, request, 0x0008u, response, response_capacity, response_length);
+      }
+      if (binary_append_config_group(ctx->runtime_config, group, payload, sizeof(payload), &payload_length) != 0) {
+        return binary_error_response(ctx, request, 0x000Eu, response, response_capacity, response_length);
+      }
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_DUMP_REGS: {
+      if (request->payload_len != 0u) {
+        return binary_error_response(ctx, request, 0x0002u, response, response_capacity, response_length);
+      }
+      uint16_t offsets[128];
+      uint32_t values[128];
+      const size_t count = pa_pu_read_register_snapshot(offsets, values, 128u);
+      for (size_t i = 0u; i < count; ++i) {
+        if (binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                      offsets[i], values[i]) != 0) {
+          return binary_error_response(ctx, request, 0x000Eu, response, response_capacity, response_length);
+        }
+      }
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_WRITE_REG: {
+      if (request->payload_len != 8u) {
+        return binary_error_response(ctx, request, 0x0002u, response, response_capacity, response_length);
+      }
+      const uint16_t offset = (uint16_t)request->payload[0]
+                            | ((uint16_t)request->payload[1] << 8u);
+      const uint32_t value = (uint32_t)request->payload[4]
+                           | ((uint32_t)request->payload[5] << 8u)
+                           | ((uint32_t)request->payload[6] << 16u)
+                           | ((uint32_t)request->payload[7] << 24u);
+      pa_pu_write(offset, value);
+      if (binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    offset, pa_pu_read(offset)) != 0) {
+        return binary_error_response(ctx, request, 0x000Eu, response, response_capacity, response_length);
+      }
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+
+    case PA_BINARY_CMD_HELLO:
+    case PA_BINARY_CMD_VERSION:
+      pa_pu_read_status(&pa_status);
+      if (binary_payload_append_string(payload, sizeof(payload), &payload_length,
+                                        PA_BINARY_TLV_APP_VERSION, APP_VERSION) != 0 ||
+          binary_payload_append_string(payload, sizeof(payload), &payload_length,
+                                       PA_BINARY_TLV_BUILD_TIME, APP_BUILD_TIME) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0302u, pa_status.pa_version) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0303u, pa_status.pa_build_information) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0304u, pa_status.adapted_main_board_version) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0305u, pa_status.adapted_gic_board_version) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0306u, pa_status.adapted_roic_board_version) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x030Au, pa_status.pa_pu_com_version) != 0) {
+        return -1;
+      }
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+
+    case PA_BINARY_CMD_PING:
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             NULL, 0u, response, response_capacity, response_length);
+
+    case PA_BINARY_CMD_STATUS: {
+      work_mode_status_t work_status;
+      memset(&work_status, 0, sizeof(work_status));
+      pa_pu_read_status(&pa_status);
+      work_mode_get_status(ctx->work_mode, &work_status);
+
+      const struct {
+        uint16_t type;
+        uint32_t value;
+      } fields[] = {
+        {0x0200u, (uint32_t)work_status.mode},
+        {0x0201u, (uint32_t)work_status.state},
+        {0x0202u, (uint32_t)work_status.last_error},
+        {0x0204u, work_status.capture_id},
+        {0x0205u, (uint32_t)work_status.ddr_frame_count},
+        {0x0206u, work_status.last_dark_addr},
+        {0x0207u, work_status.last_bright_addr},
+        {0x0209u, pa_status.img_wr_state},
+        {0x020Au, pa_status.img_wr_end},
+        {0x020Bu, pa_status.img_corr_state},
+        {0x020Cu, pa_status.img_corr_end},
+        {0x020Du, pa_status.gic_state},
+        {0x020Eu, pa_status.gic_end},
+        {0x020Fu, pa_status.gic_dfx},
+        {0x0213u, pa_status.dync_state},
+        {0x0214u, pa_status.img_upload_state},
+      };
+      for (size_t i = 0u; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+        if (binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                      fields[i].type, fields[i].value) != 0) {
+          return -1;
+        }
+      }
+      /* STATUS 同步返回版本信息，帮助窗口和 SDK 无需额外发送 VERSION 请求。 */
+      if (binary_payload_append_string(payload, sizeof(payload), &payload_length,
+                                       PA_BINARY_TLV_APP_VERSION, APP_VERSION) != 0 ||
+          binary_payload_append_string(payload, sizeof(payload), &payload_length,
+                                       PA_BINARY_TLV_BUILD_TIME, APP_BUILD_TIME) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0302u, pa_status.pa_version) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0303u, pa_status.pa_build_information) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0304u, pa_status.adapted_main_board_version) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0305u, pa_status.adapted_gic_board_version) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0306u, pa_status.adapted_roic_board_version) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0307u, pa_status.adapted_reserved_board_0_version) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0308u, pa_status.adapted_reserved_board_1_version) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0309u, pa_status.adapted_reserved_board_2_version) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x030Au, pa_status.pa_pu_com_version) != 0) {
+        return -1;
+      }
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_START_STATIC_CAPTURE: {
+      /* 正式静态采图命令自动确保 Static Idle 工作线程已启动。 */
+      if (work_mode_start(ctx->work_mode) != 0) {
+        return binary_error_response(ctx, request, 0x0008u,
+                                      response, response_capacity, response_length);
+      }
+      work_mode_status_t work_status;
+      memset(&work_status, 0, sizeof(work_status));
+      int ret = work_mode_start_static_idle_capture(ctx->work_mode, &work_status);
+      if (ret != 0) {
+        return binary_error_response(ctx, request,
+                                     ret == -2 ? 0x0008u : 0x000Eu,
+                                     response, response_capacity, response_length);
+      }
+      payload_length = 0u;
+      if (binary_append_work_status(&work_status, payload, sizeof(payload), &payload_length) != 0) {
+        return -1;
+      }
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_START_DYNAMIC: {
+      int ret = work_mode_start_dynamic(ctx->work_mode);
+      if (ret != 0) {
+        return binary_error_response(ctx, request,
+                                     ret == -2 ? 0x0008u : 0x000Eu,
+                                     response, response_capacity, response_length);
+      }
+      work_mode_status_t work_status;
+      memset(&work_status, 0, sizeof(work_status));
+      work_mode_get_status(ctx->work_mode, &work_status);
+      payload_length = 0u;
+      if (binary_append_work_status(&work_status, payload, sizeof(payload), &payload_length) != 0) {
+        return -1;
+      }
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_STOP_DYNAMIC: {
+      work_mode_status_t work_status;
+      memset(&work_status, 0, sizeof(work_status));
+      int ret = work_mode_stop_dynamic(ctx->work_mode, &work_status);
+      if (ret != 0) {
+        return binary_error_response(ctx, request, 0x000Eu,
+                                     response, response_capacity, response_length);
+      }
+      payload_length = 0u;
+      if (binary_append_work_status(&work_status, payload, sizeof(payload), &payload_length) != 0) {
+        return -1;
+      }
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_QUERY_DYNAMIC: {
+      work_mode_status_t work_status;
+      memset(&work_status, 0, sizeof(work_status));
+      work_mode_get_status(ctx->work_mode, &work_status);
+      payload_length = 0u;
+      if (binary_append_work_status(&work_status, payload, sizeof(payload), &payload_length) != 0) {
+        return -1;
+      }
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_CAL_OFFSET_BEGIN: {
+      uint32_t total_frames = 0u;
+      uint32_t valid_frames = 0u;
+      uint32_t mode = 0u;
+      cal_gain_status_t gain_status;
+      calibration_gain_get_status(&gain_status);
+      if (calibration_task_is_active() || gain_status.active ||
+          !binary_read_u32_tlv(request->payload, request->payload_len, 0x3000u, &total_frames) ||
+          !binary_read_u32_tlv(request->payload, request->payload_len, 0x3001u, &valid_frames) ||
+          !binary_read_u32_tlv(request->payload, request->payload_len, 0x3002u, &mode) ||
+          total_frames == 0u || valid_frames == 0u || valid_frames > total_frames ||
+          total_frames > 65535u || mode > 1u ||
+          (mode == 0u && (total_frames != 1u || valid_frames != 1u))) {
+        return binary_error_response(ctx, request, 0x0002u,
+                                     response, response_capacity, response_length);
+      }
+      ctx->offset_calibration_configured = true;
+      ctx->offset_total_frames = total_frames;
+      ctx->offset_valid_frames = valid_frames;
+      ctx->offset_calibration_mode = (uint8_t)mode;
+      if (binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x3000u, total_frames) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x3001u, valid_frames) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x3002u, mode) != 0) return -1;
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_CAL_OFFSET_CAPTURE: {
+      if (request->payload_len != 0u || !ctx->offset_calibration_configured ||
+          !binary_prepare_hardware_action(ctx, "CAL_OFFSET_CAPTURE")) {
+        return binary_error_response(ctx, request, 0x0008u,
+                                     response, response_capacity, response_length);
+      }
+      int ret = -1;
+      if (ctx->offset_calibration_mode == 0u) {
+        ret = calibration_task_start_make_offset(ctx->fpga_mem);
+      } else {
+        /* mode=1 为历史协议值；实现已改为静态逐帧采集，避免 Dynamic 连续出图丢帧。 */
+        ret = calibration_task_start_dynamic_offset(ctx->fpga_mem,
+                                                    NULL,
+                                                    false,
+                                                    ctx->offset_total_frames,
+                                                    ctx->offset_valid_frames);
+      }
+      if (ret != 0) {
+        return binary_error_response(ctx, request, ret == -2 ? 0x0008u : 0x000Eu,
+                                     response, response_capacity, response_length);
+      }
+      if (binary_append_calibration_status(payload, sizeof(payload), &payload_length) != 0) return -1;
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_CAL_OFFSET_BUILD: {
+      cal_task_status_t task;
+      calibration_task_get_status(&task);
+      if (request->payload_len != 0u || !ctx->offset_calibration_configured ||
+          (task.kind != CAL_TASK_MAKE_OFFSET && task.kind != CAL_TASK_DYNAMIC_OFFSET) ||
+          task.state != CAL_TASK_SUCCEEDED) {
+        return binary_error_response(ctx, request,
+                                     calibration_task_is_active() ? 0x0008u : 0x000Eu,
+                                     response, response_capacity, response_length);
+      }
+      /* 当前实现由后台采集任务原子生成并加载模板；BUILD 用作完成确认边界。 */
+      ctx->offset_calibration_configured = false;
+      if (binary_append_calibration_status(payload, sizeof(payload), &payload_length) != 0) return -1;
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_CAL_OFFSET_CANCEL:
+      if (request->payload_len != 0u) {
+        return binary_error_response(ctx, request, 0x0002u,
+                                     response, response_capacity, response_length);
+      }
+      {
+        cal_task_status_t task;
+        calibration_task_get_status(&task);
+        if (calibration_task_is_active() &&
+            task.kind != CAL_TASK_MAKE_OFFSET && task.kind != CAL_TASK_DYNAMIC_OFFSET) {
+          return binary_error_response(ctx, request, 0x0008u,
+                                       response, response_capacity, response_length);
+        }
+        (void)calibration_task_request_stop();
+      }
+      ctx->offset_calibration_configured = false;
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             NULL, 0u, response, response_capacity, response_length);
+
+    case PA_BINARY_CMD_CAL_GAIN_BEGIN: {
+      uint32_t level_count = 0u;
+      uint32_t frames_per_level = 0u;
+      uint32_t threshold_bits = 0u;
+      uint16_t level_bytes_length = 0u;
+      const uint8_t* level_bytes = binary_find_tlv(request->payload,
+                                                   request->payload_len,
+                                                   0x3110u,
+                                                   &level_bytes_length);
+      if (ctx->offset_calibration_configured || calibration_task_is_active() ||
+          !binary_read_u32_tlv(request->payload, request->payload_len, 0x3100u, &level_count) ||
+          !binary_read_u32_tlv(request->payload, request->payload_len, 0x3101u, &frames_per_level) ||
+          !binary_read_u32_tlv(request->payload, request->payload_len, 0x3102u, &threshold_bits) ||
+          level_count < 2u || level_count > CAL_GAIN_MAX_LEVELS ||
+          level_bytes == NULL || level_bytes_length != level_count * 4u) {
+        return binary_error_response(ctx, request, 0x0002u,
+                                     response, response_capacity, response_length);
+      }
+      uint32_t levels[CAL_GAIN_MAX_LEVELS];
+      for (uint32_t i = 0u; i < level_count; ++i) {
+        const uint8_t* item = level_bytes + i * 4u;
+        levels[i] = (uint32_t)item[0] | ((uint32_t)item[1] << 8u)
+                  | ((uint32_t)item[2] << 16u) | ((uint32_t)item[3] << 24u);
+      }
+      float threshold = 0.0f;
+      memcpy(&threshold, &threshold_bits, sizeof(threshold));
+      if (!isfinite(threshold) || threshold <= 0.0f || threshold > 1.0f) {
+        return binary_error_response(ctx, request, 0x0002u,
+                                     response, response_capacity, response_length);
+      }
+      calibration_gain_cancel();
+      if (calibration_gain_begin(levels, level_count, frames_per_level, threshold) != 0) {
+        return binary_error_response(ctx, request, 0x0002u,
+                                     response, response_capacity, response_length);
+      }
+      if (binary_append_calibration_status(payload, sizeof(payload), &payload_length) != 0) return -1;
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_CAL_GAIN_CAPTURE: {
+      uint32_t level = 0u;
+      if (!binary_read_u32_tlv(request->payload, request->payload_len, 0x3120u, &level) ||
+          !binary_prepare_hardware_action(ctx, "CAL_GAIN_CAPTURE")) {
+        return binary_error_response(ctx, request, 0x0008u,
+                                     response, response_capacity, response_length);
+      }
+      int ret = calibration_task_start_gain_capture(ctx->fpga_mem, level);
+      if (ret != 0) {
+        return binary_error_response(ctx, request, ret == -2 ? 0x0008u : 0x000Eu,
+                                     response, response_capacity, response_length);
+      }
+      if (binary_append_calibration_status(payload, sizeof(payload), &payload_length) != 0) return -1;
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_CAL_GAIN_BUILD: {
+      if (request->payload_len != 0u || !binary_prepare_hardware_action(ctx, "CAL_GAIN_BUILD")) {
+        return binary_error_response(ctx, request, 0x0008u,
+                                     response, response_capacity, response_length);
+      }
+      int ret = calibration_task_start_gain_build(ctx->fpga_mem);
+      if (ret != 0) {
+        return binary_error_response(ctx, request, ret == -2 ? 0x0008u : 0x000Eu,
+                                     response, response_capacity, response_length);
+      }
+      if (binary_append_calibration_status(payload, sizeof(payload), &payload_length) != 0) return -1;
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_CAL_GAIN_CANCEL:
+      if (request->payload_len != 0u) {
+        return binary_error_response(ctx, request, 0x0002u,
+                                     response, response_capacity, response_length);
+      }
+      {
+        cal_task_status_t task;
+        calibration_task_get_status(&task);
+        if (calibration_task_is_active() &&
+            task.kind != CAL_TASK_GAIN_CAPTURE && task.kind != CAL_TASK_GAIN_BUILD &&
+            task.kind != CAL_TASK_MAKE_GAIN) {
+          return binary_error_response(ctx, request, 0x0008u,
+                                       response, response_capacity, response_length);
+        }
+        if (!calibration_task_request_stop()) calibration_gain_cancel();
+      }
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             NULL, 0u, response, response_capacity, response_length);
+
+    case PA_BINARY_CMD_CAL_STATUS:
+      if (request->payload_len != 0u) {
+        return binary_error_response(ctx, request, 0x0002u,
+                                     response, response_capacity, response_length);
+      }
+      if (binary_append_calibration_status(payload, sizeof(payload), &payload_length) != 0) return -1;
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+
+    case PA_BINARY_CMD_IMG_UPLOAD_CONFIG: {
+      if (!binary_prepare_hardware_action(ctx, "IMG_UPLOAD_CONFIG")) {
+        return binary_error_response(ctx, request, 0x0008u,
+                                     response, response_capacity, response_length);
+      }
+      uint32_t template_kind = 0u;
+      uint32_t value = 0u;
+      img_upload_command_config_t upload = {
+        .config = default_img_upload_config(ctx->fpga_mem),
+        .wait_done = true,
+        .source_name = "offset",
+      };
+      if (!binary_read_u32_tlv(request->payload, request->payload_len, 0x5000u, &template_kind) ||
+          template_kind > 1u) {
+        return binary_error_response(ctx, request, 0x0002u,
+                                     response, response_capacity, response_length);
+      }
+      upload.source_name = template_kind == 0u ? "offset" : "gain";
+      if (binary_read_u32_tlv(request->payload, request->payload_len, 0x5001u, &value)) {
+        upload.config.image_addr = value;
+        upload.source_name = "custom";
+      }
+      if (binary_read_u32_tlv(request->payload, request->payload_len, 0x5002u, &value)) {
+        if (value == 0u || value > UINT16_MAX) {
+          return binary_error_response(ctx, request, 0x0002u,
+                                       response, response_capacity, response_length);
+        }
+        upload.config.row_num = (uint16_t)value;
+      }
+      if (binary_read_u32_tlv(request->payload, request->payload_len, 0x5003u, &value)) {
+        if (value == 0u || value > UINT16_MAX) {
+          return binary_error_response(ctx, request, 0x0002u,
+                                       response, response_capacity, response_length);
+        }
+        upload.config.col_num = (uint16_t)value;
+      }
+      if (binary_read_u32_tlv(request->payload, request->payload_len, 0x5004u, &value)) {
+        if (value == 0u || value > UINT16_MAX) {
+          return binary_error_response(ctx, request, 0x0002u,
+                                       response, response_capacity, response_length);
+        }
+        upload.config.pkg_num = (uint16_t)value;
+      }
+      if (!resolve_img_upload_template(ctx->fpga_mem, &upload) ||
+          upload.config.row_num == 0u || upload.config.col_num == 0u || upload.config.pkg_num == 0u) {
+        return binary_error_response(ctx, request, 0x0002u,
+                                     response, response_capacity, response_length);
+      }
+      pa_pu_configure_img_upload(&upload.config);
+      if (binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x5000u, template_kind) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x5001u, upload.config.image_addr) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x5002u, upload.config.row_num) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x5003u, upload.config.col_num) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x5004u, upload.config.pkg_num) != 0) return -1;
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_IMG_UPLOAD_START: {
+      if (request->payload_len != 0u || !binary_prepare_hardware_action(ctx, "IMG_UPLOAD_START")) {
+        return binary_error_response(ctx, request, 0x0008u,
+                                     response, response_capacity, response_length);
+      }
+      pa_pu_prepare_irq_wait();
+      pa_pu_start_img_upload();
+      uint32_t int_vector = 0u;
+      int ret = pa_pu_wait_int_vector(PA_PU_IRQ_IMG_UPLOAD_END, PA_PU_IRQ_TIMEOUT_MS, &int_vector);
+      if (ret <= 0) {
+        return binary_error_response(ctx, request, ret == 0 ? 0x0005u : 0x000Eu,
+                                     response, response_capacity, response_length);
+      }
+      if (binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x5005u,
+                                    pa_pu_read(PA_PU_IMG_UPLOAD_STATE_REG)) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x5006u,
+                                    pa_pu_read(PA_PU_IMG_UPLOAD_END_REG)) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x5007u,
+                                    pa_pu_read(PA_PU_IMG_UPLOAD_DFX_REG)) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x5008u,
+                                    int_vector) != 0) return -1;
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+    }
+
+    case PA_BINARY_CMD_IMG_UPLOAD_QUERY:
+      if (request->payload_len != 0u) {
+        return binary_error_response(ctx, request, 0x0002u,
+                                     response, response_capacity, response_length);
+      }
+      if (binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x5005u,
+                                    pa_pu_read(PA_PU_IMG_UPLOAD_STATE_REG)) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x5006u,
+                                    pa_pu_read(PA_PU_IMG_UPLOAD_END_REG)) != 0 ||
+          binary_payload_append_u32(payload, sizeof(payload), &payload_length, 0x5007u,
+                                    pa_pu_read(PA_PU_IMG_UPLOAD_DFX_REG)) != 0) return -1;
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
+
+    default:
+      return binary_error_response(ctx, request, 0x0001u,
+                                   response, response_capacity, response_length);
+  }
 }

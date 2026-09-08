@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "pa_pu_regs.h"
+
 /*
  * 全局编译配置。
  *
@@ -37,6 +39,16 @@
  * 当前 ARM 侧只实现 0=Idle/Static Idle；其它模式会初始化但不会自动启动。
  */
 #define WORK_MODE_DEFAULT_MODE 0u
+#endif
+
+#ifndef APP_CONFIG_FILE
+/* 运行时 INI 配置文件；不存在时由 ARM 按编译默认参数自动创建。 */
+#define APP_CONFIG_FILE "/usr/local/pa_controller/config.ini"
+#endif
+
+#ifndef APP_CONFIG_FILE
+/* 运行时 INI 配置文件；不存在时由 ARM 按编译默认参数自动创建。 */
+#define APP_CONFIG_FILE "/usr/local/pa_controller/config.ini"
 #endif
 
 #ifndef DEVICE_WIDTH
@@ -200,7 +212,7 @@
 
 #ifndef DYNAMIC_STEP_0_CFG_H
 /* Dynamic step0 high：enable=1，req_code=0（idle）。 */
-#define DYNAMIC_STEP_0_CFG_H 0x80000000u
+#define DYNAMIC_STEP_0_CFG_H PA_PU_DYNC_STEP_CFG_H(1u, PA_PU_DYNC_REQ_IDLE)
 #endif
 
 #ifndef DYNAMIC_STEP_0_CFG_L
@@ -210,7 +222,7 @@
 
 #ifndef DYNAMIC_STEP_1_CFG_H
 /* Dynamic step1 high：enable=1，req_code=4（采一张图）。 */
-#define DYNAMIC_STEP_1_CFG_H 0x80000004u
+#define DYNAMIC_STEP_1_CFG_H PA_PU_DYNC_STEP_CFG_H(1u, PA_PU_DYNC_REQ_CAPTURE_ONE_IMAGE)
 #endif
 #ifndef DYNAMIC_STEP_1_CFG_L
 /* Dynamic step1 定时参数，单位 ms。 */

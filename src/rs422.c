@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
@@ -127,6 +128,43 @@ int rs422_write_text(rs422_t* port, const char* text) {
     }
     p += n;
     len -= (size_t)n;
+  }
+  return 0;
+}
+
+int rs422_read_bytes(rs422_t* port, void* buffer, size_t size) {
+  if (port == NULL || port->fd < 0 || buffer == NULL || size == 0u) {
+    return -1;
+  }
+
+  for (;;) {
+    ssize_t n = read(port->fd, buffer, size);
+    if (n < 0 && errno == EINTR) {
+      return 0;
+    }
+    if (n < 0) {
+      return -1;
+    }
+    return (int)n;
+  }
+}
+
+int rs422_write_bytes(rs422_t* port, const void* buffer, size_t size) {
+  if (port == NULL || port->fd < 0 || buffer == NULL) {
+    return -1;
+  }
+
+  const uint8_t* data = (const uint8_t*)buffer;
+  while (size > 0u) {
+    ssize_t n = write(port->fd, data, size);
+    if (n < 0 && errno == EINTR) {
+      return -1;
+    }
+    if (n <= 0) {
+      return -1;
+    }
+    data += n;
+    size -= (size_t)n;
   }
   return 0;
 }

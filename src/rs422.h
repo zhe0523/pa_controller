@@ -19,3 +19,7 @@ int rs422_read_line(rs422_t* port, char* buffer, size_t size);
 
 /* 写出协议响应，调用者负责提供 \r\n。 */
 int rs422_write_text(rs422_t* port, const char* text);
+
+/* 二进制协议收发：保留串口原始字节，不做换行或字符转换。 */
+int rs422_read_bytes(rs422_t* port, void* buffer, size_t size);
+int rs422_write_bytes(rs422_t* port, const void* buffer, size_t size);

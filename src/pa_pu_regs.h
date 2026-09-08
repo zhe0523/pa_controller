@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 /*
  * PA/PU 寄存器地址表。
  *
@@ -291,6 +293,38 @@ enum {
   /* ROIC 请求码：配置一次 ROIC。 */
   PA_PU_ROIC_REQ_CONFIG_ONCE = 1u,
 };
+
+enum {
+  /*
+   * dynamic step high 配置字：
+   * bit31    current step enable
+   * bit30~8  reserved
+   * bit7~0   current step req code
+   */
+  PA_PU_DYNC_STEP_ENABLE_MASK = 0x80000000u,
+  PA_PU_DYNC_STEP_REQ_MASK = 0x000000ffu,
+};
+
+enum {
+  /* req_code=0：空闲等待。 */
+  PA_PU_DYNC_REQ_IDLE = 0u,
+  /* req_code=1：serial clear。 */
+  PA_PU_DYNC_REQ_SERIAL_CLEAR = 1u,
+  /* req_code=2：parallel clear。 */
+  PA_PU_DYNC_REQ_PARALLEL_CLEAR = 2u,
+  /* req_code=3：xao clear。 */
+  PA_PU_DYNC_REQ_XAO_CLEAR = 3u,
+  /* req_code=4：采集一张图。 */
+  PA_PU_DYNC_REQ_CAPTURE_ONE_IMAGE = 4u,
+  /* req_code=5：等待 sync in 信号。 */
+  PA_PU_DYNC_REQ_WAIT_SYNC_IN = 5u,
+  /* req_code=6：等待 sync out。 */
+  PA_PU_DYNC_REQ_WAIT_SYNC_OUT = 6u,
+};
+
+/* 按协议字段拼 dynamic step high 配置字。 */
+#define PA_PU_DYNC_STEP_CFG_H(enable, req_code) \
+  (((enable) ? PA_PU_DYNC_STEP_ENABLE_MASK : 0u) | ((uint32_t)(req_code) & PA_PU_DYNC_STEP_REQ_MASK))
 
 enum {
   /* 新版 GIC/ROIC 协议使用连续编码 0~7；其它值由 FPGA 按 1x1 处理。 */

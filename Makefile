@@ -10,6 +10,8 @@ CC = $(CROSS_COMPILE)gcc
 endif
 # strip 工具；deploy 目标用它生成去符号版本。
 STRIP ?= $(CROSS_COMPILE)strip
+# 纯协议测试不依赖目标板，默认使用当前 Ubuntu 主机编译器并在本机执行。
+HOSTCC ?= cc
 
 # 输出目标与构建目录。
 TARGET = pa_controller
@@ -26,9 +28,12 @@ WORK_MODE_AUTO_START ?= 0
 # 默认启动的工作模式编号。当前实现 0=Idle/Static Idle、7=Continuous/Dynamic。
 WORK_MODE_DEFAULT_MODE ?= 0
 
+# 运行时 INI 配置文件；首次启动且文件不存在时按编译默认参数自动生成。
+APP_CONFIG_FILE ?= ./config.ini
+
 # 开发板部署/运行参数，deploy-board 和 run-board 目标使用。
 # 部署目标板 IP。
-BOARD_HOST ?= 192.168.3.54
+BOARD_HOST ?= 192.168.3.52
 # 部署目标板用户名。
 BOARD_USER ?= root
 # 部署目标板密码；仅 deploy-board/run-board 调试使用。
@@ -50,7 +55,7 @@ PA_PU_UIO_DEVICE ?=
 
 # 上位机通讯串口配置。
 # RS422 设备节点。
-RS422_DEVICE ?= /dev/ttyS1
+RS422_DEVICE ?= /dev/ttyUSB0
 # RS422 波特率。
 RS422_BAUD ?= 115200
 
@@ -144,10 +149,10 @@ PA_PU_WRITE_VERIFY_ATTEMPTS ?= 2
 DYNAMIC_CYCLE_NUM ?= 10
 DYNAMIC_IMG_START_ADDR ?= 0x26A00000
 DYNAMIC_IMG_END_ADDR ?= 0x3FFFFFFF
-# step0：enable=1、req_code=0(idle)、time=50ms。
+# step0：enable=1、req_code=0(idle)、time=50ms，等价于 PA_PU_DYNC_STEP_CFG_H(1, PA_PU_DYNC_REQ_IDLE)。
 DYNAMIC_STEP_0_CFG_H ?= 0x80000000
 DYNAMIC_STEP_0_CFG_L ?= 50
-# step1：enable=1、req_code=4(capture one image)、time=50ms。
+# step1：enable=1、req_code=4(capture one image)、time=50ms，等价于 PA_PU_DYNC_STEP_CFG_H(1, PA_PU_DYNC_REQ_CAPTURE_ONE_IMAGE)。
 DYNAMIC_STEP_1_CFG_H ?= 0x80000004
 DYNAMIC_STEP_1_CFG_L ?= 50
 # step2~step9 默认关闭；需要组合清空、等待同步等流程时分别覆盖 high/low。
@@ -186,11 +191,11 @@ STATIC_IDLE_CLEAN_LOG_ENABLE ?= 0
 
 # 模板和校准中间文件路径。
 # offset 模板落盘文件；MAKE_OFFSET/MAKE_DYNC_OFFSET 成功后写入，启动时 LOAD_TEMPLATE 会读取。
-TEMPLATE_OFFSET_FILE ?= /usr/local/offset.raw
+TEMPLATE_OFFSET_FILE ?= ./offset.raw
 # gain 模板落盘文件；MAKE_GAIN/CAL_GAIN_BUILD 成功后写入，启动时 LOAD_TEMPLATE 会读取。
-TEMPLATE_GAIN_FILE ?= /usr/local/gain.raw
+TEMPLATE_GAIN_FILE ?= ./gain.raw
 # gain/defect 多灰阶校准的均值图中间文件目录。
-CAL_GAIN_DIR ?= /usr/local/calib
+CAL_GAIN_DIR ?= ./calib
 # Gain 模板任务执行方式：0=前台同步，1=后台异步。
 # 控制 CAL_GAIN_CAPTURE、CAL_GAIN_BUILD 和 MAKE_GAIN；Dynamic offset 不受影响。
 GAIN_TASK_BACKGROUND_ENABLE ?= 0
@@ -263,6 +268,8 @@ ROIC_DEFAULT_REG_2D ?= 0
 ROIC_DEFAULT_REG_3B ?= 0
 
 CFLAGS = -Wall -Wextra -O2 -g -std=c11 -D_GNU_SOURCE
+# 工程公共头文件目录；正式二进制协议定义位于 include/pa_protocol.h。
+CFLAGS += -Iinclude
 # 生成 .d 头文件依赖，避免修改 work_mode.h/app_config.h 后增量编译漏重编相关 .c。
 CFLAGS += -MMD -MP
 CFLAGS += -march=$(ARCH)
@@ -270,6 +277,7 @@ CFLAGS += -DAPP_VERSION='"$(APP_VERSION)"'
 CFLAGS += -DAPP_BUILD_TIME='"$(BUILD_TIME)"'
 CFLAGS += -DWORK_MODE_AUTO_START=$(WORK_MODE_AUTO_START)
 CFLAGS += -DWORK_MODE_DEFAULT_MODE=$(WORK_MODE_DEFAULT_MODE)
+CFLAGS += -DAPP_CONFIG_FILE='"$(APP_CONFIG_FILE)"'
 CFLAGS += -DPA_PU_BASE_ADDR=$(PA_PU_BASE_ADDR)
 CFLAGS += -DPA_PU_UIO_DEVICE='"$(PA_PU_UIO_DEVICE)"'
 CFLAGS += -DRS422_DEVICE='"$(RS422_DEVICE)"'
@@ -365,7 +373,9 @@ SRCS = src/main.c \
        src/log.c \
        src/fpga_mem.c \
        src/pa_pu.c \
+       src/pa_protocol.c \
        src/dynamic_mode.c \
+       src/config_store.c \
        src/work_mode.c \
        src/rs422.c \
        src/template_builder.c \
@@ -376,6 +386,13 @@ OBJS = $(SRCS:%.c=$(BUILD_DIR)/%.o)
 DEPS = $(OBJS:.o=.d)
 
 all: $(BIN_DIR)/$(TARGET)
+
+test-protocol: $(BUILD_DIR)/tests/pa_protocol_tests
+	$(BUILD_DIR)/tests/pa_protocol_tests
+
+$(BUILD_DIR)/tests/pa_protocol_tests: tests/pa_protocol_tests.c src/pa_protocol.c include/pa_protocol.h
+	mkdir -p $(dir $@)
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iinclude tests/pa_protocol_tests.c src/pa_protocol.c -o $@
 
 $(BIN_DIR):
 	mkdir -p $@
@@ -436,6 +453,6 @@ config:
 clean:
 	rm -rf $(BUILD_DIR)
 
-.PHONY: all clean config deploy deploy-board run-board
+.PHONY: all clean config test-protocol deploy deploy-board run-board
 
 -include $(DEPS)

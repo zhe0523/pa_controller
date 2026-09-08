@@ -119,22 +119,30 @@ static int load_active_template(const char* path, uint16_t* dst) {
   return 0;
 }
 
-int template_load_files(fpga_mem_t* mem) {
+int template_load_files_from_paths(fpga_mem_t* mem,
+                                   const char* offset_path,
+                                   const char* gain_path) {
   if (!fpga_mem_is_open(mem)) {
     return -1;
   }
 
+  if (offset_path == NULL || offset_path[0] == '\0') offset_path = TEMPLATE_OFFSET_FILE;
+  if (gain_path == NULL || gain_path[0] == '\0') gain_path = TEMPLATE_GAIN_FILE;
   int ret = 0;
-  if (load_active_template(TEMPLATE_OFFSET_FILE, (uint16_t*)mem->offset_template) != 0) {
+  if (load_active_template(offset_path, (uint16_t*)mem->offset_template) != 0) {
     ret = -1;
   }
 
   /* gain 区只保存一份完整模板，物理窗口大小由设备树 UIO map0 决定。 */
-  if (load_active_template(TEMPLATE_GAIN_FILE, (uint16_t*)mem->gain_template) != 0) {
+  if (load_active_template(gain_path, (uint16_t*)mem->gain_template) != 0) {
     ret = -1;
   }
 
   return ret;
+}
+
+int template_load_files(fpga_mem_t* mem) {
+  return template_load_files_from_paths(mem, TEMPLATE_OFFSET_FILE, TEMPLATE_GAIN_FILE);
 }
 
 int template_make_offset_cancellable(fpga_mem_t* mem, template_cancel_fn cancel, void* opaque) {

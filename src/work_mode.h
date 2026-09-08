@@ -156,6 +156,8 @@ int work_mode_start_static_idle_capture(work_mode_context_t* wm, work_mode_statu
 int work_mode_start_dynamic(work_mode_context_t* wm);
 /* 更新正式 Continuous 参数；FPGA Dynamic 运行中返回 -2。 */
 int work_mode_update_dynamic_config(work_mode_context_t* wm, const pa_pu_dync_config_t* config);
+/* 使用配置文件中的完整 Dynamic 参数（包含步骤及等待时序）。 */
+int work_mode_update_dynamic_settings(work_mode_context_t* wm, const dynamic_mode_config_t* config);
 /* 停止 Dynamic；返回后工作线程已回收或状态进入 ERROR。 */
 int work_mode_stop_dynamic(work_mode_context_t* wm, work_mode_status_t* result);
 /* 读取工作线程状态快照。 */

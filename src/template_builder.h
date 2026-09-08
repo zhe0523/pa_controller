@@ -15,6 +15,11 @@
 /* 从 TEMPLATE_OFFSET_FILE / TEMPLATE_GAIN_FILE 加载模板到 FPGA/PA 共享内存。 */
 int template_load_files(fpga_mem_t* mem);
 
+/* 使用运行时配置指定的模板文件加载；路径为空时回退到编译默认路径。 */
+int template_load_files_from_paths(fpga_mem_t* mem,
+                                   const char* offset_path,
+                                   const char* gain_path);
+
 /* 用当前原始图像生成 offset 模板，并同时写入文件和 FPGA 模板内存。 */
 int template_make_offset(fpga_mem_t* mem);
 
