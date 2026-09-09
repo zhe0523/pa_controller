@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "app_config.h"
@@ -29,7 +30,7 @@ static void on_signal(int signo) {
 static void print_usage(const char* program) {
   fprintf(stderr, "Usage: %s [--stdio|--binary] [-d rs422_device] [-b baud]\n", program);
   fprintf(stderr, "  --stdio: read commands from stdin and write responses to stdout\n");
-  fprintf(stderr, "  --binary: use formal binary protocol on RS422\n");
+  fprintf(stderr, "  --binary: use formal binary protocol on RS422 (default)\n");
   fprintf(stderr, "  default device: %s\n", RS422_DEVICE);
   fprintf(stderr, "  default baud:   %d\n", RS422_BAUD);
 }
@@ -100,14 +101,107 @@ static const char* default_work_mode_name(uint32_t mode) {
 }
 
 typedef struct {
+  bool valid;
+  uint16_t cmd;
+  uint32_t seq;
+  uint16_t payload_crc;
+  uint64_t completed_ms;
+  size_t response_length;
+  uint8_t response[PA_PROTOCOL_MAX_FRAME];
+} binary_response_cache_entry_t;
+
+typedef struct {
   command_context_t* command_context;
   rs422_t* port;
+  binary_response_cache_entry_t cache[8];
+  size_t cache_next;
 } binary_loop_context_t;
+
+static uint64_t binary_monotonic_ms(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+    return 0u;
+  }
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static binary_response_cache_entry_t* binary_cache_find(binary_loop_context_t* loop,
+                                                         const pa_protocol_frame_view_t* request,
+                                                         uint64_t now_ms) {
+  const uint16_t payload_crc = pa_protocol_crc16(request->payload, request->payload_len);
+  for (size_t i = 0u; i < sizeof(loop->cache) / sizeof(loop->cache[0]); ++i) {
+    binary_response_cache_entry_t* entry = &loop->cache[i];
+    if (!entry->valid || entry->cmd != request->cmd || entry->seq != request->seq ||
+        entry->payload_crc != payload_crc ||
+        (now_ms != 0u && entry->completed_ms != 0u && now_ms - entry->completed_ms > 30000u)) {
+      continue;
+    }
+    return entry;
+  }
+  return NULL;
+}
+
+static bool binary_cache_seq_collision(binary_loop_context_t* loop,
+                                       const pa_protocol_frame_view_t* request,
+                                       uint64_t now_ms) {
+  const uint16_t payload_crc = pa_protocol_crc16(request->payload, request->payload_len);
+  for (size_t i = 0u; i < sizeof(loop->cache) / sizeof(loop->cache[0]); ++i) {
+    const binary_response_cache_entry_t* entry = &loop->cache[i];
+    if (!entry->valid || entry->seq != request->seq ||
+        (now_ms != 0u && entry->completed_ms != 0u && now_ms - entry->completed_ms > 30000u)) {
+      continue;
+    }
+    return entry->cmd != request->cmd || entry->payload_crc != payload_crc;
+  }
+  return false;
+}
+
+static void binary_cache_store(binary_loop_context_t* loop,
+                               const pa_protocol_frame_view_t* request,
+                               const uint8_t* response,
+                               size_t response_length) {
+  binary_response_cache_entry_t* entry = &loop->cache[loop->cache_next];
+  loop->cache_next = (loop->cache_next + 1u) % (sizeof(loop->cache) / sizeof(loop->cache[0]));
+  entry->valid = true;
+  entry->cmd = request->cmd;
+  entry->seq = request->seq;
+  entry->payload_crc = pa_protocol_crc16(request->payload, request->payload_len);
+  entry->completed_ms = binary_monotonic_ms();
+  entry->response_length = response_length;
+  memcpy(entry->response, response, response_length);
+}
 
 static int handle_binary_frame(const pa_protocol_frame_view_t* request, void* user) {
   binary_loop_context_t* loop = (binary_loop_context_t*)user;
   if (loop == NULL || loop->command_context == NULL || loop->port == NULL) {
     return -1;
+  }
+
+  const uint64_t now_ms = binary_monotonic_ms();
+  if (binary_cache_seq_collision(loop, request, now_ms)) {
+    uint8_t collision_payload[8] = {0x02u, 0x00u, 0x04u, 0x00u, 0x02u, 0x00u, 0x00u, 0x00u};
+    uint8_t collision_response[PA_PROTOCOL_MAX_FRAME];
+    size_t collision_length = 0u;
+    if (pa_protocol_encode(PA_PROTOCOL_MSG_ERR, 0u, request->cmd, request->seq,
+                           collision_payload, sizeof(collision_payload),
+                           collision_response, sizeof(collision_response), &collision_length) != PA_PROTOCOL_OK ||
+        rs422_write_bytes(loop->port, collision_response, collision_length) != 0) {
+      return -1;
+    }
+    log_warn("binary sequence collision rejected cmd=0x%04x seq=%u", request->cmd, request->seq);
+    return 0;
+  }
+
+  binary_response_cache_entry_t* cached = binary_cache_find(loop, request, now_ms);
+  if (cached != NULL) {
+    if (rs422_write_bytes(loop->port, cached->response, cached->response_length) != 0) {
+      log_error("binary cached response write failed cmd=0x%04x seq=%u",
+                request->cmd, request->seq);
+      return -1;
+    }
+    log_info("binary duplicate request replayed cmd=0x%04x seq=%u response=%u bytes",
+             request->cmd, request->seq, (unsigned)cached->response_length);
+    return 0;
   }
 
   uint8_t response[PA_PROTOCOL_MAX_FRAME];
@@ -122,6 +216,7 @@ static int handle_binary_frame(const pa_protocol_frame_view_t* request, void* us
               request->cmd, request->seq, result);
     return -1;
   }
+  binary_cache_store(loop, request, response, response_length);
   if (rs422_write_bytes(loop->port, response, response_length) != 0) {
     log_error("binary response write failed cmd=0x%04x seq=%u",
               request->cmd, request->seq);
@@ -139,14 +234,20 @@ int main(int argc, char* argv[]) {
   const char* rs422_device = RS422_DEVICE;
   int rs422_baud = RS422_BAUD;
   bool use_stdio = false;
-  bool use_binary = false;
+  bool use_binary = true;
+  bool saw_stdio = false;
+  bool saw_binary = false;
 
   /* 解析运行参数：--stdio 用于开发板无独立 422 口时模拟上位机命令。 */
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--stdio") == 0) {
       use_stdio = true;
+      use_binary = false;
+      saw_stdio = true;
     } else if (strcmp(argv[i], "--binary") == 0) {
       use_binary = true;
+      use_stdio = false;
+      saw_binary = true;
     } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
       rs422_device = argv[++i];
     } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
@@ -183,7 +284,7 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  if (use_stdio && use_binary) {
+  if (saw_stdio && saw_binary) {
     fprintf(stderr, "--stdio and --binary cannot be used together\n");
     return 1;
   }

@@ -6,10 +6,19 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "app_config.h"
 #include "log.h"
+
+static uint64_t monotonic_ms(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+    return 0u;
+  }
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 
 /* 计算一行有效图像在整幅 FPGA 图像中的起始像素。 */
 static size_t active_row_offset(unsigned row) {
@@ -129,14 +138,35 @@ int template_load_files_from_paths(fpga_mem_t* mem,
   if (offset_path == NULL || offset_path[0] == '\0') offset_path = TEMPLATE_OFFSET_FILE;
   if (gain_path == NULL || gain_path[0] == '\0') gain_path = TEMPLATE_GAIN_FILE;
   int ret = 0;
-  if (load_active_template(offset_path, (uint16_t*)mem->offset_template) != 0) {
+  const uint64_t total_start_ms = monotonic_ms();
+  log_info("template load begin offset=%s gain=%s", offset_path, gain_path);
+
+  const uint64_t offset_start_ms = monotonic_ms();
+  log_info("template load offset begin path=%s", offset_path);
+  const int offset_result = load_active_template(offset_path, (uint16_t*)mem->offset_template);
+  const uint64_t offset_elapsed_ms = monotonic_ms() - offset_start_ms;
+  log_info("template load offset end path=%s result=%s elapsed_ms=%llu",
+           offset_path, offset_result == 0 ? "ok" : "failed",
+           (unsigned long long)offset_elapsed_ms);
+  if (offset_result != 0) {
     ret = -1;
   }
 
   /* gain 区只保存一份完整模板，物理窗口大小由设备树 UIO map0 决定。 */
-  if (load_active_template(gain_path, (uint16_t*)mem->gain_template) != 0) {
+  const uint64_t gain_start_ms = monotonic_ms();
+  log_info("template load gain begin path=%s", gain_path);
+  const int gain_result = load_active_template(gain_path, (uint16_t*)mem->gain_template);
+  const uint64_t gain_elapsed_ms = monotonic_ms() - gain_start_ms;
+  log_info("template load gain end path=%s result=%s elapsed_ms=%llu",
+           gain_path, gain_result == 0 ? "ok" : "failed",
+           (unsigned long long)gain_elapsed_ms);
+  if (gain_result != 0) {
     ret = -1;
   }
+
+  log_info("template load end result=%s elapsed_ms=%llu",
+           ret == 0 ? "ok" : "partial_or_failed",
+           (unsigned long long)(monotonic_ms() - total_start_ms));
 
   return ret;
 }

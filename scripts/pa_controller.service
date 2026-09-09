@@ -1,0 +1,16 @@
+[Unit]
+Description=TiRay PA Controller
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/root
+ExecStart=/root/pa_controller
+Restart=always
+RestartSec=1
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

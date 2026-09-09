@@ -11,6 +11,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/reboot.h>
 
 #include "app_config.h"
 #include "calibration_builder.h"
@@ -248,6 +249,21 @@ static int apply_runtime_config(command_context_t* ctx) {
   dynamic_config.stop_timeout_ms = config->dynamic_stop_timeout_ms;
   if (work_mode_update_static_idle_config(ctx->work_mode, &config->static_idle) != 0 ||
       work_mode_update_dynamic_settings(ctx->work_mode, &dynamic_config) != 0) return -1;
+  return 0;
+}
+
+/* 在返回二进制确认帧后延迟执行系统重启，确保上位机能收到命令已接受的结果。 */
+static int schedule_system_reboot(void) {
+  const pid_t child = fork();
+  if (child < 0) {
+    return -1;
+  }
+  if (child == 0) {
+    sleep(1);
+    sync();
+    (void)reboot(RB_AUTOBOOT);
+    _exit(127);
+  }
   return 0;
 }
 
@@ -3361,6 +3377,7 @@ enum {
   PA_BINARY_CMD_PING = 0x0002,
   PA_BINARY_CMD_STATUS = 0x0003,
   PA_BINARY_CMD_VERSION = 0x0004,
+  PA_BINARY_CMD_REBOOT = 0x0005,
   PA_BINARY_CMD_START_STATIC_CAPTURE = 0x0200,
   PA_BINARY_CMD_START_DYNAMIC = 0x0210,
   PA_BINARY_CMD_STOP_DYNAMIC = 0x0211,
@@ -3738,6 +3755,32 @@ static bool binary_prepare_hardware_action(command_context_t* ctx, const char* n
   return prepare_manual_hardware_action(ctx, name, response, sizeof(response));
 }
 
+/*
+ * 二进制配置下发前，prepare_manual_hardware_action() 可能会停掉 Static Idle
+ * 工作线程。配置命令是按组到达的，因此每个配置组完成后都要恢复原先的
+ * Static Idle 状态；Dynamic 运行时不会进入这里的恢复路径。
+ */
+static bool binary_static_idle_was_running(command_context_t* ctx) {
+  if (ctx == NULL || ctx->work_mode == NULL || dynamic_mode_is_active(&ctx->work_mode->dynamic)) {
+    return false;
+  }
+  work_mode_status_t status;
+  memset(&status, 0, sizeof(status));
+  work_mode_get_status(ctx->work_mode, &status);
+  return status.state == WORK_STATE_IDLE_WAIT || status.state == WORK_STATE_IDLE_CLEANING;
+}
+
+static void binary_restore_static_idle(command_context_t* ctx, bool was_running) {
+  if (!was_running || ctx == NULL || ctx->work_mode == NULL) {
+    return;
+  }
+  if (work_mode_start(ctx->work_mode) != 0) {
+    log_error("SET_CONFIG_GROUP failed to restore Static Idle work thread");
+  } else {
+    log_info("SET_CONFIG_GROUP restored Static Idle work thread");
+  }
+}
+
 int command_handle_binary(command_context_t* ctx,
                           const pa_protocol_frame_view_t* request,
                           uint8_t* response,
@@ -3778,10 +3821,19 @@ int command_handle_binary(command_context_t* ctx,
         return binary_error_response(ctx, request, 0x0002u, response, response_capacity, response_length);
       }
       unsigned group = (unsigned)request->payload[0] | ((unsigned)request->payload[1] << 8u);
+      /*
+       * 与 ASCII SET_CONFIG_GROUP 保持一致：Static Idle 处于等待或自清空
+       * 时，先停掉后台工作线程，再修改 PA/PU 配置，避免配置写入与 GIC
+       * 自清空操作并发。Dynamic 持续运行时该前置检查仍会拒绝请求。
+       */
+      bool restore_static_idle = binary_static_idle_was_running(ctx);
       if (binary_config_group(group) == NULL ||
+          !binary_prepare_hardware_action(ctx, "SET_CONFIG_GROUP") ||
           binary_apply_config_group(ctx, request->payload, request->payload_len, group) != 0) {
+        binary_restore_static_idle(ctx, restore_static_idle);
         return binary_error_response(ctx, request, 0x0008u, response, response_capacity, response_length);
       }
+      binary_restore_static_idle(ctx, restore_static_idle);
       if (binary_append_config_group(ctx->runtime_config, group, payload, sizeof(payload), &payload_length) != 0) {
         return binary_error_response(ctx, request, 0x000Eu, response, response_capacity, response_length);
       }
@@ -3857,6 +3909,19 @@ int command_handle_binary(command_context_t* ctx,
     case PA_BINARY_CMD_PING:
       return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
                              NULL, 0u, response, response_capacity, response_length);
+
+    case PA_BINARY_CMD_REBOOT:
+      if (request->payload_len != 0u || schedule_system_reboot() != 0) {
+        return binary_error_response(ctx, request, 0x0002u, response, response_capacity, response_length);
+      }
+      log_info("binary reboot accepted seq=%u; system reboot scheduled", request->seq);
+      if (binary_payload_append_u32(payload, sizeof(payload), &payload_length,
+                                    0x0005u, 1u) != 0) {
+        return binary_error_response(ctx, request, 0x000Eu, response, response_capacity, response_length);
+      }
+      return binary_response(ctx, request, PA_PROTOCOL_MSG_DONE,
+                             payload, (uint16_t)payload_length,
+                             response, response_capacity, response_length);
 
     case PA_BINARY_CMD_STATUS: {
       work_mode_status_t work_status;

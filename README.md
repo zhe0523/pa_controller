@@ -130,6 +130,19 @@ root@192.168.3.54:/root/pa_controller
 sudo apt install sshpass
 ```
 
+下位机正常运行时使用 systemd 保持 `pa_controller` 常驻，并在开机自动启动。部署程序和服务文件后，在开发板执行：
+
+```sh
+chmod +x /root/install_service.sh
+/root/install_service.sh /root
+```
+
+服务配置为异常退出自动重启，直到设备关机。手动停止服务仅用于维护：
+
+```sh
+systemctl disable --now pa_controller.service
+```
+
 默认登录参数：
 
 ```text
@@ -175,7 +188,7 @@ make run-board BOARD_HOST=192.168.3.54 BOARD_USER=root BOARD_DIR=/root BOARD_RUN
 
 当前先使用 ASCII 行协议，命令以 `\r\n` 或 `\n` 结束，便于串口助手联调。
 命令名大小写不敏感，参数通常使用 `key=value`，十进制和 `0x` 十六进制都支持。
-正式业务命令通过 `src/command_handler.c` 的二进制入口接入。当前 ARM 工程已经加入独立的二进制帧基础层：`include/pa_protocol.h`、`src/pa_protocol.c`，并支持 `--binary` RS422 运行模式。二进制模式当前已实现 `HELLO(0x0001)`、`PING(0x0002)`、`STATUS(0x0003)`、`VERSION(0x0004)`、`GET_CONFIG_GROUP(0x0103)`、`SET_CONFIG_GROUP(0x0104)`、`START_STATIC_CAPTURE(0x0200)`、`START_DYNAMIC(0x0210)`、`STOP_DYNAMIC(0x0211)`、`QUERY_DYNAMIC(0x0212)`、`CAL_OFFSET_*(0x0300~0x0303)`、`CAL_GAIN_*(0x0304~0x0307)`、`CAL_STATUS(0x0308)` 和 `IMG_UPLOAD_*(0x0500~0x0502)`。配置组 payload 为 `u16 group_id` 加连续的 `{u16 item_id, u16 len=4, u32 value}` 小端 TLV；下位机收到 SET 后会校验、应用并保存 `config.ini`。ASCII 模板和调试命令继续作为研发入口保留。
+正式业务命令通过 `src/command_handler.c` 的二进制入口接入。当前 ARM 工程已经加入独立的二进制帧基础层：`include/pa_protocol.h`、`src/pa_protocol.c`，并支持 `--binary` RS422 运行模式。二进制模式当前已实现 `HELLO(0x0001)`、`PING(0x0002)`、`STATUS(0x0003)`、`VERSION(0x0004)`、`REBOOT(0x0005)`、`GET_CONFIG_GROUP(0x0103)`、`SET_CONFIG_GROUP(0x0104)`、`START_STATIC_CAPTURE(0x0200)`、`START_DYNAMIC(0x0210)`、`STOP_DYNAMIC(0x0211)`、`QUERY_DYNAMIC(0x0212)`、`CAL_OFFSET_*(0x0300~0x0303)`、`CAL_GAIN_*(0x0304~0x0307)`、`CAL_STATUS(0x0308)` 和 `IMG_UPLOAD_*(0x0500~0x0502)`。配置组 payload 为 `u16 group_id` 加连续的 `{u16 item_id, u16 len=4, u32 value}` 小端 TLV；下位机收到 SET 后会校验、应用并保存 `config.ini`。`REBOOT` 返回确认帧后由下位机延迟执行系统重启。
 
 协议基础层的固定联调帧如下，表示 `REQ cmd=0x0001 seq=1` 的空 payload 请求：
 
@@ -188,10 +201,10 @@ AA 55 01 10 01 00 01 00 01 00 00 00 00 00 00 00 78 62
 RS422 二进制联调示例：
 
 ```sh
-./pa_controller --binary -d /dev/ttyS1 -b 115200
+./pa_controller -d /dev/ttyS1 -b 115200
 ```
 
-上位机使用 `pa_host --binary` 启动。二进制帧为小端字段，帧头 `AA 55`，协议版本为 1，
+上位机默认直接使用二进制协议启动，无需附加参数。二进制帧为小端字段，帧头 `AA 55`，协议版本为 1，
 固定头长度 16 字节，末尾为 CRC16-CCITT-FALSE。空 payload 的 PING 请求固定帧为：
 
 ```text
